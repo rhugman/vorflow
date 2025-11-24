@@ -1,0 +1,19 @@
+name: vorflow
+channels:
+  - nodefaults
+  - conda-forge
+dependencies:
+  - python>3.9
+  - pip
+  - gmsh
+  - geopandas
+  - shapely
+  - numpy
+  - pandas
+  - pyproj
+  - meshio
+  - pytest
+  - jupyter
+  - matplotlib
+  - pip:
+      - -e .[dev,gmsh]
