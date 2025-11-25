@@ -124,18 +124,29 @@ class MeshGenerator:
         """
         field_list = []
         
+        # 0. Determine Global Background Size
+        # We need this to cap the Threshold fields correctly.
+        # If SizeMax is too huge, the gradation is too steep.
+        global_max_lc = 100.0
+        if 'lc' in polygons_gdf.columns and not polygons_gdf.empty:
+            global_max_lc = float(polygons_gdf['lc'].max())
+        if global_max_lc <= 0: global_max_lc = 100.0
+
+        # Helper to find point tags robustly (since fragment might change them)
+        def get_point_tag_at(x, y):
+            eps = 1e-4
+            # Search for 0D entities (points) near coordinates
+            ents = gmsh.model.getEntitiesInBoundingBox(x-eps, y-eps, -eps, x+eps, y+eps, eps, dim=0)
+            if ents:
+                return ents[0][1] # Return tag
+            return None
+
         def add_refinement(entity_dim, entity_tags, size_target, dist_min, dist_max):
             if not isinstance(entity_tags, list):
                 entity_tags = [entity_tags]
             
-            # Filter tags. Note: Fragment might have consumed/renamed tags.
-            # However, Gmsh fields usually handle "input" tags correctly if they were part of the history.
-            # If strictness is needed, we would need to track the out_map from fragment.
-            # For now, we pass the original tags.
             valid_tags = [float(t) for t in entity_tags]
-            
-            if not valid_tags:
-                return None
+            if not valid_tags: return None
 
             f_dist = gmsh.model.mesh.field.add("Distance")
             if entity_dim == 0: 
@@ -146,17 +157,24 @@ class MeshGenerator:
             f_thresh = gmsh.model.mesh.field.add("Threshold")
             gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMin", float(size_target))
-            gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", 1e22)
+            
+            # FIX: Set SizeMax to the global background size.
+            # This ensures the linear interpolation 1.0 -> 20.0 happens over DistMax.
+            gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", float(global_max_lc))
+            
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMin", float(dist_min))
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", float(dist_max))
             return f_thresh
 
         # 1. Point Resolutions
         for idx, row in points_gdf.iterrows():
-            if idx in gmsh_map['points']:
-                tag = gmsh_map['points'][idx]
+            # Robust lookup: Find the tag currently at this location
+            tag = get_point_tag_at(row.geometry.x, row.geometry.y)
+            
+            if tag:
                 lc = max(row.get('lc', 5.0), 0.001)
-                fid = add_refinement(0, [tag], lc, 1.0, 500.0)
+                # Refine to 'lc' within 2m, fade to background over 150m
+                fid = add_refinement(0, [tag], lc, 2.0, 150.0)
                 if fid: field_list.append(fid)
 
         # 2. Line Resolutions
@@ -164,17 +182,13 @@ class MeshGenerator:
             if idx in gmsh_map['lines']:
                 tags = gmsh_map['lines'][idx]
                 lc = max(row.get('lc', 10.0), 0.001)
+                # Refine to 'lc' within 5m, fade to background over 200m
                 fid = add_refinement(1, tags, lc, 5.0, 200.0)
                 if fid: field_list.append(fid)
 
         # 3. Global Background Field
         f_bg = gmsh.model.mesh.field.add("MathEval")
-        bg_size = 100.0
-        if 'lc' in polygons_gdf.columns and not polygons_gdf.empty:
-            bg_size = float(polygons_gdf['lc'].max())
-        if bg_size <= 0: bg_size = 100.0
-            
-        gmsh.model.mesh.field.setString(f_bg, "F", str(bg_size))
+        gmsh.model.mesh.field.setString(f_bg, "F", str(global_max_lc))
         field_list.append(f_bg)
 
         # 4. Combine
@@ -184,9 +198,9 @@ class MeshGenerator:
             gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", field_list)
             gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
         
-        # Algo 5 (Delaunay) is robust
         gmsh.option.setNumber("Mesh.Algorithm", 5) 
 
+        
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
         self._initialize_gmsh()
         
