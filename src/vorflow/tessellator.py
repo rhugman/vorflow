@@ -31,6 +31,8 @@ class VoronoiTessellator:
         vor = Voronoi(nodes)
         polygons = []
         ids = []
+        gen_x = []
+        gen_y = []
         
         for i, region_index in enumerate(vor.point_region):
             region = vor.regions[region_index]
@@ -42,6 +44,10 @@ class VoronoiTessellator:
             
             if poly.is_valid:
                 polygons.append(poly)
+                # Capture generator coordinates from the input nodes
+                gen_x.append(nodes[i][0])
+                gen_y.append(nodes[i][1])
+                
                 # Handle ghost nodes (which have no tag)
                 if i < len(node_tags):
                     ids.append(node_tags[i])
@@ -49,7 +55,7 @@ class VoronoiTessellator:
                     ids.append(-1) 
         
         gdf = gpd.GeoDataFrame(
-            {'node_id': ids}, 
+            {'node_id': ids, 'x': gen_x, 'y': gen_y}, 
             geometry=polygons, 
             crs=self.cm.crs
         )
@@ -58,19 +64,32 @@ class VoronoiTessellator:
     def _enforce_barriers(self, grid_gdf):
         """
         Splits Voronoi cells along 'Barrier' lines.
+        SKIPs lines that have 'straddle_width' defined, as they are already aligned.
         """
         if self.cm.clean_lines.empty:
             return grid_gdf
             
-        barriers = self.cm.clean_lines[self.cm.clean_lines['is_barrier'] == True]
-        if barriers.empty:
+        # Filter: Only barriers that do NOT have straddle_width
+        # If straddle_width is NaN or 0, we cut. If it has a value, we skip.
+        mask_barrier = self.cm.clean_lines['is_barrier'] == True
+        
+        # Handle case where straddle_width column might not exist yet
+        if 'straddle_width' in self.cm.clean_lines.columns:
+            mask_no_straddle = (self.cm.clean_lines['straddle_width'].isna()) | (self.cm.clean_lines['straddle_width'] <= 0)
+        else:
+            mask_no_straddle = True
+            
+        barriers_to_cut = self.cm.clean_lines[mask_barrier & mask_no_straddle]
+        
+        if barriers_to_cut.empty:
             return grid_gdf
             
-        print(f"Enforcing Barrier Cuts on {len(barriers)} barrier lines...")
+        print(f"Enforcing Barrier Cuts on {len(barriers_to_cut)} lines (Straddle lines skipped)...")
         
         current_grid = grid_gdf
         
-        for idx, row in barriers.iterrows():
+        for idx, row in barriers_to_cut.iterrows():
+            # ...existing cut logic...
             line = row.geometry
             
             # Find candidate cells (spatial index query)
@@ -155,9 +174,6 @@ class VoronoiTessellator:
 
         print("Clipping to Domain Boundary...")
         
-        # FIX: Robust Domain Definition
-        # Instead of relying on self.cm.domain_boundary (which might be unset),
-        # we calculate the union of the actual meshed polygons.
         if not self.cm.clean_polygons.empty:
             domain_geom = unary_union(self.cm.clean_polygons.geometry)
             if not domain_geom.is_valid:
@@ -178,8 +194,6 @@ class VoronoiTessellator:
         
         if len(bounded_voronoi) == 0:
             print("Warning: Clipping resulted in 0 cells. Check CRS or Domain Box.")
-            print(f"  -> Raw Bounds: {raw_gdf.total_bounds}")
-            print(f"  -> Domain Bounds: {domain_gdf.total_bounds}")
             return bounded_voronoi
 
         print("Enforcing Hydrogeological Zones...")
@@ -204,9 +218,11 @@ class VoronoiTessellator:
         # Final Cleanup
         self.final_grid = self.final_grid.explode(index_parts=True).reset_index(drop=True)
         
-        # Calculate centroids
-        self.final_grid['x'] = self.final_grid.geometry.centroid.x
-        self.final_grid['y'] = self.final_grid.geometry.centroid.y
+        # FIX: Do NOT overwrite 'x' and 'y' with centroids.
+        # We keep 'x' and 'y' as the generator coordinates for quality analysis.
+        # We add explicit centroid columns for reference.
+        self.final_grid['centroid_x'] = self.final_grid.geometry.centroid.x
+        self.final_grid['centroid_y'] = self.final_grid.geometry.centroid.y
         
         print(f"Final Voronoi Grid Generated: {len(self.final_grid)} cells.")
         return self.final_grid

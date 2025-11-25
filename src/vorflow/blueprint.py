@@ -25,31 +25,33 @@ class ConceptualMesh:
         self.clean_lines = gpd.GeoDataFrame()
         self.clean_points = gpd.GeoDataFrame()
 
-    def add_polygon(self, geometry, zone_id, resolution, z_order=0, mesh_refinement=True):
+    def add_polygon(self, geometry, zone_id, resolution, z_order=0, mesh_refinement=True, dist_min=None, dist_max=None):
         """
-        Ingests polygon zones (aquifers, lakes, exclusion zones).
+        Registers a polygon zone.
         
         Args:
-            geometry (shapely.Polygon): The geometry object.
-            zone_id (str/int): Identifier for the material property/zone.
-            resolution (float): Target mesh edge length in this zone.
-            z_order (int): Priority. Higher z_order cuts through lower z_order.
-            mesh_refinement (bool): If True, adds interior points for generation.
+            geometry (shapely.Polygon): The geometry.
+            zone_id (int/str): Identifier.
+            resolution (float): Mesh size inside the zone.
+            z_order (int): Stacking order (higher overwrites lower).
+            mesh_refinement (bool): If False, this zone is just for tagging, not meshing control.
+            dist_min (float): Distance from boundary where size remains constant.
+            dist_max (float): Distance from boundary where size reaches background.
         """
-        # Ensure validity immediately upon entry
         if not geometry.is_valid:
             geometry = make_valid(geometry)
             
         self.raw_polygons.append({
             'geometry': geometry,
             'zone_id': zone_id,
-            'lc': resolution, # 'lc' is gmsh shorthand for characteristic length
+            'lc': resolution,
             'z_order': z_order,
-            'refine': mesh_refinement
+            'refine': mesh_refinement,
+            'dist_min': dist_min,
+            'dist_max': dist_max
         })
 
-
-    def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False, dist_min=None, dist_max=None):
+    def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False, dist_min=None, dist_max=None, straddle_width=None):
         """
         Ingests features like rivers, faults, or boundary conditions.
         
@@ -58,9 +60,11 @@ class ConceptualMesh:
             line_id (str): Identifier.
             resolution (float): Target mesh size on the line.
             snap_to_polygons (bool): Whether to snap to zone boundaries.
-            is_barrier (bool): If True, acts as a flow barrier (edges align). If False, conductive (nodes align).
-            dist_min (float, optional): Distance from line where mesh size remains constant (resolution).
+            is_barrier (bool): If True, acts as a flow barrier.
+            dist_min (float, optional): Distance from line where mesh size remains constant.
             dist_max (float, optional): Distance from line where mesh size reaches background size.
+            straddle_width (float, optional): If set, replaces the line with two parallel lines 
+                                              separated by this width. Forces Voronoi face alignment.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
@@ -71,7 +75,8 @@ class ConceptualMesh:
             'lc': resolution,
             'is_barrier': is_barrier,
             'dist_min': dist_min,
-            'dist_max': dist_max
+            'dist_max': dist_max,
+            'straddle_width': straddle_width # New Parameter
         })
 
     def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None):
@@ -160,10 +165,6 @@ class ConceptualMesh:
     def generate(self):
         """
         Main execution method.
-        1. Resolves overlaps.
-        2. Cleans topology.
-        3. Applies densification to polygons and lines.
-        4. Prepares data for the MeshGenerator.
         """
         print("Resolving polygon overlaps...")
         self._resolve_overlaps()
@@ -173,26 +174,21 @@ class ConceptualMesh:
         
         # Clean Lines
         if self.raw_lines:
-            # Construct GeoDataFrame directly from the raw_lines list
             self.clean_lines = gpd.GeoDataFrame(self.raw_lines, crs=self.crs)
         else:
-            self.clean_lines = gpd.GeoDataFrame(columns=['geometry', 'line_id', 'lc', 'is_barrier', 'dist_min', 'dist_max'], crs=self.crs)
-
+            self.clean_lines = gpd.GeoDataFrame(columns=['geometry', 'line_id', 'lc', 'is_barrier', 'dist_min', 'dist_max', 'straddle_width'], crs=self.crs)
+   
         # Clean Points
         if self.raw_points:
             self.clean_points = gpd.GeoDataFrame(self.raw_points, crs=self.crs)
         else:
             self.clean_points = gpd.GeoDataFrame(columns=['geometry', 'point_id', 'lc', 'dist_min', 'dist_max'], crs=self.crs)
 
-
         print("Densifying geometry...")
         self._apply_densification()
-
-        # Set the global domain boundary based on the union of all polygons
-        self.domain_boundary = unary_union(self.clean_polygons.geometry)
         
         return self.clean_polygons, self.clean_lines, self.clean_points
-    
+
     
 # ...existing code...
     def _densify_geometry(self, geometry, resolution):
