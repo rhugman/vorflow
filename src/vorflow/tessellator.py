@@ -3,18 +3,15 @@ import geopandas as gpd
 import pandas as pd
 import gmsh
 from scipy.spatial import Voronoi
-from shapely.geometry import Polygon, Point
-from shapely.ops import unary_union
+from shapely.geometry import Polygon, Point, LineString, MultiPolygon
+from shapely.ops import unary_union, split
+from shapely.validation import make_valid
 
 class VoronoiTessellator:
     def __init__(self, mesh_generator, conceptual_mesh):
         """
         Converts the Triangular Mesh into a Polgonal Voronoi Grid,
         strictly respecting the boundaries defined in ConceptualMesh.
-        
-        Args:
-            mesh_generator (MeshGenerator): The instance holding the active Gmsh model.
-            conceptual_mesh (ConceptualMesh): The instance holding the clean zones.
         """
         self.mg = mesh_generator
         self.cm = conceptual_mesh
@@ -27,52 +24,38 @@ class VoronoiTessellator:
     def _extract_nodes(self):
         """
         Pulls node coordinates from the active Gmsh model.
-        Returns:
-            nodes (np.array): (N, 2) array of XY coordinates.
-            node_tags (np.array): Array of Gmsh node IDs.
         """
-        # Get all nodes from the model (dim=-1 means all dimensions)
         node_tags, coords, _ = gmsh.model.mesh.getNodes()
-        
-        # coords comes as a flat 1D array [x1, y1, z1, x2, y2, z2...]
-        # Reshape to (N, 3) and slice to (N, 2) for 2D operations
         nodes_3d = np.array(coords).reshape(-1, 3)
         nodes_2d = nodes_3d[:, :2]
-        
         return nodes_2d, node_tags
 
     def _build_raw_voronoi(self, nodes, node_tags):
         """
-        Uses Scipy to compute the mathematical Voronoi diagram of the nodes.
-        Then converts infinite regions into finite Shapely polygons.
+        Uses Scipy to compute the mathematical Voronoi diagram.
         """
         vor = Voronoi(nodes)
-        
         polygons = []
         ids = []
         
-        # Loop through point_region map to ensure we align with node_tags
-        # vor.point_region gives the index of the region for each input point
+        # Map point_region to input index
+        # vor.point_region is an array where index i corresponds to input point i
         for i, region_index in enumerate(vor.point_region):
             region = vor.regions[region_index]
-            
-            # Skip empty regions or regions with -1 (indicates infinity/outer boundary)
             if not region or -1 in region:
                 continue
             
-            # Get vertices for this region
             verts = vor.vertices[region]
-            
-            # Create Polygon
             poly = Polygon(verts)
             
             if poly.is_valid:
                 polygons.append(poly)
-                ids.append(node_tags[i]) # Map back to Gmsh Node ID
+                # Handle ghost nodes (which have no tag)
+                if i < len(node_tags):
+                    ids.append(node_tags[i])
+                else:
+                    ids.append(-1) # Ghost node ID
         
-        # Create a preliminary GDF
-        # Note: This set excludes the "Infinite" boundary cells. 
-        # We will handle the boundary by constructing a bounding box clip.
         gdf = gpd.GeoDataFrame(
             {'node_id': ids}, 
             geometry=polygons, 
@@ -80,26 +63,93 @@ class VoronoiTessellator:
         )
         return gdf
 
-    def _repair_boundary_cells(self, raw_gdf, nodes):
+    def _enforce_barriers(self, grid_gdf):
         """
-        The Scipy Voronoi alg leaves 'infinite' cells at the boundary.
-        We fix this by creating a synthetic bounding box larger than the domain,
-        generating Voronoi for that, and clipping to the Domain Boundary.
+        Splits Voronoi cells along 'Barrier' lines.
+        Since nodes are on the line, the cells straddle the line.
+        We cut them to create a face along the fault.
         """
-        # 1. Get the Domain Boundary from ConceptualMesh
-        domain_shape = self.cm.domain_boundary
+        # 1. Identify Barrier Lines
+        if self.cm.clean_lines.empty:
+            return grid_gdf
+            
+        barriers = self.cm.clean_lines[self.cm.clean_lines['is_barrier'] == True]
+        if barriers.empty:
+            return grid_gdf
+            
+        print("Enforcing Barrier Cuts...")
         
-        # 2. Filter raw_gdf to only those strictly inside or intersecting
-        # (This removes garbage infinite approximations if any slipped through)
-        # Actually, for Option A, we want to maximize coverage.
+        # We process the grid list-wise to handle splits
+        # Converting to list of dicts is often faster for manipulation than pure GDF
+        new_cells = []
         
-        # STRATEGY UPDATE for Robustness:
-        # Scipy's finite regions are often insufficient for the hull.
-        # A simple engineering fix: 
-        # Add "Ghost Nodes" far outside the domain before Voronoi generation
-        # to force the domain hull nodes to have finite cells. 
-        # (Implemented in generate() wrapper for cleanliness).
-        pass 
+        # Spatial Index for speed
+        sindex = grid_gdf.sindex
+        
+        # Track which cells have been processed (split)
+        processed_indices = set()
+        
+        # Iterate over barriers
+        # Note: If barriers intersect each other, this simple loop might need recursion,
+        # but for now we assume barriers are handled sequentially.
+        
+        # To do this robustly using GeoPandas:
+        # We can use the 'split' operation on the whole geometry column? 
+        # No, shapely.ops.split works on single geometries.
+        
+        # Strategy:
+        # 1. Find all cells intersecting ANY barrier.
+        # 2. For each such cell, split it by the barrier(s).
+        # 3. Keep the pieces.
+        
+        # Let's do it per barrier to ensure we handle the specific line geometry
+        current_grid = grid_gdf
+        
+        for idx, row in barriers.iterrows():
+            line = row.geometry
+            
+            # Find candidate cells
+            possible_matches_index = list(current_grid.sindex.query(line, predicate='intersects'))
+            candidate_cells = current_grid.iloc[possible_matches_index]
+            
+            cells_to_keep = []
+            cells_to_remove_indices = []
+            
+            for cell_idx, cell_row in candidate_cells.iterrows():
+                cell_poly = cell_row.geometry
+                
+                # Check actual intersection (sindex is bounding box)
+                if not cell_poly.intersects(line):
+                    continue
+                    
+                # Perform Split
+                # shapely.split(polygon, line) -> GeometryCollection
+                try:
+                    split_result = split(cell_poly, line)
+                    
+                    if len(split_result.geoms) > 1:
+                        # Successful split!
+                        cells_to_remove_indices.append(cell_idx)
+                        
+                        # Create new entries for the pieces
+                        for piece in split_result.geoms:
+                            if isinstance(piece, (Polygon, MultiPolygon)):
+                                new_row = cell_row.copy()
+                                new_row.geometry = piece
+                                # We might want to update node_id or add a flag, 
+                                # but for now we keep the parent ID (duplicate IDs allowed in DISV)
+                                cells_to_keep.append(new_row)
+                except Exception as e:
+                    print(f"Warning: Failed to split cell {cell_row['node_id']} along barrier: {e}")
+            
+            if cells_to_remove_indices:
+                # Remove old cells
+                current_grid = current_grid.drop(cells_to_remove_indices)
+                # Add new pieces
+                new_df = gpd.GeoDataFrame(cells_to_keep, crs=current_grid.crs)
+                current_grid = pd.concat([current_grid, new_df], ignore_index=True)
+        
+        return current_grid
 
     def generate(self):
         """
@@ -111,9 +161,7 @@ class VoronoiTessellator:
         print("Extracting Nodes from Gmsh...")
         nodes, tags = self.nodes, self.node_tags
         
-        # --- GHOST NODE TRICK ---
-        # Add 4 ghost nodes very far away to force closure of the convex hull
-        # This ensures 'scipy.spatial.Voronoi' returns finite polygons for our domain.
+        # Ghost Node Trick
         minx, miny = np.min(nodes, axis=0)
         maxx, maxy = np.max(nodes, axis=0)
         w, h = maxx - minx, maxy - miny
@@ -127,45 +175,41 @@ class VoronoiTessellator:
         ])
         
         combined_nodes = np.vstack([nodes, ghost_nodes])
-        # Note: tags for ghost nodes don't matter, we will filter them out later
         
         print("Computing Mathematical Voronoi...")
         raw_gdf = self._build_raw_voronoi(combined_nodes, tags)
         
-        # Filter out the ghost cells (they will be massive)
-        # Simple check: Keep cells that intersect the domain
+        # Filter ghost cells
+        raw_gdf = raw_gdf[raw_gdf['node_id'] != -1]
+        
         print("Clipping to Domain Boundary...")
         domain_gdf = gpd.GeoDataFrame(
             geometry=[self.cm.domain_boundary], 
             crs=self.cm.crs
         )
-        
-        # Clip 1: Global Domain Cut
-        # This ensures the outer boundary is exactly the user input boundary
         bounded_voronoi = gpd.clip(raw_gdf, domain_gdf)
         
-        print("Enforcing Hydrogeological Zones (The Cookie Cutter)...")
-        # Clip 2: Internal Zone Enforcement
-        # We overlay the bounded voronoi with the clean polygons from ConceptualMesh.
-        # This splits any cell crossing a line.
-        
-        # Ensure the clean_polygons have the metadata we want to keep (Zone ID, etc)
+        print("Enforcing Hydrogeological Zones...")
         zones = self.cm.clean_polygons[['geometry', 'zone_id', 'z_order']]
         
-        # The Intersection logic
-        # keep_geom_type=True ensures we don't get LineStrings from touching edges
-        self.final_grid = gpd.overlay(
+        # Intersection with Zones
+        zoned_grid = gpd.overlay(
             bounded_voronoi, 
             zones, 
             how='intersection', 
             keep_geom_type=True
         )
         
-        # Post-Processing: Cleanup
-        # The overlay might produce MultiPolygons or tiny slivers.
+        # Explode MultiPolygons
+        zoned_grid = zoned_grid.explode(index_parts=True).reset_index(drop=True)
+        
+        # --- NEW: Enforce Barriers ---
+        self.final_grid = self._enforce_barriers(zoned_grid)
+        
+        # Final Cleanup
         self.final_grid = self.final_grid.explode(index_parts=True).reset_index(drop=True)
         
-        # Calculate cell centers (for MF6 DISV)
+        # Calculate centroids
         self.final_grid['x'] = self.final_grid.geometry.centroid.x
         self.final_grid['y'] = self.final_grid.geometry.centroid.y
         
