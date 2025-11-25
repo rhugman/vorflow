@@ -20,7 +20,6 @@ class MeshGenerator:
         if not gmsh.is_initialized():
             gmsh.initialize()
             gmsh.option.setNumber("General.Verbosity", self.verbosity)
-            # Relax tolerances slightly to handle floating point noise in inputs
             gmsh.option.setNumber("Geometry.Tolerance", 1e-6)
             gmsh.option.setNumber("Geometry.OCCBooleanPreserveNumbering", 1)
             gmsh.model.add("mesh_model")
@@ -35,15 +34,10 @@ class MeshGenerator:
         """
         Transfers Shapely geometry to Gmsh OCC kernel.
         Strategy: Fragment EVERYTHING (Surfaces, Lines, AND Points).
-        
-        This resolves all topological relationships:
-        - Overlapping polygons are stitched.
-        - Lines cut surfaces.
-        - Points are inserted as vertices into surfaces/lines.
         """
         gmsh_map = {'points': {}, 'lines': {}, 'surfaces': {}}
         
-        # 1. Add Points (Wells)
+        # 1. Add Points
         all_point_tags = []
         for idx, row in points_gdf.iterrows():
             x, y = row.geometry.x, row.geometry.y
@@ -51,7 +45,7 @@ class MeshGenerator:
             gmsh_map['points'][idx] = tag
             all_point_tags.append(tag)
             
-        # 2. Add Lines (Rivers, Faults)
+        # 2. Add Lines
         all_line_tags = []
         for idx, row in lines_gdf.iterrows():
             coords = list(row.geometry.coords)
@@ -67,7 +61,7 @@ class MeshGenerator:
             gmsh_map['lines'][idx] = line_segs
             all_line_tags.extend(line_segs)
 
-        # 3. Add Polygons (Zones)
+        # 3. Add Polygons
         initial_surface_tags = []
         for idx, row in polygons_gdf.iterrows():
             ext_coords = list(row.geometry.exterior.coords)
@@ -88,30 +82,17 @@ class MeshGenerator:
             initial_surface_tags.append((2, surf))
 
         # 4. Fragment Everything
-        # We include POINTS in the tool tags. 
-        # This ensures points become hard vertices in the mesh topology.
         object_tags = initial_surface_tags
-        
-        # Tools = Lines + Points
         tool_tags = [(1, t) for t in all_line_tags]
         tool_tags.extend([(0, t) for t in all_point_tags])
         
-        # Fragment
         out_dt, out_map = gmsh.model.occ.fragment(object_tags, tool_tags)
         
-        # CRITICAL: Remove Duplicates
-        # This merges the overlapping surfaces (Background + Refined) and 
-        # snaps points to lines/surfaces if they are within tolerance.
+        # Remove Duplicates (This invalidates old tags!)
         gmsh.model.occ.removeAllDuplicates()
-        
-        # Synchronize to finalize the B-Rep
         gmsh.model.occ.synchronize()
         
-        # Retrieve valid 2D surfaces
         final_surface_tags = [tag for dim, tag in gmsh.model.getEntities(2)]
-
-        # Note: We do NOT need to manually embed points anymore.
-        # The fragment operation has already inserted them into the topology.
 
         # 5. Physical Groups
         gmsh.model.addPhysicalGroup(2, final_surface_tags, tag=2000)
@@ -122,28 +103,41 @@ class MeshGenerator:
     def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
         """
         Sets up the resolution (Size) fields.
-        Now supports 'dist_min' and 'dist_max' columns in input GDFs for control.
+        Uses spatial lookup to find entities after fragmentation.
         """
         field_list = []
         
         # 0. Determine Global Background Size
-        global_max_lc = 0.0
+        global_max_lc = 100.0
         if 'lc' in polygons_gdf.columns and not polygons_gdf.empty:
             global_max_lc = float(polygons_gdf['lc'].max())
-        #if global_max_lc <= 0: global_max_lc = 100.0
+        if global_max_lc <= 0: global_max_lc = 100.0
 
-        # Helper to find point tags robustly
+        # --- SPATIAL LOOKUP HELPERS ---
         def get_point_tag_at(x, y):
             eps = 1e-4
             ents = gmsh.model.getEntitiesInBoundingBox(x-eps, y-eps, -eps, x+eps, y+eps, eps, dim=0)
-            if ents:
-                return ents[0][1]
+            if ents: return ents[0][1]
             return None
 
+        def get_line_tags_for_geom(geom):
+            """Finds all curve tags overlapping with the input LineString."""
+            found_tags = set()
+            coords = list(geom.coords)
+            eps = 1e-4
+            # Sample midpoints of segments
+            for i in range(len(coords) - 1):
+                p1 = coords[i]
+                p2 = coords[i+1]
+                mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+                # Search for curves (dim=1)
+                ents = gmsh.model.getEntitiesInBoundingBox(mx-eps, my-eps, -eps, mx+eps, my+eps, eps, dim=1)
+                for e in ents:
+                    found_tags.add(e[1])
+            return list(found_tags)
+
         def add_refinement(entity_dim, entity_tags, size_target, dist_min, dist_max):
-            if not isinstance(entity_tags, list):
-                entity_tags = [entity_tags]
-            
+            if not isinstance(entity_tags, list): entity_tags = [entity_tags]
             valid_tags = [float(t) for t in entity_tags]
             if not valid_tags: return None
 
@@ -156,19 +150,13 @@ class MeshGenerator:
             f_thresh = gmsh.model.mesh.field.add("Threshold")
             gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMin", float(size_target))
-            
-            # SizeMax is the global background. 
-            # The gradient is determined by (SizeMax - SizeMin) / (DistMax - DistMin)
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", float(global_max_lc))
-            
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMin", float(dist_min))
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", float(dist_max))
             return f_thresh
 
-        # Helper to safely get parameters from GDF
         def get_row_param(row, key, default):
-            if key in row and not pd.isna(row[key]):
-                return float(row[key])
+            if key in row and not pd.isna(row[key]): return float(row[key])
             return default
 
         # 1. Point Resolutions
@@ -176,17 +164,9 @@ class MeshGenerator:
             tag = get_point_tag_at(row.geometry.x, row.geometry.y)
             if tag:
                 lc = max(row.get('lc', 5.0), 0.001)
-                
-                # Default Strategy:
-                # DistMin: Keep refined size constant for 2 * lc
-                # DistMax: Fade out over 1.5 * Background Cell Size
-                # This ensures the transition zone is always proportional to the background grid.
                 default_d_min = lc * 2.0
                 default_d_max = global_max_lc * 1.5
-                
-                # Ensure d_max is always > d_min to avoid errors
-                if default_d_max <= default_d_min:
-                    default_d_max = default_d_min + global_max_lc
+                if default_d_max <= default_d_min: default_d_max = default_d_min + global_max_lc
                 
                 d_min = get_row_param(row, 'dist_min', default_d_min)
                 d_max = get_row_param(row, 'dist_max', default_d_max)
@@ -196,15 +176,14 @@ class MeshGenerator:
 
         # 2. Line Resolutions
         for idx, row in lines_gdf.iterrows():
-            if idx in gmsh_map['lines']:
-                tags = gmsh_map['lines'][idx]
+            # FIX: Use spatial lookup instead of stale gmsh_map
+            tags = get_line_tags_for_geom(row.geometry)
+            
+            if tags:
                 lc = max(row.get('lc', 10.0), 0.001)
-                
                 default_d_min = lc * 1.0
                 default_d_max = global_max_lc * 1.5
-                
-                if default_d_max <= default_d_min:
-                    default_d_max = default_d_min + global_max_lc
+                if default_d_max <= default_d_min: default_d_max = default_d_min + global_max_lc
                 
                 d_min = get_row_param(row, 'dist_min', default_d_min)
                 d_max = get_row_param(row, 'dist_max', default_d_max)
@@ -226,10 +205,8 @@ class MeshGenerator:
         
         gmsh.option.setNumber("Mesh.Algorithm", 5) 
 
-
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
         self._initialize_gmsh()
-        
         try:
             print("Transferring Geometry to Gmsh...")
             gmsh_map, final_surfaces = self._add_geometry(clean_polys, clean_lines, clean_points)
