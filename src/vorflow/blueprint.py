@@ -49,8 +49,19 @@ class ConceptualMesh:
         })
 
 
-    def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False):
-        """Ingests features like rivers, faults, or boundary conditions."""
+    def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False, dist_min=None, dist_max=None):
+        """
+        Ingests features like rivers, faults, or boundary conditions.
+        
+        Args:
+            geometry (shapely.LineString): The geometry.
+            line_id (str): Identifier.
+            resolution (float): Target mesh size on the line.
+            snap_to_polygons (bool): Whether to snap to zone boundaries.
+            is_barrier (bool): If True, acts as a flow barrier (edges align). If False, conductive (nodes align).
+            dist_min (float, optional): Distance from line where mesh size remains constant (resolution).
+            dist_max (float, optional): Distance from line where mesh size reaches background size.
+        """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
             
@@ -58,15 +69,28 @@ class ConceptualMesh:
             'geometry': geometry,
             'line_id': line_id,
             'lc': resolution,
-            'is_barrier': is_barrier 
+            'is_barrier': is_barrier,
+            'dist_min': dist_min,
+            'dist_max': dist_max
         })
 
-    def add_point(self, geometry, point_id, resolution):
-        """Ingests wells or observation points."""
+    def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None):
+        """
+        Ingests wells or observation points.
+        
+        Args:
+            geometry (shapely.Point): The geometry.
+            point_id (str): Identifier.
+            resolution (float): Target mesh size at the point.
+            dist_min (float, optional): Distance from point where mesh size remains constant.
+            dist_max (float, optional): Distance from point where mesh size reaches background size.
+        """
         self.raw_points.append({
             'geometry': geometry,
             'point_id': point_id,
-            'lc': resolution
+            'lc': resolution,
+            'dist_min': dist_min,
+            'dist_max': dist_max
         })
 
     def _resolve_overlaps(self):
@@ -152,13 +176,13 @@ class ConceptualMesh:
             # Construct GeoDataFrame directly from the raw_lines list
             self.clean_lines = gpd.GeoDataFrame(self.raw_lines, crs=self.crs)
         else:
-            self.clean_lines = gpd.GeoDataFrame(columns=['geometry', 'line_id', 'lc', 'is_barrier'], crs=self.crs)
+            self.clean_lines = gpd.GeoDataFrame(columns=['geometry', 'line_id', 'lc', 'is_barrier', 'dist_min', 'dist_max'], crs=self.crs)
 
         # Clean Points
         if self.raw_points:
             self.clean_points = gpd.GeoDataFrame(self.raw_points, crs=self.crs)
         else:
-            self.clean_points = gpd.GeoDataFrame(columns=['geometry', 'point_id', 'lc'], crs=self.crs)
+            self.clean_points = gpd.GeoDataFrame(columns=['geometry', 'point_id', 'lc', 'dist_min', 'dist_max'], crs=self.crs)
 
 
         print("Densifying geometry...")

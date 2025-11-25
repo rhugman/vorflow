@@ -127,10 +127,10 @@ class MeshGenerator:
         field_list = []
         
         # 0. Determine Global Background Size
-        global_max_lc = 100.0
+        global_max_lc = 0.0
         if 'lc' in polygons_gdf.columns and not polygons_gdf.empty:
             global_max_lc = float(polygons_gdf['lc'].max())
-        if global_max_lc <= 0: global_max_lc = 100.0
+        #if global_max_lc <= 0: global_max_lc = 100.0
 
         # Helper to find point tags robustly
         def get_point_tag_at(x, y):
