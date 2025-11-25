@@ -1,6 +1,7 @@
 import geopandas as gpd
 import pandas as pd
-from shapely.geometry import Polygon, LineString, Point, box
+import numpy as np
+from shapely.geometry import Polygon, LineString, Point, box, MultiPolygon
 from shapely.ops import unary_union, snap, linemerge
 from shapely.validation import make_valid
 
@@ -57,7 +58,7 @@ class ConceptualMesh:
             'geometry': geometry,
             'line_id': line_id,
             'lc': resolution,
-            'is_barrier': is_barrier # <--- Store the new argument
+            'is_barrier': is_barrier 
         })
 
     def add_point(self, geometry, point_id, resolution):
@@ -137,7 +138,8 @@ class ConceptualMesh:
         Main execution method.
         1. Resolves overlaps.
         2. Cleans topology.
-        3. Prepares data for the MeshGenerator.
+        3. Applies densification to polygons and lines.
+        4. Prepares data for the MeshGenerator.
         """
         print("Resolving polygon overlaps...")
         self._resolve_overlaps()
@@ -158,7 +160,78 @@ class ConceptualMesh:
         else:
             self.clean_points = gpd.GeoDataFrame(columns=['geometry', 'point_id', 'lc'], crs=self.crs)
 
+
+        print("Densifying geometry...")
+        self._apply_densification()
+
         # Set the global domain boundary based on the union of all polygons
         self.domain_boundary = unary_union(self.clean_polygons.geometry)
         
         return self.clean_polygons, self.clean_lines, self.clean_points
+    
+    
+# ...existing code...
+    def _densify_geometry(self, geometry, resolution):
+        """
+        Adds vertices to LineStrings and Polygon boundaries to ensure segments
+        are no longer than the specified resolution.
+        """
+        def densify_line(line, max_segment_length):
+            if not isinstance(line, LineString):
+                return line
+            
+            coords = list(line.coords)
+            new_coords = [coords[0]]
+            
+            for i in range(len(coords) - 1):
+                p1 = np.array(coords[i])
+                p2 = np.array(coords[i+1])
+                segment_length = np.linalg.norm(p2 - p1)
+                
+                if segment_length > max_segment_length:
+                    num_segments = int(np.ceil(segment_length / max_segment_length))
+                    # Add intermediate points
+                    for j in range(1, num_segments):
+                        t = j / num_segments
+                        p_new = p1 + t * (p2 - p1)
+                        new_coords.append(tuple(p_new))
+                
+                # Always add the end point of the segment to preserve original vertices
+                new_coords.append(coords[i+1])
+            
+            return LineString(new_coords)
+
+        if geometry.geom_type == 'LineString':
+            return densify_line(geometry, resolution)
+            
+        elif geometry.geom_type == 'Polygon':
+            # Densify exterior
+            new_exterior = densify_line(geometry.exterior, resolution)
+            
+            # Densify interiors (holes)
+            new_interiors = []
+            for interior in geometry.interiors:
+                new_interiors.append(densify_line(interior, resolution))
+                
+            return Polygon(new_exterior, new_interiors)
+            
+        elif geometry.geom_type == 'MultiPolygon':
+            parts = [self._densify_geometry(p, resolution) for p in geometry.geoms]
+            return MultiPolygon(parts)
+            
+        return geometry
+
+
+    def _apply_densification(self):
+        """Applies densification to clean polygons and lines."""
+        # Densify Polygons
+        if not self.clean_polygons.empty:
+            self.clean_polygons['geometry'] = self.clean_polygons.apply(
+                lambda row: self._densify_geometry(row['geometry'], row['lc']), axis=1
+            )
+
+        # Densify Lines
+        if not self.clean_lines.empty:
+            self.clean_lines['geometry'] = self.clean_lines.apply(
+                lambda row: self._densify_geometry(row['geometry'], row['lc']), axis=1
+            )
