@@ -10,8 +10,7 @@ from shapely.validation import make_valid
 class VoronoiTessellator:
     def __init__(self, mesh_generator, conceptual_mesh):
         """
-        Converts the Triangular Mesh into a Polgonal Voronoi Grid,
-        strictly respecting the boundaries defined in ConceptualMesh.
+        Converts the Triangular Mesh into a Polgonal Voronoi Grid.
         """
         self.mg = mesh_generator
         self.cm = conceptual_mesh
@@ -21,25 +20,18 @@ class VoronoiTessellator:
         self.node_tags = mesh_generator.node_tags
         self.zones_gdf = mesh_generator.zones_gdf
 
-    def _extract_nodes(self):
-        """
-        Pulls node coordinates from the active Gmsh model.
-        """
-        node_tags, coords, _ = gmsh.model.mesh.getNodes()
-        nodes_3d = np.array(coords).reshape(-1, 3)
-        nodes_2d = nodes_3d[:, :2]
-        return nodes_2d, node_tags
-
     def _build_raw_voronoi(self, nodes, node_tags):
         """
         Uses Scipy to compute the mathematical Voronoi diagram.
         """
+        if len(nodes) < 3:
+            print("Error: Not enough nodes to generate Voronoi.")
+            return gpd.GeoDataFrame()
+
         vor = Voronoi(nodes)
         polygons = []
         ids = []
         
-        # Map point_region to input index
-        # vor.point_region is an array where index i corresponds to input point i
         for i, region_index in enumerate(vor.point_region):
             region = vor.regions[region_index]
             if not region or -1 in region:
@@ -54,7 +46,7 @@ class VoronoiTessellator:
                 if i < len(node_tags):
                     ids.append(node_tags[i])
                 else:
-                    ids.append(-1) # Ghost node ID
+                    ids.append(-1) 
         
         gdf = gpd.GeoDataFrame(
             {'node_id': ids}, 
@@ -66,10 +58,7 @@ class VoronoiTessellator:
     def _enforce_barriers(self, grid_gdf):
         """
         Splits Voronoi cells along 'Barrier' lines.
-        Since nodes are on the line, the cells straddle the line.
-        We cut them to create a face along the fault.
         """
-        # 1. Identify Barrier Lines
         if self.cm.clean_lines.empty:
             return grid_gdf
             
@@ -77,38 +66,14 @@ class VoronoiTessellator:
         if barriers.empty:
             return grid_gdf
             
-        print("Enforcing Barrier Cuts...")
+        print(f"Enforcing Barrier Cuts on {len(barriers)} barrier lines...")
         
-        # We process the grid list-wise to handle splits
-        # Converting to list of dicts is often faster for manipulation than pure GDF
-        new_cells = []
-        
-        # Spatial Index for speed
-        sindex = grid_gdf.sindex
-        
-        # Track which cells have been processed (split)
-        processed_indices = set()
-        
-        # Iterate over barriers
-        # Note: If barriers intersect each other, this simple loop might need recursion,
-        # but for now we assume barriers are handled sequentially.
-        
-        # To do this robustly using GeoPandas:
-        # We can use the 'split' operation on the whole geometry column? 
-        # No, shapely.ops.split works on single geometries.
-        
-        # Strategy:
-        # 1. Find all cells intersecting ANY barrier.
-        # 2. For each such cell, split it by the barrier(s).
-        # 3. Keep the pieces.
-        
-        # Let's do it per barrier to ensure we handle the specific line geometry
         current_grid = grid_gdf
         
         for idx, row in barriers.iterrows():
             line = row.geometry
             
-            # Find candidate cells
+            # Find candidate cells (spatial index query)
             possible_matches_index = list(current_grid.sindex.query(line, predicate='intersects'))
             candidate_cells = current_grid.iloc[possible_matches_index]
             
@@ -118,47 +83,47 @@ class VoronoiTessellator:
             for cell_idx, cell_row in candidate_cells.iterrows():
                 cell_poly = cell_row.geometry
                 
-                # Check actual intersection (sindex is bounding box)
+                # Strict intersection check
                 if not cell_poly.intersects(line):
                     continue
                     
-                # Perform Split
-                # shapely.split(polygon, line) -> GeometryCollection
                 try:
                     split_result = split(cell_poly, line)
                     
+                    # Only proceed if we actually split the polygon into multiple pieces
                     if len(split_result.geoms) > 1:
-                        # Successful split!
-                        cells_to_remove_indices.append(cell_idx)
-                        
-                        # Create new entries for the pieces
+                        valid_pieces = []
                         for piece in split_result.geoms:
                             if isinstance(piece, (Polygon, MultiPolygon)):
                                 new_row = cell_row.copy()
                                 new_row.geometry = piece
-                                # We might want to update node_id or add a flag, 
-                                # but for now we keep the parent ID (duplicate IDs allowed in DISV)
-                                cells_to_keep.append(new_row)
+                                valid_pieces.append(new_row)
+                        
+                        # SAFETY CHECK: Only remove original if we have valid pieces to replace it
+                        if valid_pieces:
+                            cells_to_remove_indices.append(cell_idx)
+                            cells_to_keep.extend(valid_pieces)
+                            
                 except Exception as e:
-                    print(f"Warning: Failed to split cell {cell_row['node_id']} along barrier: {e}")
+                    print(f"Warning: Failed to split cell {cell_row['node_id']}: {e}")
             
             if cells_to_remove_indices:
-                # Remove old cells
                 current_grid = current_grid.drop(cells_to_remove_indices)
-                # Add new pieces
                 new_df = gpd.GeoDataFrame(cells_to_keep, crs=current_grid.crs)
                 current_grid = pd.concat([current_grid, new_df], ignore_index=True)
         
         return current_grid
 
+# ...existing code...
     def generate(self):
         """
-        Main execution workflow.
+        Main execution workflow with debug logging.
         """
-        if self.nodes is None:
-            raise RuntimeError("MeshGenerator data (nodes) is missing. Run MeshGenerator.generate() first.")
+        if self.nodes is None or len(self.nodes) == 0:
+            print("Error: No nodes found in MeshGenerator.")
+            return gpd.GeoDataFrame()
         
-        print("Extracting Nodes from Gmsh...")
+        print(f"Extracting {len(self.nodes)} Nodes from Gmsh...")
         nodes, tags = self.nodes, self.node_tags
         
         # Ghost Node Trick
@@ -178,17 +143,45 @@ class VoronoiTessellator:
         
         print("Computing Mathematical Voronoi...")
         raw_gdf = self._build_raw_voronoi(combined_nodes, tags)
+        print(f"  -> Raw Polygons: {len(raw_gdf)}")
         
         # Filter ghost cells
         raw_gdf = raw_gdf[raw_gdf['node_id'] != -1]
+        print(f"  -> After Ghost Filter: {len(raw_gdf)}")
         
+        # Ensure CRS matches
+        if raw_gdf.crs is None and self.cm.crs:
+            raw_gdf.set_crs(self.cm.crs, inplace=True)
+
         print("Clipping to Domain Boundary...")
+        
+        # FIX: Robust Domain Definition
+        # Instead of relying on self.cm.domain_boundary (which might be unset),
+        # we calculate the union of the actual meshed polygons.
+        if not self.cm.clean_polygons.empty:
+            domain_geom = unary_union(self.cm.clean_polygons.geometry)
+            if not domain_geom.is_valid:
+                domain_geom = make_valid(domain_geom)
+        elif hasattr(self.cm, 'domain_boundary') and self.cm.domain_boundary:
+            domain_geom = self.cm.domain_boundary
+        else:
+            print("Error: No domain geometry found (no polygons).")
+            return gpd.GeoDataFrame()
+
         domain_gdf = gpd.GeoDataFrame(
-            geometry=[self.cm.domain_boundary], 
+            geometry=[domain_geom], 
             crs=self.cm.crs
         )
-        bounded_voronoi = gpd.clip(raw_gdf, domain_gdf)
         
+        bounded_voronoi = gpd.clip(raw_gdf, domain_gdf)
+        print(f"  -> After Domain Clip: {len(bounded_voronoi)}")
+        
+        if len(bounded_voronoi) == 0:
+            print("Warning: Clipping resulted in 0 cells. Check CRS or Domain Box.")
+            print(f"  -> Raw Bounds: {raw_gdf.total_bounds}")
+            print(f"  -> Domain Bounds: {domain_gdf.total_bounds}")
+            return bounded_voronoi
+
         print("Enforcing Hydrogeological Zones...")
         zones = self.cm.clean_polygons[['geometry', 'zone_id', 'z_order']]
         
@@ -199,12 +192,14 @@ class VoronoiTessellator:
             how='intersection', 
             keep_geom_type=True
         )
+        print(f"  -> After Zone Overlay: {len(zoned_grid)}")
         
         # Explode MultiPolygons
         zoned_grid = zoned_grid.explode(index_parts=True).reset_index(drop=True)
         
-        # --- NEW: Enforce Barriers ---
+        # Enforce Barriers
         self.final_grid = self._enforce_barriers(zoned_grid)
+        print(f"  -> After Barrier Cuts: {len(self.final_grid)}")
         
         # Final Cleanup
         self.final_grid = self.final_grid.explode(index_parts=True).reset_index(drop=True)
@@ -215,8 +210,11 @@ class VoronoiTessellator:
         
         print(f"Final Voronoi Grid Generated: {len(self.final_grid)} cells.")
         return self.final_grid
+# ...existing code...
 
     def export_to_shapefile(self, filepath):
-        if self.final_grid is not None:
+        if self.final_grid is not None and not self.final_grid.empty:
             self.final_grid.to_file(filepath)
             print(f"Saved to {filepath}")
+        else:
+            print("No grid to export.")

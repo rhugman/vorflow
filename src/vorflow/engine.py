@@ -3,6 +3,7 @@ import sys
 import math
 import numpy as np
 import pandas as pd
+from shapely.geometry import Polygon, Point, LineString
 
 class MeshGenerator:
     def __init__(self, verbosity=2):
@@ -103,7 +104,6 @@ class MeshGenerator:
     def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
         """
         Sets up the resolution (Size) fields.
-        Uses spatial lookup to find entities after fragmentation.
         """
         field_list = []
         
@@ -113,7 +113,7 @@ class MeshGenerator:
             global_max_lc = float(polygons_gdf['lc'].max())
         if global_max_lc <= 0: global_max_lc = 100.0
 
-        # --- SPATIAL LOOKUP HELPERS ---
+        # --- HELPERS ---
         def get_point_tag_at(x, y):
             eps = 1e-4
             ents = gmsh.model.getEntitiesInBoundingBox(x-eps, y-eps, -eps, x+eps, y+eps, eps, dim=0)
@@ -121,19 +121,14 @@ class MeshGenerator:
             return None
 
         def get_line_tags_for_geom(geom):
-            """Finds all curve tags overlapping with the input LineString."""
             found_tags = set()
             coords = list(geom.coords)
             eps = 1e-4
-            # Sample midpoints of segments
             for i in range(len(coords) - 1):
-                p1 = coords[i]
-                p2 = coords[i+1]
+                p1, p2 = coords[i], coords[i+1]
                 mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-                # Search for curves (dim=1)
                 ents = gmsh.model.getEntitiesInBoundingBox(mx-eps, my-eps, -eps, mx+eps, my+eps, eps, dim=1)
-                for e in ents:
-                    found_tags.add(e[1])
+                for e in ents: found_tags.add(e[1])
             return list(found_tags)
 
         def add_refinement(entity_dim, entity_tags, size_target, dist_min, dist_max):
@@ -176,9 +171,7 @@ class MeshGenerator:
 
         # 2. Line Resolutions
         for idx, row in lines_gdf.iterrows():
-            # FIX: Use spatial lookup instead of stale gmsh_map
             tags = get_line_tags_for_geom(row.geometry)
-            
             if tags:
                 lc = max(row.get('lc', 10.0), 0.001)
                 default_d_min = lc * 1.0
@@ -191,19 +184,70 @@ class MeshGenerator:
                 fid = add_refinement(1, tags, lc, d_min, d_max)
                 if fid: field_list.append(fid)
 
-        # 3. Global Background Field
+        # 3. Polygon Resolutions (Internal + Gradation)
+        # Iterate over actual Gmsh surfaces to handle fragmented zones
+        final_surfaces = gmsh.model.getEntities(2)
+        
+        for dim, s_tag in final_surfaces:
+            # Find which polygon this surface belongs to via centroid check
+            xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, s_tag)
+            cx, cy = (xmin+xmax)/2, (ymin+ymax)/2
+            
+            # Find matching row in polygons_gdf
+            # Optimization: Filter by bounding box first
+            possible_matches = polygons_gdf.cx[cx:cx, cy:cy]
+            match_row = None
+            p_point = Point(cx, cy)
+            
+            for idx, row in possible_matches.iterrows():
+                if row.geometry.contains(p_point):
+                    match_row = row
+                    break
+            
+            if match_row is not None:
+                lc = float(match_row.get('lc', global_max_lc))
+                
+                # Only apply if this zone is refined relative to background
+                if lc < global_max_lc:
+                    # A. Internal Field: Force constant size inside
+                    f_const = gmsh.model.mesh.field.add("MathEval")
+                    gmsh.model.mesh.field.setString(f_const, "F", str(lc))
+                    
+                    f_restrict = gmsh.model.mesh.field.add("Restrict")
+                    gmsh.model.mesh.field.setNumber(f_restrict, "InField", f_const)
+                    gmsh.model.mesh.field.setNumbers(f_restrict, "SurfacesList", [s_tag])
+                    field_list.append(f_restrict)
+                    
+                    # B. External Field: Gradation from boundary
+                    # Get boundary curves of this surface
+                    bnd = gmsh.model.getBoundary([(2, s_tag)], combined=False, oriented=False, recursive=False)
+                    bnd_curves = [t for d, t in bnd if d == 1]
+                    
+                    if bnd_curves:
+                        default_d_min = lc * 2.0
+                        default_d_max = global_max_lc * 1.5
+                        if default_d_max <= default_d_min: default_d_max = default_d_min + global_max_lc
+                        
+                        d_min = get_row_param(match_row, 'dist_min', default_d_min)
+                        d_max = get_row_param(match_row, 'dist_max', default_d_max)
+                        
+                        fid = add_refinement(1, bnd_curves, lc, d_min, d_max)
+                        if fid: field_list.append(fid)
+
+        # 4. Global Background Field
         f_bg = gmsh.model.mesh.field.add("MathEval")
         gmsh.model.mesh.field.setString(f_bg, "F", str(global_max_lc))
         field_list.append(f_bg)
 
-        # 4. Combine
+        # 5. Combine
         if field_list:
             min_field = gmsh.model.mesh.field.add("Min")
             field_list = [float(f) for f in field_list]
             gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", field_list)
             gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
         
-        gmsh.option.setNumber("Mesh.Algorithm", 5) 
+        gmsh.option.setNumber("Mesh.Algorithm", 5)
+
 
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
         self._initialize_gmsh()
@@ -219,7 +263,7 @@ class MeshGenerator:
             
             print("Optimizing Mesh (Lloyd)...")
             gmsh.option.setNumber("Mesh.Optimize", 1)
-            gmsh.model.mesh.optimize( niter=5)
+            gmsh.model.mesh.optimize( niter=100)
             
             if output_file:
                 gmsh.write(output_file)
