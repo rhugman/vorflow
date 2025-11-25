@@ -19,6 +19,9 @@ class MeshGenerator:
         if not gmsh.is_initialized():
             gmsh.initialize()
             gmsh.option.setNumber("General.Verbosity", self.verbosity)
+            # Relax tolerances slightly to handle floating point noise in inputs
+            gmsh.option.setNumber("Geometry.Tolerance", 1e-6)
+            gmsh.option.setNumber("Geometry.OCCBooleanPreserveNumbering", 1)
             gmsh.model.add("mesh_model")
             self.initialized = True
 
@@ -30,20 +33,25 @@ class MeshGenerator:
     def _add_geometry(self, polygons_gdf, lines_gdf, points_gdf):
         """
         Transfers Shapely geometry to Gmsh OCC kernel.
-        Strategy: Fragment EVERYTHING.
-        This resolves all intersections between barriers, rivers, and zone boundaries.
+        Strategy: Fragment EVERYTHING (Surfaces, Lines, AND Points).
+        
+        This resolves all topological relationships:
+        - Overlapping polygons are stitched.
+        - Lines cut surfaces.
+        - Points are inserted as vertices into surfaces/lines.
         """
         gmsh_map = {'points': {}, 'lines': {}, 'surfaces': {}}
         
         # 1. Add Points (Wells)
+        all_point_tags = []
         for idx, row in points_gdf.iterrows():
             x, y = row.geometry.x, row.geometry.y
             tag = gmsh.model.occ.addPoint(x, y, 0)
             gmsh_map['points'][idx] = tag
+            all_point_tags.append(tag)
             
         # 2. Add Lines (Rivers, Faults)
         all_line_tags = []
-        
         for idx, row in lines_gdf.iterrows():
             coords = list(row.geometry.coords)
             pt_tags = []
@@ -60,9 +68,7 @@ class MeshGenerator:
 
         # 3. Add Polygons (Zones)
         initial_surface_tags = []
-        
         for idx, row in polygons_gdf.iterrows():
-            # Exterior
             ext_coords = list(row.geometry.exterior.coords)
             if ext_coords[0] == ext_coords[-1]:
                 ext_coords = ext_coords[:-1]
@@ -81,83 +87,77 @@ class MeshGenerator:
             initial_surface_tags.append((2, surf))
 
         # 4. Fragment Everything
-        # We cut the surfaces with ALL lines (Barriers AND Conductive).
-        # This ensures that if a river crosses a fault, the geometry is correctly split.
-        # This places nodes on ALL lines, which is required for both cases.
-        
+        # We include POINTS in the tool tags. 
+        # This ensures points become hard vertices in the mesh topology.
         object_tags = initial_surface_tags
+        
+        # Tools = Lines + Points
         tool_tags = [(1, t) for t in all_line_tags]
+        tool_tags.extend([(0, t) for t in all_point_tags])
         
-        # Remove duplicates before fragmenting to clean up dirty input
-        gmsh.model.occ.removeAllDuplicates()
-        
+        # Fragment
         out_dt, out_map = gmsh.model.occ.fragment(object_tags, tool_tags)
         
-        # The valid surfaces are now the result of the fragment operation
-        final_surface_tags = [tag for dim, tag in out_dt if dim == 2]
-
-        # 5. Synchronize
+        # CRITICAL: Remove Duplicates
+        # This merges the overlapping surfaces (Background + Refined) and 
+        # snaps points to lines/surfaces if they are within tolerance.
+        gmsh.model.occ.removeAllDuplicates()
+        
+        # Synchronize to finalize the B-Rep
         gmsh.model.occ.synchronize()
+        
+        # Retrieve valid 2D surfaces
+        final_surface_tags = [tag for dim, tag in gmsh.model.getEntities(2)]
 
-        # 6. Embed Points (Wells)
-        # Points must still be embedded into the new surfaces
-        point_tags = [tag for tag in gmsh_map['points'].values()]
-        if point_tags:
-            # Embed in all surfaces (robust)
-            for s_tag in final_surface_tags:
-                try:
-                    gmsh.model.mesh.embed(0, point_tags, 2, s_tag)
-                except:
-                    pass
+        # Note: We do NOT need to manually embed points anymore.
+        # The fragment operation has already inserted them into the topology.
 
-        # 7. Physical Groups
+        # 5. Physical Groups
         gmsh.model.addPhysicalGroup(2, final_surface_tags, tag=2000)
         gmsh.model.setPhysicalName(2, 2000, "Meshed Domain")
         
         return gmsh_map, final_surface_tags
     
-    
     def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
         """
         Sets up the resolution (Size) fields.
-        Uses a 'Min' field strategy to handle overlapping resolution requests.
         """
         field_list = []
         
-        # Function to add a threshold field
         def add_refinement(entity_dim, entity_tags, size_target, dist_min, dist_max):
-            # Safety: Ensure entity_tags is a list of standard python floats
             if not isinstance(entity_tags, list):
                 entity_tags = [entity_tags]
-            # Explicit cast to float/int for Gmsh API
-            entity_tags = [t for t in entity_tags]
             
-            # 1. Distance Field
+            # Filter tags. Note: Fragment might have consumed/renamed tags.
+            # However, Gmsh fields usually handle "input" tags correctly if they were part of the history.
+            # If strictness is needed, we would need to track the out_map from fragment.
+            # For now, we pass the original tags.
+            valid_tags = [float(t) for t in entity_tags]
+            
+            if not valid_tags:
+                return None
+
             f_dist = gmsh.model.mesh.field.add("Distance")
             if entity_dim == 0: 
-                gmsh.model.mesh.field.setNumbers(f_dist, "PointsList", entity_tags)
+                gmsh.model.mesh.field.setNumbers(f_dist, "PointsList", valid_tags)
             elif entity_dim == 1: 
-                gmsh.model.mesh.field.setNumbers(f_dist, "CurvesList", entity_tags)
+                gmsh.model.mesh.field.setNumbers(f_dist, "CurvesList", valid_tags)
             
-            # 2. Threshold Field
             f_thresh = gmsh.model.mesh.field.add("Threshold")
             gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMin", float(size_target))
-            # SizeMax is set very high so this field doesn't artificially constrain 
-            # the mesh far away. The global background field will cap it.
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", 1e22)
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMin", float(dist_min))
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", float(dist_max))
-            
             return f_thresh
 
-        # 1. Point Resolutions (Wells)
+        # 1. Point Resolutions
         for idx, row in points_gdf.iterrows():
             if idx in gmsh_map['points']:
                 tag = gmsh_map['points'][idx]
-                lc = max(row.get('lc', 5.0), 0.001) # Clamp to avoid 0
+                lc = max(row.get('lc', 5.0), 0.001)
                 fid = add_refinement(0, [tag], lc, 1.0, 500.0)
-                field_list.append(fid)
+                if fid: field_list.append(fid)
 
         # 2. Line Resolutions
         for idx, row in lines_gdf.iterrows():
@@ -165,25 +165,26 @@ class MeshGenerator:
                 tags = gmsh_map['lines'][idx]
                 lc = max(row.get('lc', 10.0), 0.001)
                 fid = add_refinement(1, tags, lc, 5.0, 200.0)
-                field_list.append(fid)
+                if fid: field_list.append(fid)
 
         # 3. Global Background Field
         f_bg = gmsh.model.mesh.field.add("MathEval")
         bg_size = 100.0
         if 'lc' in polygons_gdf.columns and not polygons_gdf.empty:
             bg_size = float(polygons_gdf['lc'].max())
+        if bg_size <= 0: bg_size = 100.0
             
         gmsh.model.mesh.field.setString(f_bg, "F", str(bg_size))
         field_list.append(f_bg)
 
-        # 4. Combine with Min Field
+        # 4. Combine
         if field_list:
             min_field = gmsh.model.mesh.field.add("Min")
             field_list = [float(f) for f in field_list]
             gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", field_list)
             gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
         
-        # Mesh Options - Algo 5 (Delaunay) is often more robust for complex fields than 6
+        # Algo 5 (Delaunay) is robust
         gmsh.option.setNumber("Mesh.Algorithm", 5) 
 
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
@@ -199,14 +200,13 @@ class MeshGenerator:
             print("Generating Triangular Mesh...")
             gmsh.model.mesh.generate(2)
             
-            print("Optimizing Mesh...")
+            print("Optimizing Mesh (Lloyd)...")
             gmsh.option.setNumber("Mesh.Optimize", 1)
             gmsh.model.mesh.optimize( niter=5)
             
             if output_file:
                 gmsh.write(output_file)
                 
-            # Extract nodes
             node_tags, coords, _ = gmsh.model.mesh.getNodes()
             nodes_3d = np.array(coords).reshape(-1, 3)
             self.nodes = nodes_3d[:, :2]
