@@ -2,6 +2,7 @@ import gmsh
 import sys
 import math
 import numpy as np
+import pandas as pd
 
 class MeshGenerator:
     def __init__(self, verbosity=2):
@@ -121,24 +122,22 @@ class MeshGenerator:
     def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
         """
         Sets up the resolution (Size) fields.
+        Now supports 'dist_min' and 'dist_max' columns in input GDFs for control.
         """
         field_list = []
         
         # 0. Determine Global Background Size
-        # We need this to cap the Threshold fields correctly.
-        # If SizeMax is too huge, the gradation is too steep.
         global_max_lc = 100.0
         if 'lc' in polygons_gdf.columns and not polygons_gdf.empty:
             global_max_lc = float(polygons_gdf['lc'].max())
         if global_max_lc <= 0: global_max_lc = 100.0
 
-        # Helper to find point tags robustly (since fragment might change them)
+        # Helper to find point tags robustly
         def get_point_tag_at(x, y):
             eps = 1e-4
-            # Search for 0D entities (points) near coordinates
             ents = gmsh.model.getEntitiesInBoundingBox(x-eps, y-eps, -eps, x+eps, y+eps, eps, dim=0)
             if ents:
-                return ents[0][1] # Return tag
+                return ents[0][1]
             return None
 
         def add_refinement(entity_dim, entity_tags, size_target, dist_min, dist_max):
@@ -158,23 +157,41 @@ class MeshGenerator:
             gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMin", float(size_target))
             
-            # FIX: Set SizeMax to the global background size.
-            # This ensures the linear interpolation 1.0 -> 20.0 happens over DistMax.
+            # SizeMax is the global background. 
+            # The gradient is determined by (SizeMax - SizeMin) / (DistMax - DistMin)
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", float(global_max_lc))
             
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMin", float(dist_min))
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", float(dist_max))
             return f_thresh
 
+        # Helper to safely get parameters from GDF
+        def get_row_param(row, key, default):
+            if key in row and not pd.isna(row[key]):
+                return float(row[key])
+            return default
+
         # 1. Point Resolutions
         for idx, row in points_gdf.iterrows():
-            # Robust lookup: Find the tag currently at this location
             tag = get_point_tag_at(row.geometry.x, row.geometry.y)
-            
             if tag:
                 lc = max(row.get('lc', 5.0), 0.001)
-                # Refine to 'lc' within 2m, fade to background over 150m
-                fid = add_refinement(0, [tag], lc, 2.0, 150.0)
+                
+                # Default Strategy:
+                # DistMin: Keep refined size constant for 2 * lc
+                # DistMax: Fade out over 1.5 * Background Cell Size
+                # This ensures the transition zone is always proportional to the background grid.
+                default_d_min = lc * 2.0
+                default_d_max = global_max_lc * 1.5
+                
+                # Ensure d_max is always > d_min to avoid errors
+                if default_d_max <= default_d_min:
+                    default_d_max = default_d_min + global_max_lc
+                
+                d_min = get_row_param(row, 'dist_min', default_d_min)
+                d_max = get_row_param(row, 'dist_max', default_d_max)
+                
+                fid = add_refinement(0, [tag], lc, d_min, d_max)
                 if fid: field_list.append(fid)
 
         # 2. Line Resolutions
@@ -182,8 +199,17 @@ class MeshGenerator:
             if idx in gmsh_map['lines']:
                 tags = gmsh_map['lines'][idx]
                 lc = max(row.get('lc', 10.0), 0.001)
-                # Refine to 'lc' within 5m, fade to background over 200m
-                fid = add_refinement(1, tags, lc, 5.0, 200.0)
+                
+                default_d_min = lc * 1.0
+                default_d_max = global_max_lc * 1.5
+                
+                if default_d_max <= default_d_min:
+                    default_d_max = default_d_min + global_max_lc
+                
+                d_min = get_row_param(row, 'dist_min', default_d_min)
+                d_max = get_row_param(row, 'dist_max', default_d_max)
+                
+                fid = add_refinement(1, tags, lc, d_min, d_max)
                 if fid: field_list.append(fid)
 
         # 3. Global Background Field
@@ -200,7 +226,7 @@ class MeshGenerator:
         
         gmsh.option.setNumber("Mesh.Algorithm", 5) 
 
-        
+
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
         self._initialize_gmsh()
         
