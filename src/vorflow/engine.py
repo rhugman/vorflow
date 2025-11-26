@@ -8,14 +8,25 @@ from shapely.ops import unary_union
 from shapely.validation import make_valid
 
 class MeshGenerator:
-    def __init__(self, background_lc, verbosity=2):
-        self.initialized = False
+    def __init__(self, background_lc=None,verbosity=0, mesh_algorithm=6, smoothing_steps=10, optimization_cycles=2):
+        """
+        Args:
+            verbosity (int): 0=Silent, 1=Basic, 2=Debug.
+            mesh_algorithm (int): Gmsh 2D Algorithm. 
+                                  5=Delaunay (Fast), 6=Frontal-Delaunay (Better Quality).
+            smoothing_steps (int): Number of Lloyd smoothing steps applied by Gmsh internally during generation.
+            optimization_cycles (int): Number of explicit Relocate2D/Laplace2D passes after generation.
+        """
+        self.background_lc = background_lc
         self.verbosity = verbosity
-        self.background_lc = float(background_lc)
+        self.mesh_algorithm = mesh_algorithm
+        self.smoothing_steps = smoothing_steps
+        self.optimization_cycles = optimization_cycles
+
+        self.initialized = False
         self.nodes = None
         self.node_tags = None
         self.zones_gdf = None
-    
     
     def _initialize_gmsh(self):
         if not gmsh.is_initialized():
@@ -505,7 +516,7 @@ class MeshGenerator:
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
 
-        gmsh.option.setNumber("Mesh.Algorithm", 5) 
+        
 
 
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
@@ -517,23 +528,28 @@ class MeshGenerator:
             print("Setting up Resolution Fields...")
             self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points)
             
+            # OPTIMIZATION: Configurable Algorithm
+            # 5=Delaunay, 6=Frontal-Delaunay (Better for Voronoi)
+            gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm) 
             
-            # 2. Smoothing: Applies Laplacian smoothing to internal nodes.
-            # This relaxes the mesh, making triangles more equilateral.
-            # Equilateral triangles -> Compact, Hexagonal Voronoi cells -> Lower Drift.
-            gmsh.option.setNumber("Mesh.Smoothing", 10) 
+            # Configurable Internal Smoothing
+            gmsh.option.setNumber("Mesh.Smoothing", self.smoothing_steps)
 
             print("Generating Triangular Mesh...")
             gmsh.model.mesh.generate(2)
-            # NEW: Explicit Optimization Passes
-            if self.verbosity > 0:
-                print("Optimizing Mesh (Relocate2D & Laplace2D)...")
             
-            # Relocate2D: Moves nodes to improve element quality (Compactness)
-            gmsh.model.mesh.optimize("Relocate2D",niter=100)
-            
-            # Laplace2D: Smooths the mesh to relax gradients (Drift reduction)
-            gmsh.model.mesh.optimize("Laplace2D",niter=100)
+            # EXPLICIT OPTIMIZATION LOOP
+            if self.optimization_cycles > 0:
+                if self.verbosity > 0:
+                    print(f"Running {self.optimization_cycles} Optimization Cycles (Relocate2D & Laplace2D)...")
+                
+                for i in range(self.optimization_cycles):
+                    if self.verbosity > 1:
+                        print(f"  -> Cycle {i+1}/{self.optimization_cycles}")
+                    # Relocate2D: Moves nodes to improve element quality (Compactness)
+                    gmsh.model.mesh.optimize("Relocate2D",niter=1)
+                    # Laplace2D: Smooths the mesh to relax gradients (Drift reduction)
+                    gmsh.model.mesh.optimize("Laplace2D",niter=1)
 
             
             if output_file:
