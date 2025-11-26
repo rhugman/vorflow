@@ -87,7 +87,10 @@ class VoronoiTessellator:
         print(f"Enforcing Barrier Cuts on {len(barriers_to_cut)} lines (Straddle lines skipped)...")
         
         current_grid = grid_gdf
-        
+
+        # Track the maximum node ID to assign new IDs to split pieces
+        max_id = grid_gdf['node_id'].max()
+
         for idx, row in barriers_to_cut.iterrows():
             # ...existing cut logic...
             line = row.geometry
@@ -112,10 +115,27 @@ class VoronoiTessellator:
                     # Only proceed if we actually split the polygon into multiple pieces
                     if len(split_result.geoms) > 1:
                         valid_pieces = []
-                        for piece in split_result.geoms:
+                        
+                        # Sort pieces by area, largest keeps the original ID
+                        sorted_pieces = sorted(list(split_result.geoms), key=lambda p: p.area, reverse=True)
+                        
+                        for i, piece in enumerate(sorted_pieces):
                             if isinstance(piece, (Polygon, MultiPolygon)):
                                 new_row = cell_row.copy()
                                 new_row.geometry = piece
+                                
+                                if i == 0:
+                                    # Largest piece keeps original ID
+                                    pass 
+                                else:
+                                    # Smaller pieces get new unique IDs
+                                    max_id += 1
+                                    new_row['node_id'] = max_id
+                                    # Note: The x/y generator is now technically "wrong" for this new cell
+                                    # Ideally, calculate a new centroid for it
+                                    new_row['x'] = piece.centroid.x
+                                    new_row['y'] = piece.centroid.y
+                                    
                                 valid_pieces.append(new_row)
                         
                         # SAFETY CHECK: Only remove original if we have valid pieces to replace it
@@ -196,19 +216,42 @@ class VoronoiTessellator:
             print("Warning: Clipping resulted in 0 cells. Check CRS or Domain Box.")
             return bounded_voronoi
 
-        print("Enforcing Hydrogeological Zones...")
+        print("Enforcing Hydrogeological Zones (Optimization: Point Sampling)...")
         zones = self.cm.clean_polygons[['geometry', 'zone_id', 'z_order']]
         
-        # Intersection with Zones
-        zoned_grid = gpd.overlay(
-            bounded_voronoi, 
-            zones, 
-            how='intersection', 
-            keep_geom_type=True
-        )
-        print(f"  -> After Zone Overlay: {len(zoned_grid)}")
+        # Optimization: Instead of expensive polygon overlay/intersection,
+        # we sample the zone at the generator node location.
+        # This avoids creating sliver polygons and is much faster.
         
-        # Explode MultiPolygons
+        # 1. Create temporary points for spatial join
+        pts_gdf = gpd.GeoDataFrame(
+            {'node_id': bounded_voronoi['node_id']},
+            geometry=gpd.points_from_xy(bounded_voronoi.x, bounded_voronoi.y),
+            crs=bounded_voronoi.crs
+        )
+        
+        # 2. Spatial Join to find zone for each node
+        # Use 'intersects' to catch nodes on boundaries
+        joined = gpd.sjoin(pts_gdf, zones, how='left', predicate='intersects')
+        
+        # 3. Handle nodes on boundaries (multiple matches)
+        # Sort by z_order to prioritize overlaying zones
+        if 'z_order' in joined.columns:
+            joined = joined.sort_values('z_order', ascending=False)
+        
+        # Keep one entry per node
+        joined = joined.drop_duplicates(subset='node_id')
+        
+        # 4. Map attributes back to the Voronoi polygons
+        zoned_grid = bounded_voronoi.merge(
+            joined[['node_id', 'zone_id', 'z_order']],
+            on='node_id',
+            how='left'
+        )
+        
+        print(f"  -> Zones Assigned: {len(zoned_grid)}")
+        
+        # Explode MultiPolygons (safety for clip artifacts)
         zoned_grid = zoned_grid.explode(index_parts=True).reset_index(drop=True)
         
         # Enforce Barriers
@@ -217,7 +260,7 @@ class VoronoiTessellator:
         
         # Final Cleanup
         self.final_grid = self.final_grid.explode(index_parts=True).reset_index(drop=True)
-        
+
         # FIX: Do NOT overwrite 'x' and 'y' with centroids.
         # We keep 'x' and 'y' as the generator coordinates for quality analysis.
         # We add explicit centroid columns for reference.

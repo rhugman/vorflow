@@ -154,13 +154,44 @@ class ConceptualMesh:
         Ensures lines snap to polygon boundaries and points snap to lines/polygons
         to ensure Gmsh treats them as connected.
         """
-        # Implementation strategy:
-        # 1. Snap Points to Lines
+        # 1. Collect Polygon Boundaries
+        # We snap to boundaries (LineStrings), not the filled Polygons
+        if not self.clean_polygons.empty:
+            poly_boundaries = unary_union(self.clean_polygons.geometry.boundary)
+        else:
+            poly_boundaries = None
+
         # 2. Snap Lines to Polygon Boundaries
-        # 3. Ensure Polygon shared edges are identical (no slivers)
-        
-        # (Placeholder for complex snapping logic using shapely.ops.snap)
-        pass
+        # This ensures that if a river ends near a zone boundary, it connects exactly.
+        if self.raw_lines and poly_boundaries is not None and not poly_boundaries.is_empty:
+            print(f"Snapping {len(self.raw_lines)} lines to polygon boundaries (tol={tolerance})...")
+            for i, line_data in enumerate(self.raw_lines):
+                original_line = line_data['geometry']
+                # snap(input, reference, tolerance)
+                snapped_line = snap(original_line, poly_boundaries, tolerance)
+                self.raw_lines[i]['geometry'] = snapped_line
+
+        # 3. Snap Points to Everything (Lines + Polygons)
+        # This ensures wells sit exactly on faults or boundaries if they are close.
+        if self.raw_points:
+            geoms_to_snap_to = []
+            if poly_boundaries is not None and not poly_boundaries.is_empty:
+                geoms_to_snap_to.append(poly_boundaries)
+            
+            if self.raw_lines:
+                # Use the potentially updated lines
+                lines_union = unary_union([d['geometry'] for d in self.raw_lines])
+                geoms_to_snap_to.append(lines_union)
+            
+            if geoms_to_snap_to:
+                reference_geom = unary_union(geoms_to_snap_to)
+                
+                print(f"Snapping {len(self.raw_points)} points to geometry (tol={tolerance})...")
+                for i, point_data in enumerate(self.raw_points):
+                    original_point = point_data['geometry']
+                    snapped_point = snap(original_point, reference_geom, tolerance)
+                    self.raw_points[i]['geometry'] = snapped_point
+
 
     def generate(self):
         """

@@ -166,19 +166,43 @@ class MeshGenerator:
 
         return final_map
     
+# ...existing code...
     def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
         """
         Sets up fields using the robust tag map.
         """
         field_list = []
+        
+        # Determine global background size
         global_max_lc = 100.0
         if 'lc' in polygons_gdf.columns and not polygons_gdf.empty:
             global_max_lc = float(polygons_gdf['lc'].max())
         if global_max_lc <= 0: global_max_lc = 100.0
 
+        def extract_tags(entry_list):
+            """Helper to handle both [(dim, tag)] and [tag] formats."""
+            clean_tags = []
+            for item in entry_list:
+                if isinstance(item, (tuple, list)) and len(item) >= 2:
+                    clean_tags.append(item[1])
+                else:
+                    clean_tags.append(item)
+            return clean_tags
+
+        def get_row_param(row, key, default):
+            if key in row and not pd.isna(row[key]): return float(row[key])
+            return float(default)
+
         def add_refinement(entity_dim, entity_tags, size_target, dist_min, dist_max):
             if not entity_tags: return None
             valid_tags = [float(t) for t in entity_tags]
+            
+            # SANITIZATION: Ensure dist_max is logically valid
+            # 1. dist_max must be > dist_min
+            if dist_max <= dist_min:
+                # If invalid, push dist_max out to allow at least some gradation
+                # or assume the user meant "width" and add it to min
+                dist_max = dist_min + max(size_target, 1e-3)
             
             f_dist = gmsh.model.mesh.field.add("Distance")
             if entity_dim == 0: gmsh.model.mesh.field.setNumbers(f_dist, "PointsList", valid_tags)
@@ -192,59 +216,85 @@ class MeshGenerator:
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", float(dist_max))
             return f_thresh
 
-        def get_row_param(row, key, default):
-            if key in row and not pd.isna(row[key]): return float(row[key])
-            return default
-
         # 1. Points
         for idx, row in points_gdf.iterrows():
             if idx in gmsh_map['points']:
-                tags = gmsh_map['points'][idx]
-                lc = max(row.get('lc', 5.0), 0.001)
+                tags = extract_tags(gmsh_map['points'][idx])
+                lc = max(get_row_param(row, 'lc', 5.0), 0.001)
                 d_min = get_row_param(row, 'dist_min', lc * 2.0)
                 d_max = get_row_param(row, 'dist_max', global_max_lc * 1.5)
+                
                 fid = add_refinement(0, tags, lc, d_min, d_max)
                 if fid: field_list.append(fid)
 
         # 2. Lines (and Straddle Edges)
         for idx, row in lines_gdf.iterrows():
             if idx in gmsh_map['lines']:
-                tags = gmsh_map['lines'][idx]
-                lc = max(row.get('lc', 10.0), 0.001)
+                tags = extract_tags(gmsh_map['lines'][idx])
+                lc = max(get_row_param(row, 'lc', 10.0), 0.001)
                 d_min = get_row_param(row, 'dist_min', lc * 1.0)
+                # Use provided dist_max or a reasonable default
                 d_max = get_row_param(row, 'dist_max', global_max_lc * 1.5)
+                
                 fid = add_refinement(1, tags, lc, d_min, d_max)
                 if fid: field_list.append(fid)
+
+        # 3. Polygons (Zone-specific resolution AND Gradation)
+        for idx, row in polygons_gdf.iterrows():
+            if idx in gmsh_map['surfaces']:
+                tags = extract_tags(gmsh_map['surfaces'][idx])
+                lc = get_row_param(row, 'lc', global_max_lc)
                 
-        # 3. Straddle Surfaces (Transfinite Enforcement)
-        # We must validate that the surface is still a 4-sided patch after fragmentation.
+                # Only apply fields if this zone is finer than global
+                if lc < global_max_lc:
+                    # A. Internal Resolution: Constant Field Restricted to Surface
+                    f_const = gmsh.model.mesh.field.add("Constant")
+                    gmsh.model.mesh.field.setNumber(f_const, "VIn", lc)
+                    gmsh.model.mesh.field.setNumber(f_const, "VOut", global_max_lc * 10) # Ignore outside
+                    
+                    f_rest = gmsh.model.mesh.field.add("Restrict")
+                    gmsh.model.mesh.field.setNumber(f_rest, "IField", f_const)
+                    gmsh.model.mesh.field.setNumbers(f_rest, "SurfacesList", [float(t) for t in tags])
+                    field_list.append(f_rest)
+
+                    # B. Exterior Gradation: Threshold Field on Boundary Curves
+                    # This respects dist_max for polygons
+                    d_max = get_row_param(row, 'dist_max', 0.0)
+                    if d_max > 0:
+                        # Get boundary curves for these surfaces
+                        dim_tags = [(2, int(t)) for t in tags]
+                        boundaries = gmsh.model.getBoundary(dim_tags, combined=True, oriented=False, recursive=False)
+                        curve_tags = [b[1] for b in boundaries if b[0] == 1]
+                        
+                        if curve_tags:
+                            d_min = get_row_param(row, 'dist_min', 0.0)
+                            # Add threshold field based on these curves
+                            fid_grad = add_refinement(1, curve_tags, lc, d_min, d_max)
+                            if fid_grad: field_list.append(fid_grad)
+
+        # 4. Straddle Surfaces (Transfinite Enforcement)
         for idx, tags in gmsh_map.get('straddle_surfs', {}).items():
-            for s_tag in tags:
-                # Check topology: Get all boundary points (recursive=True gets vertices)
-                # combined=False, oriented=False, recursive=True
+            clean_tags = extract_tags(tags)
+            for s_tag in clean_tags:
+                # Check topology: Get all boundary points
                 bnd_pts = gmsh.model.getBoundary([(2, s_tag)], combined=False, oriented=False, recursive=True)
-                
-                # bnd_pts is list of (dim, tag). Filter for dim=0 (points)
                 unique_corners = set(t for d, t in bnd_pts if d == 0)
                 
                 if len(unique_corners) == 4:
-                    # It is a valid quad patch
                     try:
                         gmsh.model.mesh.setTransfiniteSurface(s_tag)
                         gmsh.model.mesh.setRecombine(2, s_tag)
                     except Exception:
-                        # Fallback if something else is wrong
                         gmsh.model.mesh.setRecombine(2, s_tag)
                 else:
-                    # It was cut or distorted (e.g. 5 corners). 
-                    # Do NOT use Transfinite, just use Recombine to get quads where possible.
                     gmsh.model.mesh.setRecombine(2, s_tag)
 
-        # 4. Background
+        # 5. Global Background
         f_bg = gmsh.model.mesh.field.add("MathEval")
         gmsh.model.mesh.field.setString(f_bg, "F", str(global_max_lc))
         field_list.append(f_bg)
 
+        # 6. Combine all fields using Min
         if field_list:
             min_field = gmsh.model.mesh.field.add("Min")
             field_list = [float(f) for f in field_list]
@@ -252,6 +302,7 @@ class MeshGenerator:
             gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
         
         gmsh.option.setNumber("Mesh.Algorithm", 5) 
+# ...existing code...
 
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
         self._initialize_gmsh()
