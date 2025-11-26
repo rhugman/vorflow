@@ -259,7 +259,8 @@ class VoronoiTessellator:
         zoned_grid = zoned_grid.explode(index_parts=True).reset_index(drop=True)
         
         # Enforce Barriers
-        self.final_grid = self._enforce_barriers(zoned_grid)
+        #self.final_grid = self._enforce_barriers(zoned_grid)
+        self.final_grid = zoned_grid
         print(f"  -> After Barrier Cuts: {len(self.final_grid)}")
         
         # Final Cleanup
