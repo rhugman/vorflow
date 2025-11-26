@@ -16,4 +16,4 @@ dependencies:
   - jupyter
   - matplotlib
   - pip:
-      - -e .[dev,gmsh]
+      - -e ..[dev]
