@@ -191,16 +191,23 @@ class MeshGenerator:
                 feat_id = info['id']
                 
                 if kind == 'point':
-                    # FIX: Use extend to avoid overwriting if multiple features share an ID
-                    # (e.g. a Line generating points and a Point having the same index)
                     if feat_id not in final_map['points']:
                         final_map['points'][feat_id] = []
                     final_map['points'][feat_id].extend(res_tags)
                     
                 elif kind == 'line':
-                    final_map['lines'][feat_id] = res_tags
+                    # FIX: Accumulate tags for multi-segment lines
+                    # Previously this was overwriting, causing only the last segment to be refined.
+                    if feat_id not in final_map['lines']:
+                        final_map['lines'][feat_id] = []
+                    final_map['lines'][feat_id].extend(res_tags)
+                    
                 elif kind == 'surface':
-                    final_map['surfaces'][feat_id] = res_tags
+                    # FIX: Accumulate tags for MultiPolygons
+                    if feat_id not in final_map['surfaces']:
+                        final_map['surfaces'][feat_id] = []
+                    final_map['surfaces'][feat_id].extend(res_tags)
+                    
                 elif kind == 'straddle_surf':
                     if feat_id not in final_map['straddle_surfs']:
                         final_map['straddle_surfs'][feat_id] = []
