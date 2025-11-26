@@ -264,6 +264,7 @@ class ConceptualMesh:
         if geometry.geom_type == 'LineString':
             return densify_line(geometry, resolution)
             
+            
         elif geometry.geom_type == 'Polygon':
             # Densify exterior
             new_exterior = densify_line(geometry.exterior, resolution)

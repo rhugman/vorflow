@@ -44,8 +44,9 @@ class MeshGenerator:
         all_point_tags = []
         for idx, row in points_gdf.iterrows():
             tag = gmsh.model.occ.addPoint(row.geometry.x, row.geometry.y, 0)
-            input_tag_info[(0, tag)] = {'type': 'point', 'id': idx}
-            all_point_tags.append((0, tag))
+            key = to_key(0, tag)
+            input_tag_info[key] = {'type': 'point', 'id': idx}
+            all_point_tags.append(key)
             
         # 2. Add Lines (and Straddle Ladders)
         all_line_tags = []
@@ -72,7 +73,6 @@ class MeshGenerator:
                 # 2. Create Left/Right points
                 for i, p in enumerate(points):
                     # Calculate tangent/normal
-                    # Use a small delta for tangent approximation
                     t_val = distances[i]
                     p_near = line.interpolate(min(t_val + 0.01, length))
                     if t_val >= length - 0.001: # End of line
@@ -99,8 +99,7 @@ class MeshGenerator:
                     left_tags.append(lt)
                     right_tags.append(rt)
                 
-                # 3. Build Quad Patches
-                # We build a series of 4-sided surfaces connecting the points
+                 # 3. Build Quad Patches
                 for i in range(len(left_tags) - 1):
                     p1, p2 = left_tags[i], left_tags[i+1]
                     p3, p4 = right_tags[i+1], right_tags[i]
@@ -113,13 +112,22 @@ class MeshGenerator:
                     cl = gmsh.model.occ.addCurveLoop([l1, l2, l3, l4])
                     s = gmsh.model.occ.addPlaneSurface([cl])
                     
-                    all_surface_tags.append((2, s))
-                    input_tag_info[(2, s)] = {'type': 'straddle_surf', 'id': idx}
+                    # FIX: Use to_key for Surface
+                    s_key = to_key(2, s)
+                    all_surface_tags.append(s_key)
+                    input_tag_info[s_key] = {'type': 'straddle_surf', 'id': idx}
                     
-                    # Track the outer edges (l1, l3) as lines for resolution control
-                    input_tag_info[(1, l1)] = {'type': 'line', 'id': idx}
-                    input_tag_info[(1, l3)] = {'type': 'line', 'id': idx}
-                    all_line_tags.extend([(1, l1), (1, l3), (1, l2), (1, l4)])
+                    # FIX: Use to_key for Lines
+                    k1, k2, k3, k4 = to_key(1, l1), to_key(1, l2), to_key(1, l3), to_key(1, l4)
+                    
+                    # Register ALL edges so they aren't "lost" during reconstruction
+                    # This ensures they also inherit the line's resolution settings
+                    input_tag_info[k1] = {'type': 'line', 'id': idx}
+                    input_tag_info[k2] = {'type': 'line', 'id': idx} # Rung
+                    input_tag_info[k3] = {'type': 'line', 'id': idx}
+                    input_tag_info[k4] = {'type': 'line', 'id': idx} # Rung
+                    
+                    all_line_tags.extend([k1, k3, k2, k4])
 
             else:
                 # Standard Line
@@ -127,11 +135,13 @@ class MeshGenerator:
                 pt_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in coords]
                 for i in range(len(pt_tags) - 1):
                     l = gmsh.model.occ.addLine(pt_tags[i], pt_tags[i+1])
-                    all_line_tags.append((1, l))
-                    input_tag_info[(1, l)] = {'type': 'line', 'id': idx}
+                    
+                    # FIX: Use to_key for Standard Lines
+                    key = to_key(1, l)
+                    all_line_tags.append(key)
+                    input_tag_info[key] = {'type': 'line', 'id': idx}
 
         # 3. Add Polygons
-        all_surface_tags = []
         if not polygons_gdf.empty:
             print(f"Adding {len(polygons_gdf)} polygons to Gmsh...")
             for idx, row in polygons_gdf.iterrows():
@@ -160,21 +170,19 @@ class MeshGenerator:
                     cl_tag = gmsh.model.occ.addCurveLoop(l_tags)
                     s_tag = gmsh.model.occ.addPlaneSurface([cl_tag])
                     
-                    # KEY FIX: Cast to int for dictionary key
+                    # FIX: Use to_key for Polygons (Already present, but kept for consistency)
                     key = to_key(2, s_tag)
                     input_tag_info[key] = {'type': 'surface', 'id': idx}
                     all_surface_tags.append(key)
 
         # 4. Fragment
-        object_tags = all_surface_tags + all_line_tags + all_point_tags # + straddle tags if any
+        object_tags = all_surface_tags + all_line_tags + all_point_tags 
         
         if not object_tags:
             print("Warning: No geometry to mesh.")
             return {'points': {}, 'lines': {}, 'surfaces': {}, 'straddle_surfs': {}}
 
         print(f"Fragmenting {len(object_tags)} objects...")
-        # Fragment all objects to ensure connectivity
-        # Pass empty list as tool if just resolving self-intersections/topology
         out_dt, out_map = gmsh.model.occ.fragment(object_tags, [])
         gmsh.model.occ.synchronize()
         
@@ -184,13 +192,12 @@ class MeshGenerator:
         print(f"Reconstructing Map (Input Tags: {len(object_tags)}, Out Map Len: {len(out_map)})...")
         
         for i, input_dimtag in enumerate(object_tags):
-            # Robustly handle map lookup
             if i < len(out_map):
                 res_tags = out_map[i]
             else:
                 res_tags = [input_dimtag]
 
-            # KEY FIX: Ensure lookup key matches creation key
+            # Lookup using to_key
             key = to_key(input_dimtag[0], input_dimtag[1])
             
             if key in input_tag_info:
@@ -425,7 +432,7 @@ class MeshGenerator:
             gmsh.model.mesh.generate(2)
             
             print("Optimizing Mesh Quality...")
-            gmsh.model.mesh.optimize("Netgen")
+            gmsh.model.mesh.optimize(method="Gmsh",niter=100,force=True)
             
             if output_file:
                 gmsh.write(output_file)
