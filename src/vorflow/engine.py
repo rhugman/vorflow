@@ -4,6 +4,8 @@ import math
 import numpy as np
 import pandas as pd
 from shapely.geometry import Point, LineString, Polygon
+from shapely.ops import unary_union
+from shapely.validation import make_valid
 
 class MeshGenerator:
     def __init__(self, background_lc, verbosity=2):
@@ -32,11 +34,9 @@ class MeshGenerator:
     def _add_geometry(self, polygons_gdf, lines_gdf, points_gdf):
         """
         Transfers Shapely geometry to Gmsh OCC kernel.
-        Uses Explicit Ladder Construction for Straddle Lines.
         """
         input_tag_info = {} 
         
-        # Helper to ensure tags are standard python ints for dict keys
         def to_key(dim, tag):
             return (int(dim), int(tag))
         
@@ -48,42 +48,63 @@ class MeshGenerator:
             input_tag_info[key] = {'type': 'point', 'id': idx}
             all_point_tags.append(key)
             
+        # --- PRE-PROCESSING: BARRIER ZONES ---
+        barrier_buffers = []
+        for idx, row in lines_gdf.iterrows():
+            val = row.get('is_barrier', False)
+            is_barrier = (val is True) or (str(val).lower() in ['true', '1', 'yes'])
+            straddle = row.get('straddle_width')
+            
+            if is_barrier: 
+                lc = max(row.get('lc', 10.0), 0.001)
+                if straddle and straddle > 0:
+                    eps = straddle / 2.0
+                else:
+                    eps = lc * 0.20
+                
+                # TRIMMING BUFFER:
+                # Increased safety margin to 1.2 (20%).
+                # This pushes standard lines back significantly, ensuring their endpoints
+                # don't interfere with the delicate Delaunay symmetry of the straddle pairs.
+                trim_eps = eps * 1.20
+                
+                buf = row.geometry.buffer(trim_eps, cap_style=2)
+                barrier_buffers.append(buf)
+        
+        barrier_zone = None
+        if barrier_buffers:
+            barrier_zone = unary_union(barrier_buffers)
+            barrier_zone = make_valid(barrier_zone)
+            if self.verbosity > 0:
+                print(f"Constructed Barrier Zone from {len(barrier_buffers)} barriers.")
+
         # 2. Add Lines
         all_line_tags = []
         all_surface_tags = [] 
         
         for idx, row in lines_gdf.iterrows():
-            # Trigger Virtual Straddle if 'straddle_width' is set OR 'is_barrier' is True
+            # ... (Setup variables) ...
+            val = row.get('is_barrier', False)
+            is_barrier = (val is True) or (str(val).lower() in ['true', '1', 'yes'])
             straddle = row.get('straddle_width')
-            is_barrier = row.get('is_barrier', False)
             lc = max(row.get('lc', 10.0), 0.001)
             
             use_virtual_straddle = is_barrier or (straddle is not None and straddle > 0)
             
             if use_virtual_straddle:
-                if self.verbosity > 1:
-                    print(f"Line {idx}: Virtual Straddle Active (Barrier={is_barrier}, Width={straddle})")
-
                 # --- VIRTUAL STRADDLE (Point Pairs) ---
                 line = row.geometry
                 length = line.length
                 num_segments = int(max(1, np.ceil(length / lc)))
                 distances = np.linspace(0, length, num_segments + 1)
                 
-                # Determine offset distance (epsilon)
                 if straddle and straddle > 0:
-                    # Physical width specified
                     epsilon = straddle / 2.0
                 else:
-                    # Virtual Barrier: Use a stable fraction of LC
-                    # 0.01 was too small (optimizer collapsed it).
-                    # 0.20 (20%) creates a 1:2.5 aspect ratio, which survives optimization.
                     epsilon = lc * 0.20
                 
                 for d in distances:
                     p = line.interpolate(d)
-                    
-                    # Calculate Normal
                     t_val = d
                     p_near = line.interpolate(min(t_val + 0.01, length))
                     if t_val >= length - 0.001:
@@ -97,34 +118,62 @@ class MeshGenerator:
                     dx, dy = dx/mag, dy/mag
                     nx, ny = -dy, dx
                     
-                    # Add Pair of Hard Points
-                    # Left Node
                     lx, ly = p.x + nx*epsilon, p.y + ny*epsilon
                     lt = gmsh.model.occ.addPoint(lx, ly, 0)
                     k_l = to_key(0, lt)
                     input_tag_info[k_l] = {'type': 'point', 'id': idx}
                     all_point_tags.append(k_l)
                     
-                    # Right Node
                     rx, ry = p.x - nx*epsilon, p.y - ny*epsilon
                     rt = gmsh.model.occ.addPoint(rx, ry, 0)
                     k_r = to_key(0, rt)
                     input_tag_info[k_r] = {'type': 'point', 'id': idx}
                     all_point_tags.append(k_r)
-                
-                # Note: We do NOT add the line curve itself to Gmsh.
 
             else:
-                # --- STANDARD CONSTRAINT --
-                # Nodes are placed ON the line.
-                coords = list(row.geometry.coords)
-                pt_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in coords]
-                for i in range(len(pt_tags) - 1):
-                    l = gmsh.model.occ.addLine(pt_tags[i], pt_tags[i+1])
+                # --- STANDARD CONSTRAINT ---
+                geom = row.geometry
+                
+                # TRIM AGAINST BARRIERS
+                if barrier_zone:
+                    # Check intersection
+                    if geom.intersects(barrier_zone):
+                        try:
+                            original_len = geom.length
+                            # Difference removes the part of the line inside the buffer
+                            geom = geom.difference(barrier_zone)
+                            
+                            if self.verbosity > 1:
+                                print(f"  Line {idx} trimmed by barrier (Len: {original_len:.2f} -> {geom.length:.2f})")
+                                
+                        except Exception as e:
+                            print(f"Warning: Failed to trim line {idx}: {e}")
+                
+                if geom.is_empty:
+                    continue
+                
+                # Handle MultiLineString (Result of cutting a line in half)
+                if geom.geom_type == 'LineString':
+                    parts = [geom]
+                elif geom.geom_type == 'MultiLineString':
+                    parts = geom.geoms
+                else:
+                    parts = []
+                
+                for part in parts:
+                    # Filter out tiny shards that might remain after trimming
+                    if part.length < 1e-6: continue
                     
-                    key = to_key(1, l)
-                    all_line_tags.append(key)
-                    input_tag_info[key] = {'type': 'line', 'id': idx}
+                    coords = list(part.coords)
+                    if len(coords) < 2: continue
+                    
+                    pt_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in coords]
+                    for i in range(len(pt_tags) - 1):
+                        l = gmsh.model.occ.addLine(pt_tags[i], pt_tags[i+1])
+                        
+                        key = to_key(1, l)
+                        all_line_tags.append(key)
+                        input_tag_info[key] = {'type': 'line', 'id': idx}
 
         # 3. Add Polygons
         if not polygons_gdf.empty:
