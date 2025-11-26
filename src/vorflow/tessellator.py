@@ -8,7 +8,7 @@ from shapely.ops import unary_union, split
 from shapely.validation import make_valid
 
 class VoronoiTessellator:
-    def __init__(self, mesh_generator, conceptual_mesh):
+    def __init__(self, mesh_generator, conceptual_mesh,clip_to_boundary=True):
         """
         Converts the Triangular Mesh into a Polgonal Voronoi Grid.
         """
@@ -19,6 +19,7 @@ class VoronoiTessellator:
         self.nodes = mesh_generator.nodes
         self.node_tags = mesh_generator.node_tags
         self.zones_gdf = mesh_generator.zones_gdf
+        self.clip_to_boundary = clip_to_boundary
 
     def _build_raw_voronoi(self, nodes, node_tags):
         """
@@ -192,29 +193,32 @@ class VoronoiTessellator:
         if raw_gdf.crs is None and self.cm.crs:
             raw_gdf.set_crs(self.cm.crs, inplace=True)
 
-        print("Clipping to Domain Boundary...")
         
-        if not self.cm.clean_polygons.empty:
-            domain_geom = unary_union(self.cm.clean_polygons.geometry)
-            if not domain_geom.is_valid:
-                domain_geom = make_valid(domain_geom)
-        elif hasattr(self.cm, 'domain_boundary') and self.cm.domain_boundary:
-            domain_geom = self.cm.domain_boundary
-        else:
-            print("Error: No domain geometry found (no polygons).")
-            return gpd.GeoDataFrame()
+        if self.clip_to_boundary:
+            print("Clipping to Domain Boundary...")
+            if not self.cm.clean_polygons.empty:
+                domain_geom = unary_union(self.cm.clean_polygons.geometry)
+                if not domain_geom.is_valid:
+                    domain_geom = make_valid(domain_geom)
+            elif hasattr(self.cm, 'domain_boundary') and self.cm.domain_boundary:
+                domain_geom = self.cm.domain_boundary
+            else:
+                print("Error: No domain geometry found (no polygons).")
+                return gpd.GeoDataFrame()
 
-        domain_gdf = gpd.GeoDataFrame(
-            geometry=[domain_geom], 
-            crs=self.cm.crs
-        )
+            domain_gdf = gpd.GeoDataFrame(
+                geometry=[domain_geom], 
+                crs=self.cm.crs
+            )
+            
+            bounded_voronoi = gpd.clip(raw_gdf, domain_gdf)
+            print(f"  -> After Domain Clip: {len(bounded_voronoi)}")
         
-        bounded_voronoi = gpd.clip(raw_gdf, domain_gdf)
-        print(f"  -> After Domain Clip: {len(bounded_voronoi)}")
-        
-        if len(bounded_voronoi) == 0:
-            print("Warning: Clipping resulted in 0 cells. Check CRS or Domain Box.")
-            return bounded_voronoi
+            if len(bounded_voronoi) == 0:
+                print("Warning: Clipping resulted in 0 cells. Check CRS or Domain Box.")
+                return bounded_voronoi
+        else:
+            bounded_voronoi = raw_gdf
 
         print("Enforcing Hydrogeological Zones (Optimization: Point Sampling)...")
         zones = self.cm.clean_polygons[['geometry', 'zone_id', 'z_order']]

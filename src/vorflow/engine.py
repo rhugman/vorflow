@@ -268,13 +268,36 @@ class MeshGenerator:
             if size_max_limit is None:
                 size_max_limit = global_max_lc
 
-            # SANITIZATION: Ensure dist_max is logically valid
+            # 1. GRADIENT LIMITER (Crucial for Convergence)
+            # The mesher struggles if size grows faster than ~1.5x per element.
+            # Min Distance ~= (SizeMax - SizeMin) / (GrowthRate * SizeMin)
+            # We enforce a conservative max slope to prevent stalling.
+            
+            size_diff = size_max_limit - size_target
+            if size_diff > 0:
+                # Max allowed slope: grow by 50% of current size per unit distance
+                # This is a heuristic to keep the mesh quality high and generation fast.
+                min_span_required = size_diff / (0.5 * size_target)
+                
+                # Ensure dist_max provides enough room
+                current_span = dist_max - dist_min
+                if current_span < min_span_required:
+                    # Extend dist_max to satisfy gradient limit
+                    dist_max = dist_min + min_span_required
+
+            # Sanity check
             if dist_max <= dist_min:
                 dist_max = dist_min + max(size_target, 1e-3)
             
+            # 2. Create Distance Field
             f_dist = gmsh.model.mesh.field.add("Distance")
             if entity_dim == 0: gmsh.model.mesh.field.setNumbers(f_dist, "PointsList", valid_tags)
             elif entity_dim == 1: gmsh.model.mesh.field.setNumbers(f_dist, "CurvesList", valid_tags)
+            
+            # 3. Use Native Threshold (Linear) for Efficiency
+            # MathEval (Exponential) is too slow for large meshes. 
+            # The Gradient Limiter above ensures this Linear field is steep enough to be 
+            # efficient but smooth enough to converge quickly.
             
             f_thresh = gmsh.model.mesh.field.add("Threshold")
             gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
@@ -282,6 +305,7 @@ class MeshGenerator:
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", float(size_max_limit))
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMin", float(dist_min))
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", float(dist_max))
+            
             return f_thresh
 
         # 1. Points
@@ -415,7 +439,7 @@ class MeshGenerator:
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-        
+
         gmsh.option.setNumber("Mesh.Algorithm", 5) 
 
 
@@ -428,11 +452,24 @@ class MeshGenerator:
             print("Setting up Resolution Fields...")
             self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points)
             
+            
+            # 2. Smoothing: Applies Laplacian smoothing to internal nodes.
+            # This relaxes the mesh, making triangles more equilateral.
+            # Equilateral triangles -> Compact, Hexagonal Voronoi cells -> Lower Drift.
+            gmsh.option.setNumber("Mesh.Smoothing", 10) 
+
             print("Generating Triangular Mesh...")
             gmsh.model.mesh.generate(2)
+            # NEW: Explicit Optimization Passes
+            if self.verbosity > 0:
+                print("Optimizing Mesh (Relocate2D & Laplace2D)...")
             
-            print("Optimizing Mesh Quality...")
-            gmsh.model.mesh.optimize(method="Gmsh",niter=100,force=True)
+            # Relocate2D: Moves nodes to improve element quality (Compactness)
+            gmsh.model.mesh.optimize("Relocate2D",niter=100)
+            
+            # Laplace2D: Smooths the mesh to relax gradients (Drift reduction)
+            gmsh.model.mesh.optimize("Laplace2D",niter=100)
+
             
             if output_file:
                 gmsh.write(output_file)
