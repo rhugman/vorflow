@@ -25,22 +25,29 @@ class ConceptualMesh:
         self.clean_lines = gpd.GeoDataFrame()
         self.clean_points = gpd.GeoDataFrame()
 
-    def add_polygon(self, geometry, zone_id, resolution, z_order=0, mesh_refinement=True, dist_min=None, dist_max=None):
+    def add_polygon(self, geometry, zone_id, resolution=None, z_order=0, mesh_refinement=True, dist_min=None, dist_max=None, dist_max_in=None, dist_max_out=None, border_density=None):
         """
         Registers a polygon zone.
         
         Args:
             geometry (shapely.Polygon): The geometry.
             zone_id (int/str): Identifier.
-            resolution (float): Mesh size inside the zone.
-            z_order (int): Stacking order (higher overwrites lower).
-            mesh_refinement (bool): If False, this zone is just for tagging, not meshing control.
-            dist_min (float): Distance from boundary where size remains constant.
-            dist_max (float): Distance from boundary where size reaches background.
+            resolution (float, optional): Mesh size inside the zone. Defaults to background LC if None.
+            z_order (int): Stacking order.
+            mesh_refinement (bool): If False, just for tagging.
+            dist_min (float): Distance from boundary where size remains constant (Wall width).
+            dist_max (float): Legacy shorthand for dist_max_out.
+            dist_max_in (float): Distance inside where size reaches internal resolution.
+            dist_max_out (float): Distance outside where size reaches background.
+            border_density (float, optional): Max segment length for polygon boundary densification.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
             
+        # Handle legacy dist_max
+        if dist_max is not None and dist_max_out is None:
+            dist_max_out = dist_max
+
         self.raw_polygons.append({
             'geometry': geometry,
             'zone_id': zone_id,
@@ -48,7 +55,9 @@ class ConceptualMesh:
             'z_order': z_order,
             'refine': mesh_refinement,
             'dist_min': dist_min,
-            'dist_max': dist_max
+            'dist_max_in': dist_max_in,
+            'dist_max_out': dist_max_out,
+            'border_density': border_density
         })
 
     def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False, dist_min=None, dist_max=None, straddle_width=None):
@@ -277,8 +286,10 @@ class ConceptualMesh:
         """Applies densification to clean polygons and lines."""
         # Densify Polygons
         if not self.clean_polygons.empty:
+            # Use border_density if available. If not, do NOT densify (return original geometry).
             self.clean_polygons['geometry'] = self.clean_polygons.apply(
-                lambda row: self._densify_geometry(row['geometry'], row['lc']), axis=1
+                lambda row: self._densify_geometry(row['geometry'], row['border_density']) 
+                if pd.notna(row.get('border_density')) else row['geometry'], axis=1
             )
 
         # Densify Lines
