@@ -4,16 +4,29 @@ import math
 import numpy as np
 import pandas as pd
 from shapely.geometry import Point, LineString, Polygon
+from shapely.ops import unary_union
+from shapely.validation import make_valid
 
 class MeshGenerator:
-    def __init__(self, background_lc, verbosity=2):
-        self.initialized = False
+    def __init__(self, background_lc=None,verbosity=0, mesh_algorithm=6, smoothing_steps=10, optimization_cycles=2):
+        """
+        Args:
+            verbosity (int): 0=Silent, 1=Basic, 2=Debug.
+            mesh_algorithm (int): Gmsh 2D Algorithm. 
+                                  5=Delaunay (Fast), 6=Frontal-Delaunay (Better Quality).
+            smoothing_steps (int): Number of Lloyd smoothing steps applied by Gmsh internally during generation.
+            optimization_cycles (int): Number of explicit Relocate2D/Laplace2D passes after generation.
+        """
+        self.background_lc = background_lc
         self.verbosity = verbosity
-        self.background_lc = float(background_lc)
+        self.mesh_algorithm = mesh_algorithm
+        self.smoothing_steps = smoothing_steps
+        self.optimization_cycles = optimization_cycles
+
+        self.initialized = False
         self.nodes = None
         self.node_tags = None
         self.zones_gdf = None
-    
     
     def _initialize_gmsh(self):
         if not gmsh.is_initialized():
@@ -32,11 +45,9 @@ class MeshGenerator:
     def _add_geometry(self, polygons_gdf, lines_gdf, points_gdf):
         """
         Transfers Shapely geometry to Gmsh OCC kernel.
-        Uses Explicit Ladder Construction for Straddle Lines.
         """
         input_tag_info = {} 
         
-        # Helper to ensure tags are standard python ints for dict keys
         def to_key(dim, tag):
             return (int(dim), int(tag))
         
@@ -48,98 +59,132 @@ class MeshGenerator:
             input_tag_info[key] = {'type': 'point', 'id': idx}
             all_point_tags.append(key)
             
-        # 2. Add Lines (and Straddle Ladders)
+        # --- PRE-PROCESSING: BARRIER ZONES ---
+        barrier_buffers = []
+        for idx, row in lines_gdf.iterrows():
+            val = row.get('is_barrier', False)
+            is_barrier = (val is True) or (str(val).lower() in ['true', '1', 'yes'])
+            straddle = row.get('straddle_width')
+            
+            if is_barrier: 
+                lc = max(row.get('lc', 10.0), 0.001)
+                if straddle and straddle > 0:
+                    eps = straddle / 2.0
+                else:
+                    eps = lc * 0.20
+                
+                # TRIMMING BUFFER:
+                # Increased safety margin to 1.2 (20%).
+                # This pushes standard lines back significantly, ensuring their endpoints
+                # don't interfere with the delicate Delaunay symmetry of the straddle pairs.
+                trim_eps = eps * 1.20
+                
+                buf = row.geometry.buffer(trim_eps, cap_style=2)
+                barrier_buffers.append(buf)
+        
+        barrier_zone = None
+        if barrier_buffers:
+            barrier_zone = unary_union(barrier_buffers)
+            barrier_zone = make_valid(barrier_zone)
+            if self.verbosity > 0:
+                print(f"Constructed Barrier Zone from {len(barrier_buffers)} barriers.")
+
+        # 2. Add Lines
         all_line_tags = []
         all_surface_tags = [] 
         
         for idx, row in lines_gdf.iterrows():
+            # ... (Setup variables) ...
+            val = row.get('is_barrier', False)
+            is_barrier = (val is True) or (str(val).lower() in ['true', '1', 'yes'])
             straddle = row.get('straddle_width')
             lc = max(row.get('lc', 10.0), 0.001)
             
-            if straddle and straddle > 0:
-                # --- LADDER CONSTRUCTION ---
-                # 1. Resample the line at resolution 'lc'
+            use_virtual_straddle = is_barrier or (straddle is not None and straddle > 0)
+            
+            if use_virtual_straddle:
+                # --- VIRTUAL STRADDLE (Point Pairs) ---
                 line = row.geometry
                 length = line.length
                 num_segments = int(max(1, np.ceil(length / lc)))
-                
-                # Generate points along the line
                 distances = np.linspace(0, length, num_segments + 1)
-                points = [line.interpolate(d) for d in distances]
                 
-                left_tags = []
-                right_tags = []
+                if straddle and straddle > 0:
+                    epsilon = straddle / 2.0
+                else:
+                    epsilon = lc * 0.20
                 
-                # 2. Create Left/Right points
-                for i, p in enumerate(points):
-                    # Calculate tangent/normal
-                    t_val = distances[i]
+                for d in distances:
+                    p = line.interpolate(d)
+                    t_val = d
                     p_near = line.interpolate(min(t_val + 0.01, length))
-                    if t_val >= length - 0.001: # End of line
+                    if t_val >= length - 0.001:
                          p_near = line.interpolate(max(t_val - 0.01, 0))
                          dx, dy = p.x - p_near.x, p.y - p_near.y
                     else:
                          dx, dy = p_near.x - p.x, p_near.y - p.y
                     
-                    # Normalize
                     mag = np.sqrt(dx*dx + dy*dy)
                     if mag == 0: mag = 1
                     dx, dy = dx/mag, dy/mag
-                    
-                    # Normal vector (-dy, dx)
                     nx, ny = -dy, dx
                     
-                    # Offset points
-                    w = straddle / 2.0
-                    lx, ly = p.x + nx*w, p.y + ny*w
-                    rx, ry = p.x - nx*w, p.y - ny*w
-                    
+                    lx, ly = p.x + nx*epsilon, p.y + ny*epsilon
                     lt = gmsh.model.occ.addPoint(lx, ly, 0)
+                    k_l = to_key(0, lt)
+                    input_tag_info[k_l] = {'type': 'point', 'id': idx}
+                    all_point_tags.append(k_l)
+                    
+                    rx, ry = p.x - nx*epsilon, p.y - ny*epsilon
                     rt = gmsh.model.occ.addPoint(rx, ry, 0)
-                    left_tags.append(lt)
-                    right_tags.append(rt)
-                
-                 # 3. Build Quad Patches
-                for i in range(len(left_tags) - 1):
-                    p1, p2 = left_tags[i], left_tags[i+1]
-                    p3, p4 = right_tags[i+1], right_tags[i]
-                    
-                    l1 = gmsh.model.occ.addLine(p1, p2) # Left edge
-                    l2 = gmsh.model.occ.addLine(p2, p3) # Cap/Rung
-                    l3 = gmsh.model.occ.addLine(p3, p4) # Right edge
-                    l4 = gmsh.model.occ.addLine(p4, p1) # Cap/Rung
-                    
-                    cl = gmsh.model.occ.addCurveLoop([l1, l2, l3, l4])
-                    s = gmsh.model.occ.addPlaneSurface([cl])
-                    
-                    # FIX: Use to_key for Surface
-                    s_key = to_key(2, s)
-                    all_surface_tags.append(s_key)
-                    input_tag_info[s_key] = {'type': 'straddle_surf', 'id': idx}
-                    
-                    # FIX: Use to_key for Lines
-                    k1, k2, k3, k4 = to_key(1, l1), to_key(1, l2), to_key(1, l3), to_key(1, l4)
-                    
-                    # Register ALL edges so they aren't "lost" during reconstruction
-                    # This ensures they also inherit the line's resolution settings
-                    input_tag_info[k1] = {'type': 'line', 'id': idx}
-                    input_tag_info[k2] = {'type': 'line', 'id': idx} # Rung
-                    input_tag_info[k3] = {'type': 'line', 'id': idx}
-                    input_tag_info[k4] = {'type': 'line', 'id': idx} # Rung
-                    
-                    all_line_tags.extend([k1, k3, k2, k4])
+                    k_r = to_key(0, rt)
+                    input_tag_info[k_r] = {'type': 'point', 'id': idx}
+                    all_point_tags.append(k_r)
 
             else:
-                # Standard Line
-                coords = list(row.geometry.coords)
-                pt_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in coords]
-                for i in range(len(pt_tags) - 1):
-                    l = gmsh.model.occ.addLine(pt_tags[i], pt_tags[i+1])
+                # --- STANDARD CONSTRAINT ---
+                geom = row.geometry
+                
+                # TRIM AGAINST BARRIERS
+                if barrier_zone:
+                    # Check intersection
+                    if geom.intersects(barrier_zone):
+                        try:
+                            original_len = geom.length
+                            # Difference removes the part of the line inside the buffer
+                            geom = geom.difference(barrier_zone)
+                            
+                            if self.verbosity > 1:
+                                print(f"  Line {idx} trimmed by barrier (Len: {original_len:.2f} -> {geom.length:.2f})")
+                                
+                        except Exception as e:
+                            print(f"Warning: Failed to trim line {idx}: {e}")
+                
+                if geom.is_empty:
+                    continue
+                
+                # Handle MultiLineString (Result of cutting a line in half)
+                if geom.geom_type == 'LineString':
+                    parts = [geom]
+                elif geom.geom_type == 'MultiLineString':
+                    parts = geom.geoms
+                else:
+                    parts = []
+                
+                for part in parts:
+                    # Filter out tiny shards that might remain after trimming
+                    if part.length < 1e-6: continue
                     
-                    # FIX: Use to_key for Standard Lines
-                    key = to_key(1, l)
-                    all_line_tags.append(key)
-                    input_tag_info[key] = {'type': 'line', 'id': idx}
+                    coords = list(part.coords)
+                    if len(coords) < 2: continue
+                    
+                    pt_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in coords]
+                    for i in range(len(pt_tags) - 1):
+                        l = gmsh.model.occ.addLine(pt_tags[i], pt_tags[i+1])
+                        
+                        key = to_key(1, l)
+                        all_line_tags.append(key)
+                        input_tag_info[key] = {'type': 'line', 'id': idx}
 
         # 3. Add Polygons
         if not polygons_gdf.empty:
@@ -206,11 +251,23 @@ class MeshGenerator:
                 feat_id = info['id']
                 
                 if kind == 'point':
-                    final_map['points'][feat_id] = res_tags
+                    if feat_id not in final_map['points']:
+                        final_map['points'][feat_id] = []
+                    final_map['points'][feat_id].extend(res_tags)
+                    
                 elif kind == 'line':
-                    final_map['lines'][feat_id] = res_tags
+                    # FIX: Accumulate tags for multi-segment lines
+                    # Previously this was overwriting, causing only the last segment to be refined.
+                    if feat_id not in final_map['lines']:
+                        final_map['lines'][feat_id] = []
+                    final_map['lines'][feat_id].extend(res_tags)
+                    
                 elif kind == 'surface':
-                    final_map['surfaces'][feat_id] = res_tags
+                    # FIX: Accumulate tags for MultiPolygons
+                    if feat_id not in final_map['surfaces']:
+                        final_map['surfaces'][feat_id] = []
+                    final_map['surfaces'][feat_id].extend(res_tags)
+                    
                 elif kind == 'straddle_surf':
                     if feat_id not in final_map['straddle_surfs']:
                         final_map['straddle_surfs'][feat_id] = []
@@ -268,13 +325,36 @@ class MeshGenerator:
             if size_max_limit is None:
                 size_max_limit = global_max_lc
 
-            # SANITIZATION: Ensure dist_max is logically valid
+            # 1. GRADIENT LIMITER (Crucial for Convergence)
+            # The mesher struggles if size grows faster than ~1.5x per element.
+            # Min Distance ~= (SizeMax - SizeMin) / (GrowthRate * SizeMin)
+            # We enforce a conservative max slope to prevent stalling.
+            
+            size_diff = size_max_limit - size_target
+            if size_diff > 0:
+                # Max allowed slope: grow by 50% of current size per unit distance
+                # This is a heuristic to keep the mesh quality high and generation fast.
+                min_span_required = size_diff / (0.5 * size_target)
+                
+                # Ensure dist_max provides enough room
+                current_span = dist_max - dist_min
+                if current_span < min_span_required:
+                    # Extend dist_max to satisfy gradient limit
+                    dist_max = dist_min + min_span_required
+
+            # Sanity check
             if dist_max <= dist_min:
                 dist_max = dist_min + max(size_target, 1e-3)
             
+            # 2. Create Distance Field
             f_dist = gmsh.model.mesh.field.add("Distance")
             if entity_dim == 0: gmsh.model.mesh.field.setNumbers(f_dist, "PointsList", valid_tags)
             elif entity_dim == 1: gmsh.model.mesh.field.setNumbers(f_dist, "CurvesList", valid_tags)
+            
+            # 3. Use Native Threshold (Linear) for Efficiency
+            # MathEval (Exponential) is too slow for large meshes. 
+            # The Gradient Limiter above ensures this Linear field is steep enough to be 
+            # efficient but smooth enough to converge quickly.
             
             f_thresh = gmsh.model.mesh.field.add("Threshold")
             gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
@@ -282,9 +362,10 @@ class MeshGenerator:
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMax", float(size_max_limit))
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMin", float(dist_min))
             gmsh.model.mesh.field.setNumber(f_thresh, "DistMax", float(dist_max))
+            
             return f_thresh
 
-        # 1. Points
+       # 1. Points
         for idx, row in points_gdf.iterrows():
             if idx in gmsh_map['points']:
                 tags = extract_tags(gmsh_map['points'][idx])
@@ -295,8 +376,9 @@ class MeshGenerator:
                 fid = add_refinement(0, tags, lc, d_min, d_max)
                 if fid: field_list.append(fid)
 
-        # 2. Lines (and Straddle Edges)
+        # 2. Lines (and Straddle Barriers)
         for idx, row in lines_gdf.iterrows():
+            # Case A: Standard Lines (Curves exist in Gmsh)
             if idx in gmsh_map['lines']:
                 tags = extract_tags(gmsh_map['lines'][idx])
                 lc = max(get_row_param(row, 'lc', 10.0), 0.001)
@@ -305,6 +387,24 @@ class MeshGenerator:
                 
                 fid = add_refinement(1, tags, lc, d_min, d_max)
                 if fid: field_list.append(fid)
+            
+            # Case B: Virtual Barriers (Only Points exist in Gmsh)
+            # We must refine around these points to resolve the straddle gap
+            elif idx in gmsh_map['points']:
+                # Verify it is actually a barrier/straddle line
+                is_barrier = row.get('is_barrier', False)
+                straddle = row.get('straddle_width', 0)
+                if is_barrier or (straddle and straddle > 0):
+                    tags = extract_tags(gmsh_map['points'][idx])
+                    lc = max(get_row_param(row, 'lc', 10.0), 0.001)
+                    
+                    # Refine around the straddle points
+                    d_min = get_row_param(row, 'dist_min', lc * 2.0)
+                    d_max = get_row_param(row, 'dist_max', global_max_lc * 1.5)
+                    
+                    # Apply Point Refinement (dim 0)
+                    fid = add_refinement(0, tags, lc, d_min, d_max)
+                    if fid: field_list.append(fid)
 
         # 3. Polygons (Border Density -> Interior Gradation)
         for idx, row in polygons_gdf.iterrows():
@@ -415,8 +515,8 @@ class MeshGenerator:
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+
         
-        gmsh.option.setNumber("Mesh.Algorithm", 5) 
 
 
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
@@ -428,11 +528,29 @@ class MeshGenerator:
             print("Setting up Resolution Fields...")
             self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points)
             
+            # OPTIMIZATION: Configurable Algorithm
+            # 5=Delaunay, 6=Frontal-Delaunay (Better for Voronoi)
+            gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm) 
+            
+            # Configurable Internal Smoothing
+            gmsh.option.setNumber("Mesh.Smoothing", self.smoothing_steps)
+
             print("Generating Triangular Mesh...")
             gmsh.model.mesh.generate(2)
             
-            print("Optimizing Mesh Quality...")
-            gmsh.model.mesh.optimize(method="Gmsh",niter=100,force=True)
+            # EXPLICIT OPTIMIZATION LOOP
+            if self.optimization_cycles > 0:
+                if self.verbosity > 0:
+                    print(f"Running {self.optimization_cycles} Optimization Cycles (Relocate2D & Laplace2D)...")
+                
+                for i in range(self.optimization_cycles):
+                    if self.verbosity > 1:
+                        print(f"  -> Cycle {i+1}/{self.optimization_cycles}")
+                    # Relocate2D: Moves nodes to improve element quality (Compactness)
+                    gmsh.model.mesh.optimize("Relocate2D",niter=1)
+                    # Laplace2D: Smooths the mesh to relax gradients (Drift reduction)
+                    gmsh.model.mesh.optimize("Laplace2D",niter=1)
+
             
             if output_file:
                 gmsh.write(output_file)
