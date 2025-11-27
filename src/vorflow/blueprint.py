@@ -8,18 +8,22 @@ from shapely.validation import make_valid
 class ConceptualMesh:
     def __init__(self, crs="EPSG:4326"):
         """
-        Orchestrates the preprocessing of geometry before meshing.
-        
+        Initializes the conceptual model, which holds raw geometric inputs.
+
+        This class acts as a staging area for geometric features (polygons, lines,
+        points) before they are processed into a clean, non-overlapping set of
+        inputs for the mesh generator.
+
         Args:
-            crs: Coordinate reference system for the project.
+            crs: The coordinate reference system for the project (e.g., "EPSG:4326").
         """
         self.crs = crs
-        # Storing raw inputs with their metadata (resolution, z_order, etc.)
+        # Store raw geometric inputs before processing.
         self.raw_polygons = [] 
         self.raw_lines = []
         self.raw_points = []
         
-        # The calculated "clean" domain
+        # Geometries after cleaning, snapping, and processing.
         self.domain_boundary = None
         self.clean_polygons = gpd.GeoDataFrame()
         self.clean_lines = gpd.GeoDataFrame()
@@ -27,24 +31,31 @@ class ConceptualMesh:
 
     def add_polygon(self, geometry, zone_id, resolution=None, z_order=0, mesh_refinement=True, dist_min=None, dist_max=None, dist_max_in=None, dist_max_out=None, border_density=None):
         """
-        Registers a polygon zone.
-        
+        Adds a polygon feature, such as a model boundary or a refinement zone.
+
         Args:
-            geometry (shapely.Polygon): The geometry.
-            zone_id (int/str): Identifier.
-            resolution (float, optional): Mesh size inside the zone. Defaults to background LC if None.
-            z_order (int): Stacking order.
-            mesh_refinement (bool): If False, just for tagging.
-            dist_min (float): Distance from boundary where size remains constant (Wall width).
-            dist_max (float): Legacy shorthand for dist_max_out.
-            dist_max_in (float): Distance inside where size reaches internal resolution.
-            dist_max_out (float): Distance outside where size reaches background.
-            border_density (float, optional): Max segment length for polygon boundary densification.
+            geometry (shapely.Polygon): The polygon geometry.
+            zone_id (int or str): A unique identifier for the zone.
+            resolution (float, optional): Target mesh size within this polygon. If None,
+                the background mesh size will be used.
+            z_order (int): Stacking order for resolving overlaps. Higher values are
+                processed first and will "cut" into lower-order polygons.
+            mesh_refinement (bool): If True, this polygon will be used to control mesh
+                refinement. If False, it is used only for tagging the final cells.
+            dist_min (float, optional): Distance from the polygon boundary where the mesh
+                size is held constant at the boundary's resolution.
+            dist_max (float, optional): Legacy alias for `dist_max_out`.
+            dist_max_in (float, optional): Distance inside the polygon over which the mesh
+                transitions from the boundary resolution to the internal resolution.
+            dist_max_out (float, optional): Distance outside the polygon over which the
+                mesh transitions to the background resolution.
+            border_density (float, optional): If set, densifies the polygon's boundary
+                by adding vertices, ensuring no segment is longer than this value.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
             
-        # Handle legacy dist_max
+        # For backward compatibility, allow 'dist_max' to function as 'dist_max_out'.
         if dist_max is not None and dist_max_out is None:
             dist_max_out = dist_max
 
@@ -62,18 +73,22 @@ class ConceptualMesh:
 
     def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False, dist_min=None, dist_max=None, straddle_width=None):
         """
-        Ingests features like rivers, faults, or boundary conditions.
-        
+        Adds a line feature, such as a river, fault, or other linear boundary.
+
         Args:
-            geometry (shapely.LineString): The geometry.
-            line_id (str): Identifier.
-            resolution (float): Target mesh size on the line.
-            snap_to_polygons (bool): Whether to snap to zone boundaries.
-            is_barrier (bool): If True, acts as a flow barrier.
-            dist_min (float, optional): Distance from line where mesh size remains constant.
-            dist_max (float, optional): Distance from line where mesh size reaches background size.
-            straddle_width (float, optional): If set, replaces the line with two parallel lines 
-                                              separated by this width. Forces Voronoi face alignment.
+            geometry (shapely.LineString): The line geometry.
+            line_id (str): A unique identifier for the line.
+            resolution (float): Target mesh size along the line.
+            snap_to_polygons (bool): If True, the line's endpoints will be snapped to
+                nearby polygon boundaries to ensure connectivity.
+            is_barrier (bool): If True, the line is treated as a flow barrier. The mesh
+                will be constructed to prevent cell faces from crossing it.
+            dist_min (float, optional): Distance from the line where the mesh size is
+                held constant at the line's resolution.
+            dist_max (float, optional): Distance from the line over which the mesh
+                transitions to the background resolution.
+            straddle_width (float, optional): If set, forces Voronoi cell edges to align
+                perfectly with the line by creating a "virtual straddle" of mesh nodes.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
@@ -85,19 +100,21 @@ class ConceptualMesh:
             'is_barrier': is_barrier,
             'dist_min': dist_min,
             'dist_max': dist_max,
-            'straddle_width': straddle_width # New Parameter
+            'straddle_width': straddle_width
         })
 
     def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None):
         """
-        Ingests wells or observation points.
-        
+        Adds a point feature, such as a well or an observation point.
+
         Args:
-            geometry (shapely.Point): The geometry.
-            point_id (str): Identifier.
+            geometry (shapely.Point): The point geometry.
+            point_id (str): A unique identifier for the point.
             resolution (float): Target mesh size at the point.
-            dist_min (float, optional): Distance from point where mesh size remains constant.
-            dist_max (float, optional): Distance from point where mesh size reaches background size.
+            dist_min (float, optional): Distance from the point where the mesh size is
+                held constant at the point's resolution.
+            dist_max (float, optional): Distance from the point over which the mesh
+                transitions to the background resolution.
         """
         self.raw_points.append({
             'geometry': geometry,
@@ -109,15 +126,16 @@ class ConceptualMesh:
 
     def _resolve_overlaps(self):
         """
-        The 'Cookie Cutter' Algorithm.
-        Processes polygons by z_order to create a flat, non-overlapping planar graph.
+        Processes polygons based on their `z_order` to create a flat,
+        non-overlapping planar partition. Higher `z_order` polygons "cookie-cut"
+        lower ones.
         """
-        # 1. Sort by Priority (Highest Z-order first)
+        # Sort polygons by priority, with the highest z_order processed first.
         df = pd.DataFrame(self.raw_polygons)
         df = df.sort_values(by='z_order', ascending=False)
         
         processed_geoms = []
-        occupied_space = None # Shapely geometry representing filled area
+        occupied_space = None # Tracks the union of all higher-priority polygons.
         
         final_features = []
 
@@ -125,27 +143,28 @@ class ConceptualMesh:
             current_geo = row['geometry']
             
             if occupied_space is None:
-                # First (highest priority) polygon sits as is
+                # The first (highest priority) polygon is added unmodified.
                 final_geo = current_geo
                 occupied_space = current_geo
             else:
-                # Subtract the already occupied space from the current polygon
+                # Subtract the already-occupied space from the current polygon.
                 try:
                     final_geo = current_geo.difference(occupied_space)
                 except Exception as e:
-                    # Fallback for complex topology errors
+                    # If the standard difference fails, try again with valid geometries.
                     current_geo = make_valid(current_geo)
                     occupied_space = make_valid(occupied_space)
                     final_geo = current_geo.difference(occupied_space)
 
-                # Update occupied space
+                # Add the current polygon's footprint to the occupied space.
                 occupied_space = unary_union([occupied_space, current_geo])
             
-            # If the difference resulted in empty geometry (fully covered), skip
+            # Skip if the polygon was completely covered by higher-priority ones.
             if final_geo.is_empty:
                 continue
                 
-            # Handle MultiPolygons (explode them)
+            # If the difference operation resulted in a MultiPolygon, explode it into
+            # individual Polygons, each inheriting the parent's attributes.
             if final_geo.geom_type == 'MultiPolygon':
                 for part in final_geo.geoms:
                     feat = row.copy()
@@ -160,35 +179,36 @@ class ConceptualMesh:
 
     def _enforce_connectivity(self, tolerance=1e-3):
         """
-        Ensures lines snap to polygon boundaries and points snap to lines/polygons
-        to ensure Gmsh treats them as connected.
+        Snaps features together to ensure they are topologically connected before
+        being passed to the mesher. This is crucial for Gmsh to correctly
+
+        interpret shared boundaries.
         """
-        # 1. Collect Polygon Boundaries
-        # We snap to boundaries (LineStrings), not the filled Polygons
+        # 1. Collect all polygon boundaries into a single geometry.
+        # We snap to the linear boundaries, not the polygon areas.
         if not self.clean_polygons.empty:
             poly_boundaries = unary_union(self.clean_polygons.geometry.boundary)
         else:
             poly_boundaries = None
 
-        # 2. Snap Lines to Polygon Boundaries
-        # This ensures that if a river ends near a zone boundary, it connects exactly.
+        # 2. Snap lines to polygon boundaries.
+        # This ensures that features like rivers connect precisely to zone edges.
         if self.raw_lines and poly_boundaries is not None and not poly_boundaries.is_empty:
             print(f"Snapping {len(self.raw_lines)} lines to polygon boundaries (tol={tolerance})...")
             for i, line_data in enumerate(self.raw_lines):
                 original_line = line_data['geometry']
-                # snap(input, reference, tolerance)
                 snapped_line = snap(original_line, poly_boundaries, tolerance)
                 self.raw_lines[i]['geometry'] = snapped_line
 
-        # 3. Snap Points to Everything (Lines + Polygons)
-        # This ensures wells sit exactly on faults or boundaries if they are close.
+        # 3. Snap points to all other geometries (lines and polygon boundaries).
+        # This ensures points like wells are located exactly on a feature.
         if self.raw_points:
             geoms_to_snap_to = []
             if poly_boundaries is not None and not poly_boundaries.is_empty:
                 geoms_to_snap_to.append(poly_boundaries)
             
             if self.raw_lines:
-                # Use the potentially updated lines
+                # Use the (potentially modified) snapped lines for snapping points.
                 lines_union = unary_union([d['geometry'] for d in self.raw_lines])
                 geoms_to_snap_to.append(lines_union)
             
@@ -204,7 +224,9 @@ class ConceptualMesh:
 
     def generate(self):
         """
-        Main execution method.
+        Runs the full preprocessing workflow: resolves polygon overlaps,
+        ensures topological connectivity, and prepares clean GeoDataFrames
+        for the mesher.
         """
         print("Resolving polygon overlaps...")
         self._resolve_overlaps()
@@ -212,7 +234,7 @@ class ConceptualMesh:
         print("Enforcing strict topology...")
         self._enforce_connectivity()
         
-        # Clean Lines
+        # Promote the processed raw geometries to final "clean" GeoDataFrames.
         if self.raw_lines:
             self.clean_lines = gpd.GeoDataFrame(self.raw_lines, crs=self.crs)
         else:
@@ -230,11 +252,11 @@ class ConceptualMesh:
         return self.clean_polygons, self.clean_lines, self.clean_points
 
     
-# ...existing code...
     def _densify_geometry(self, geometry, resolution):
         """
-        Adds vertices to LineStrings and Polygon boundaries to ensure segments
-        are no longer than the specified resolution.
+        Recursively adds vertices to LineStrings and Polygon boundaries to ensure
+        that no segment is longer than the specified resolution. This is critical
+        for forcing the mesh to respect a desired element size along a feature.
         """
         def densify_line(line, max_segment_length):
             if not isinstance(line, LineString):
@@ -250,13 +272,13 @@ class ConceptualMesh:
                 
                 if segment_length > max_segment_length:
                     num_segments = int(np.ceil(segment_length / max_segment_length))
-                    # Add intermediate points
+                    # Add intermediate points along the segment.
                     for j in range(1, num_segments):
                         t = j / num_segments
                         p_new = p1 + t * (p2 - p1)
                         new_coords.append(tuple(p_new))
                 
-                # Always add the end point of the segment to preserve original vertices
+                # Always add the original endpoint of the segment.
                 new_coords.append(coords[i+1])
             
             return LineString(new_coords)
@@ -266,10 +288,10 @@ class ConceptualMesh:
             
             
         elif geometry.geom_type == 'Polygon':
-            # Densify exterior
+            # Densify the exterior ring.
             new_exterior = densify_line(geometry.exterior, resolution)
             
-            # Densify interiors (holes)
+            # Densify all interior rings (holes).
             new_interiors = []
             for interior in geometry.interiors:
                 new_interiors.append(densify_line(interior, resolution))
@@ -284,16 +306,15 @@ class ConceptualMesh:
 
 
     def _apply_densification(self):
-        """Applies densification to clean polygons and lines."""
-        # Densify Polygons
+        """Applies densification to the clean polygon and line features."""
+        # Densify polygon boundaries where a 'border_density' is specified.
         if not self.clean_polygons.empty:
-            # Use border_density if available. If not, do NOT densify (return original geometry).
             self.clean_polygons['geometry'] = self.clean_polygons.apply(
                 lambda row: self._densify_geometry(row['geometry'], row['border_density']) 
                 if pd.notna(row.get('border_density')) else row['geometry'], axis=1
             )
 
-        # Densify Lines
+        # Densify lines based on their target resolution ('lc').
         if not self.clean_lines.empty:
             self.clean_lines['geometry'] = self.clean_lines.apply(
                 lambda row: self._densify_geometry(row['geometry'], row['lc']), axis=1

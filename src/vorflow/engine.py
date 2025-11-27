@@ -10,12 +10,21 @@ from shapely.validation import make_valid
 class MeshGenerator:
     def __init__(self, background_lc=None,verbosity=0, mesh_algorithm=6, smoothing_steps=10, optimization_cycles=2):
         """
+        Initializes the Gmsh-based mesh generator.
+
+        This class is responsible for taking clean geometric inputs and using Gmsh
+        to produce a high-quality triangular mesh.
+
         Args:
-            verbosity (int): 0=Silent, 1=Basic, 2=Debug.
-            mesh_algorithm (int): Gmsh 2D Algorithm. 
-                                  5=Delaunay (Fast), 6=Frontal-Delaunay (Better Quality).
-            smoothing_steps (int): Number of Lloyd smoothing steps applied by Gmsh internally during generation.
-            optimization_cycles (int): Number of explicit Relocate2D/Laplace2D passes after generation.
+            background_lc (float, optional): The default target mesh size for areas
+                not controlled by a specific refinement field.
+            verbosity (int): Gmsh verbosity level (0=silent, 1=basic, 2=debug).
+            mesh_algorithm (int): The 2D mesh algorithm to use. Common choices are
+                5 (Delaunay) for speed or 6 (Frontal-Delaunay) for quality.
+            smoothing_steps (int): Number of internal Lloyd smoothing iterations
+                performed by Gmsh during mesh generation.
+            optimization_cycles (int): Number of explicit optimization passes
+                (e.g., Relocate2D, Laplace2D) to run after the initial mesh is generated.
         """
         self.background_lc = background_lc
         self.verbosity = verbosity
@@ -44,14 +53,19 @@ class MeshGenerator:
 
     def _add_geometry(self, polygons_gdf, lines_gdf, points_gdf):
         """
-        Transfers Shapely geometry to Gmsh OCC kernel.
+        Transfers Shapely geometries from GeoDataFrames into the Gmsh model.
+
+        This method adds points, lines, and polygons to Gmsh's internal CAD
+        kernel (OCC). It also handles special cases like "straddle" lines and
+        pre-processes barrier features before fragmenting all geometries to
+        create a consistent topological model.
         """
         input_tag_info = {} 
         
         def to_key(dim, tag):
             return (int(dim), int(tag))
         
-        # 1. Add Points
+        # Add all point features to the Gmsh model first.
         all_point_tags = []
         for idx, row in points_gdf.iterrows():
             tag = gmsh.model.occ.addPoint(row.geometry.x, row.geometry.y, 0)
@@ -59,7 +73,9 @@ class MeshGenerator:
             input_tag_info[key] = {'type': 'point', 'id': idx}
             all_point_tags.append(key)
             
-        # --- PRE-PROCESSING: BARRIER ZONES ---
+        # Create a buffer zone around barrier lines. This is used to trim back
+        # other lines, preventing their endpoints from interfering with the
+        # meshing of the barrier features.
         barrier_buffers = []
         for idx, row in lines_gdf.iterrows():
             val = row.get('is_barrier', False)
@@ -73,10 +89,9 @@ class MeshGenerator:
                 else:
                     eps = lc * 0.20
                 
-                # TRIMMING BUFFER:
-                # Increased safety margin to 1.2 (20%).
-                # This pushes standard lines back significantly, ensuring their endpoints
-                # don't interfere with the delicate Delaunay symmetry of the straddle pairs.
+                # The trim buffer is made slightly larger than the feature's half-width
+                # to ensure a clean separation between standard lines and the
+                # sensitive node pairs used for straddle barriers.
                 trim_eps = eps * 1.20
                 
                 buf = row.geometry.buffer(trim_eps, cap_style=2)
@@ -89,12 +104,11 @@ class MeshGenerator:
             if self.verbosity > 0:
                 print(f"Constructed Barrier Zone from {len(barrier_buffers)} barriers.")
 
-        # 2. Add Lines
+        # Add line features to the model, handling barriers and standard lines differently.
         all_line_tags = []
         all_surface_tags = [] 
         
         for idx, row in lines_gdf.iterrows():
-            # ... (Setup variables) ...
             val = row.get('is_barrier', False)
             is_barrier = (val is True) or (str(val).lower() in ['true', '1', 'yes'])
             straddle = row.get('straddle_width')
@@ -103,7 +117,10 @@ class MeshGenerator:
             use_virtual_straddle = is_barrier or (straddle is not None and straddle > 0)
             
             if use_virtual_straddle:
-                # --- VIRTUAL STRADDLE (Point Pairs) ---
+                # For barriers or "straddle" lines, we don't add the line itself.
+                # Instead, we place pairs of points along the line's path. These
+                # points will become nodes in the triangular mesh, forcing the
+                # subsequent Voronoi cell edges to align with the original line.
                 line = row.geometry
                 length = line.length
                 num_segments = int(max(1, np.ceil(length / lc)))
@@ -129,6 +146,7 @@ class MeshGenerator:
                     dx, dy = dx/mag, dy/mag
                     nx, ny = -dy, dx
                     
+                    # Create two points, offset from the original line by the normal.
                     lx, ly = p.x + nx*epsilon, p.y + ny*epsilon
                     lt = gmsh.model.occ.addPoint(lx, ly, 0)
                     k_l = to_key(0, lt)
@@ -142,16 +160,15 @@ class MeshGenerator:
                     all_point_tags.append(k_r)
 
             else:
-                # --- STANDARD CONSTRAINT ---
+                # This is a standard line feature that will act as a constraint
+                # in the mesh, but not a hard barrier.
                 geom = row.geometry
                 
-                # TRIM AGAINST BARRIERS
+                # Trim the line against the barrier zone to avoid intersections.
                 if barrier_zone:
-                    # Check intersection
                     if geom.intersects(barrier_zone):
                         try:
                             original_len = geom.length
-                            # Difference removes the part of the line inside the buffer
                             geom = geom.difference(barrier_zone)
                             
                             if self.verbosity > 1:
@@ -163,7 +180,7 @@ class MeshGenerator:
                 if geom.is_empty:
                     continue
                 
-                # Handle MultiLineString (Result of cutting a line in half)
+                # A line might be split into multiple parts after being trimmed.
                 if geom.geom_type == 'LineString':
                     parts = [geom]
                 elif geom.geom_type == 'MultiLineString':
@@ -172,12 +189,13 @@ class MeshGenerator:
                     parts = []
                 
                 for part in parts:
-                    # Filter out tiny shards that might remain after trimming
+                    # Filter out tiny fragments that might remain after trimming.
                     if part.length < 1e-6: continue
                     
                     coords = list(part.coords)
                     if len(coords) < 2: continue
                     
+                    # Add each segment of the line to Gmsh.
                     pt_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in coords]
                     for i in range(len(pt_tags) - 1):
                         l = gmsh.model.occ.addLine(pt_tags[i], pt_tags[i+1])
@@ -186,7 +204,7 @@ class MeshGenerator:
                         all_line_tags.append(key)
                         input_tag_info[key] = {'type': 'line', 'id': idx}
 
-        # 3. Add Polygons
+        # Add polygon features to the model.
         if not polygons_gdf.empty:
             print(f"Adding {len(polygons_gdf)} polygons to Gmsh...")
             for idx, row in polygons_gdf.iterrows():
@@ -199,28 +217,30 @@ class MeshGenerator:
                     continue
                 
                 for poly in polys:
-                    # Exterior
+                    # Define the exterior boundary of the polygon.
                     ext_coords = list(poly.exterior.coords)
-                    # Create Loop
                     p_tags = []
-                    for x, y in ext_coords[:-1]: # Skip duplicate end
+                    for x, y in ext_coords[:-1]: # Skip duplicate end point.
                         p_tags.append(gmsh.model.occ.addPoint(x, y, 0))
                     
+                    # Create the line segments forming the boundary.
                     l_tags = []
                     for i in range(len(p_tags)):
                         p1 = p_tags[i]
                         p2 = p_tags[(i + 1) % len(p_tags)]
                         l_tags.append(gmsh.model.occ.addLine(p1, p2))
                     
+                    # Create a curve loop and a plane surface from the boundary.
                     cl_tag = gmsh.model.occ.addCurveLoop(l_tags)
                     s_tag = gmsh.model.occ.addPlaneSurface([cl_tag])
                     
-                    # FIX: Use to_key for Polygons (Already present, but kept for consistency)
                     key = to_key(2, s_tag)
                     input_tag_info[key] = {'type': 'surface', 'id': idx}
                     all_surface_tags.append(key)
 
-        # 4. Fragment
+        # "Fragment" combines all the individual geometries into a single,
+        # topologically consistent model. This is where intersections are
+        # calculated and new, smaller entities are created at overlaps.
         object_tags = all_surface_tags + all_line_tags + all_point_tags 
         
         if not object_tags:
@@ -231,7 +251,8 @@ class MeshGenerator:
         out_dt, out_map = gmsh.model.occ.fragment(object_tags, [])
         gmsh.model.occ.synchronize()
         
-        # 5. Reconstruct Map
+        # After fragmentation, we need to rebuild our map of which original
+        # feature corresponds to which new Gmsh tags.
         final_map = {'points': {}, 'lines': {}, 'surfaces': {}, 'straddle_surfs': {}}
         
         print(f"Reconstructing Map (Input Tags: {len(object_tags)}, Out Map Len: {len(out_map)})...")
@@ -242,7 +263,7 @@ class MeshGenerator:
             else:
                 res_tags = [input_dimtag]
 
-            # Lookup using to_key
+            # Look up the original feature ID using the pre-fragmentation tag.
             key = to_key(input_dimtag[0], input_dimtag[1])
             
             if key in input_tag_info:
@@ -256,14 +277,11 @@ class MeshGenerator:
                     final_map['points'][feat_id].extend(res_tags)
                     
                 elif kind == 'line':
-                    # FIX: Accumulate tags for multi-segment lines
-                    # Previously this was overwriting, causing only the last segment to be refined.
                     if feat_id not in final_map['lines']:
                         final_map['lines'][feat_id] = []
                     final_map['lines'][feat_id].extend(res_tags)
                     
                 elif kind == 'surface':
-                    # FIX: Accumulate tags for MultiPolygons
                     if feat_id not in final_map['surfaces']:
                         final_map['surfaces'][feat_id] = []
                     final_map['surfaces'][feat_id].extend(res_tags)
@@ -277,12 +295,16 @@ class MeshGenerator:
 
         return final_map
     
-# ...existing code...
     def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
         """
-        Sets up fields using the robust tag map.
+        Configures Gmsh mesh size fields based on the input features.
+
+        This method creates and combines various fields (`Distance`, `Threshold`,
+        `MathEval`) to control the mesh element size across the domain. It uses
+        the parameters (e.g., `lc`, `dist_min`, `dist_max`) from the
+        original conceptual model features to define how the mesh should be
+        refined near points, along lines, and within polygons.
         """
-        # --- DIAGNOSTIC START ---
         if self.verbosity > 0:
             print(f"--- Setup Fields Debug ---")
             print(f"Polygons GDF: {len(polygons_gdf)} rows")
@@ -296,15 +318,14 @@ class MeshGenerator:
                     print(f"Match? {first_idx in gmsh_map['surfaces']}")
                 else:
                     print("Gmsh Surface Map is EMPTY.")
-        # --- DIAGNOSTIC END ---
 
         field_list = []
         
-        # Determine global background size from instance variable
+        # The global background mesh size is the fallback resolution.
         global_max_lc = self.background_lc
 
         def extract_tags(entry_list):
-            """Helper to handle both [(dim, tag)] and [tag] formats."""
+            """Helper to get a clean list of integer tags from Gmsh's output."""
             clean_tags = []
             for item in entry_list:
                 if isinstance(item, (tuple, list)) and len(item) >= 2:
@@ -321,41 +342,32 @@ class MeshGenerator:
             if not entity_tags: return None
             valid_tags = [float(t) for t in entity_tags]
             
-            # Default upper limit is global background
             if size_max_limit is None:
                 size_max_limit = global_max_lc
 
-            # 1. GRADIENT LIMITER (Crucial for Convergence)
-            # The mesher struggles if size grows faster than ~1.5x per element.
-            # Min Distance ~= (SizeMax - SizeMin) / (GrowthRate * SizeMin)
-            # We enforce a conservative max slope to prevent stalling.
-            
+            # To ensure the meshing algorithm converges efficiently, the rate of
+            # change in element size must be controlled. This heuristic enforces
+            # a minimum transition distance to prevent the mesh size gradient
+            # from becoming too steep, which can stall the mesher.
             size_diff = size_max_limit - size_target
             if size_diff > 0:
-                # Max allowed slope: grow by 50% of current size per unit distance
-                # This is a heuristic to keep the mesh quality high and generation fast.
                 min_span_required = size_diff / (0.5 * size_target)
                 
-                # Ensure dist_max provides enough room
                 current_span = dist_max - dist_min
                 if current_span < min_span_required:
-                    # Extend dist_max to satisfy gradient limit
                     dist_max = dist_min + min_span_required
 
-            # Sanity check
             if dist_max <= dist_min:
                 dist_max = dist_min + max(size_target, 1e-3)
             
-            # 2. Create Distance Field
+            # Create a `Distance` field, which calculates the distance from the specified entities.
             f_dist = gmsh.model.mesh.field.add("Distance")
             if entity_dim == 0: gmsh.model.mesh.field.setNumbers(f_dist, "PointsList", valid_tags)
             elif entity_dim == 1: gmsh.model.mesh.field.setNumbers(f_dist, "CurvesList", valid_tags)
             
-            # 3. Use Native Threshold (Linear) for Efficiency
-            # MathEval (Exponential) is too slow for large meshes. 
-            # The Gradient Limiter above ensures this Linear field is steep enough to be 
-            # efficient but smooth enough to converge quickly.
-            
+            # Create a `Threshold` field, which uses the `Distance` field to
+            # define a mesh size that varies linearly from `SizeMin` to `SizeMax`
+            # over the range `DistMin` to `DistMax`. This is more efficient than `MathEval`.
             f_thresh = gmsh.model.mesh.field.add("Threshold")
             gmsh.model.mesh.field.setNumber(f_thresh, "InField", f_dist)
             gmsh.model.mesh.field.setNumber(f_thresh, "SizeMin", float(size_target))
@@ -365,7 +377,7 @@ class MeshGenerator:
             
             return f_thresh
 
-       # 1. Points
+       # 1. Point-based refinement fields.
         for idx, row in points_gdf.iterrows():
             if idx in gmsh_map['points']:
                 tags = extract_tags(gmsh_map['points'][idx])
@@ -376,9 +388,9 @@ class MeshGenerator:
                 fid = add_refinement(0, tags, lc, d_min, d_max)
                 if fid: field_list.append(fid)
 
-        # 2. Lines (and Straddle Barriers)
+        # 2. Line-based refinement fields (including straddle barriers).
         for idx, row in lines_gdf.iterrows():
-            # Case A: Standard Lines (Curves exist in Gmsh)
+            # Standard lines that exist as curves in Gmsh.
             if idx in gmsh_map['lines']:
                 tags = extract_tags(gmsh_map['lines'][idx])
                 lc = max(get_row_param(row, 'lc', 10.0), 0.001)
@@ -388,30 +400,26 @@ class MeshGenerator:
                 fid = add_refinement(1, tags, lc, d_min, d_max)
                 if fid: field_list.append(fid)
             
-            # Case B: Virtual Barriers (Only Points exist in Gmsh)
-            # We must refine around these points to resolve the straddle gap
+            # "Straddle" lines, which were converted into pairs of points.
+            # Refinement must be applied to these points to resolve the gap.
             elif idx in gmsh_map['points']:
-                # Verify it is actually a barrier/straddle line
                 is_barrier = row.get('is_barrier', False)
                 straddle = row.get('straddle_width', 0)
                 if is_barrier or (straddle and straddle > 0):
                     tags = extract_tags(gmsh_map['points'][idx])
                     lc = max(get_row_param(row, 'lc', 10.0), 0.001)
                     
-                    # Refine around the straddle points
                     d_min = get_row_param(row, 'dist_min', lc * 2.0)
                     d_max = get_row_param(row, 'dist_max', global_max_lc * 1.5)
                     
-                    # Apply Point Refinement (dim 0)
                     fid = add_refinement(0, tags, lc, d_min, d_max)
                     if fid: field_list.append(fid)
 
-        # 3. Polygons (Border Density -> Interior Gradation)
+        # 3. Polygon-based refinement fields.
         for idx, row in polygons_gdf.iterrows():
             if idx in gmsh_map['surfaces']:
                 tags = extract_tags(gmsh_map['surfaces'][idx])
                 
-                # 1. Determine Targets
                 target_lc = get_row_param(row, 'lc', global_max_lc)
                 border_dens = get_row_param(row, 'border_density', target_lc)
                 boundary_lc = min(target_lc, border_dens)
@@ -419,7 +427,7 @@ class MeshGenerator:
                 if self.verbosity > 1:
                     print(f"Poly {idx}: Target={target_lc}, Border={boundary_lc}, Global={global_max_lc}")
 
-                # 2. Setup Interior Field (Restricted to Surface)
+                # Set up a field for the polygon's interior.
                 if boundary_lc < global_max_lc or target_lc < global_max_lc:
                     
                     dim_tags = [(2, int(t)) for t in tags]
@@ -429,16 +437,13 @@ class MeshGenerator:
                     f_inner = None
                     
                     if curve_tags and boundary_lc < target_lc:
-                        # GRADATION: Border is finer than Interior.
+                        # Create a gradient from the finer boundary to the coarser interior.
                         d_min = get_row_param(row, 'dist_min', 0.0)
-                        
-                        # Use specific internal max distance
                         d_max_in = get_row_param(row, 'dist_max_in', -1.0)
                         
                         if d_max_in > d_min:
                             d_max_inner = d_max_in
                         else:
-                            # HEURISTIC: 5x Boundary Elements
                             d_max_inner = d_min + (boundary_lc * 5.0)
                             d_max_inner = max(d_max_inner, d_min + (target_lc - boundary_lc) * 0.2)
                         
@@ -448,34 +453,30 @@ class MeshGenerator:
                         f_inner = add_refinement(1, curve_tags, boundary_lc, d_min, d_max_inner, size_max_limit=target_lc)
                         
                     else:
-                        # CONSTANT: Uniform interior
+                        # Apply a constant mesh size throughout the interior.
                         if self.verbosity > 1:
                             print(f"  -> Constant Interior: Size={target_lc}")
                         
-                        # WORKAROUND: Use a Threshold field that is "always close"
-                        # Sometimes Constant fields behave oddly with Min in older Gmsh versions
-                        # We create a Distance field to the boundary curves
                         f_dist_inner = gmsh.model.mesh.field.add("Distance")
                         gmsh.model.mesh.field.setNumbers(f_dist_inner, "CurvesList", curve_tags)
                         
                         f_const = gmsh.model.mesh.field.add("Threshold")
                         gmsh.model.mesh.field.setNumber(f_const, "InField", f_dist_inner)
                         gmsh.model.mesh.field.setNumber(f_const, "SizeMin", target_lc)
-                        gmsh.model.mesh.field.setNumber(f_const, "SizeMax", target_lc) # Force constant
-                        gmsh.model.mesh.field.setNumber(f_const, "DistMin", 1e22)      # Always "close"
+                        gmsh.model.mesh.field.setNumber(f_const, "SizeMax", target_lc)
+                        gmsh.model.mesh.field.setNumber(f_const, "DistMin", 1e22)
                         gmsh.model.mesh.field.setNumber(f_const, "DistMax", 1e22)
                         
                         f_inner = f_const
 
-                    # Restrict the chosen field to the Polygon Surface
+                    # Restrict this field to apply only inside the polygon surface.
                     if f_inner:
                         f_rest = gmsh.model.mesh.field.add("Restrict")
                         gmsh.model.mesh.field.setNumber(f_rest, "IField", f_inner)
                         gmsh.model.mesh.field.setNumbers(f_rest, "SurfacesList", [float(t) for t in tags])
                         field_list.append(f_rest)
 
-                # 3. Setup Exterior Field (Gradation to Global)
-                # Use specific external max distance
+                # Set up a field for the polygon's exterior, grading to the global size.
                 d_max_out = get_row_param(row, 'dist_max_out', 0.0)
                 
                 if d_max_out > 0:
@@ -488,38 +489,59 @@ class MeshGenerator:
                         if self.verbosity > 1:
                             print(f"  -> Grading Exterior: DistMax={d_max_out}")
                         
-                        # Grades from boundary_lc -> Global Background
                         fid_grad = add_refinement(1, curve_tags, boundary_lc, d_min, d_max_out, size_max_limit=global_max_lc)
                         if fid_grad: field_list.append(fid_grad)
 
-        # 4. Straddle Surfaces (Transfinite Enforcement)
+        # 4. Straddle surfaces (placeholder for future transfinite enforcement).
         for idx, tags in gmsh_map.get('straddle_surfs', {}).items():
             clean_tags = extract_tags(tags)
             for s_tag in clean_tags:
-                # ...existing code...
                 pass
 
-        # 5. Global Background
+        # 5. Set the final background field. This is a constant field that
+        # provides the mesh size for any area not covered by other fields.
         f_bg = gmsh.model.mesh.field.add("MathEval")
         gmsh.model.mesh.field.setString(f_bg, "F", str(global_max_lc))
         field_list.append(f_bg)
 
-        # 6. Combine all fields using Min
+        # 6. Combine all fields using a `Min` field. At any point in the
+        # domain, the mesh size will be the minimum of all active fields.
         if field_list:
             min_field = gmsh.model.mesh.field.add("Min")
             field_list = [float(f) for f in field_list]
             gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", field_list)
             gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
         
-        # KEY FIX: Disable default boundary extension so our fields have full control
+        # Disable Gmsh's default size-setting mechanisms. We want our fields
+        # to have complete control over the mesh size.
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
 
-        
-
-
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None):
+        """
+        Executes the full mesh generation workflow.
+
+        This method orchestrates the entire process:
+        1. Initializes Gmsh.
+        2. Transfers geometries into the Gmsh model.
+        3. Sets up mesh size fields.
+        4. Generates the 2D triangular mesh.
+        5. Performs optional post-generation optimization.
+        6. Extracts the resulting nodes and their tags.
+
+        Args:
+            clean_polys (GeoDataFrame): Non-overlapping polygons.
+            clean_lines (GeoDataFrame): Snapped and cleaned lines.
+            clean_points (GeoDataFrame): Snapped and cleaned points.
+            output_file (str, optional): If provided, saves the mesh to this path.
+
+        Returns:
+            bool: True if generation was successful.
+        
+        Raises:
+            Exception: If any step in the Gmsh process fails.
+        """
         self._initialize_gmsh()
         try:
             print("Transferring Geometry to Gmsh...")
@@ -528,17 +550,16 @@ class MeshGenerator:
             print("Setting up Resolution Fields...")
             self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points)
             
-            # OPTIMIZATION: Configurable Algorithm
-            # 5=Delaunay, 6=Frontal-Delaunay (Better for Voronoi)
+            # Set the core meshing algorithm.
             gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm) 
             
-            # Configurable Internal Smoothing
+            # Set the number of internal smoothing steps.
             gmsh.option.setNumber("Mesh.Smoothing", self.smoothing_steps)
 
             print("Generating Triangular Mesh...")
             gmsh.model.mesh.generate(2)
             
-            # EXPLICIT OPTIMIZATION LOOP
+            # Run explicit optimization passes after generation for higher quality.
             if self.optimization_cycles > 0:
                 if self.verbosity > 0:
                     print(f"Running {self.optimization_cycles} Optimization Cycles (Relocate2D & Laplace2D)...")
@@ -546,9 +567,9 @@ class MeshGenerator:
                 for i in range(self.optimization_cycles):
                     if self.verbosity > 1:
                         print(f"  -> Cycle {i+1}/{self.optimization_cycles}")
-                    # Relocate2D: Moves nodes to improve element quality (Compactness)
+                    # Moves nodes to improve element shape (compactness).
                     gmsh.model.mesh.optimize("Relocate2D",niter=1)
-                    # Laplace2D: Smooths the mesh to relax gradients (Drift reduction)
+                    # Smooths the mesh to relax gradients (reduces drift).
                     gmsh.model.mesh.optimize("Laplace2D",niter=1)
 
             
