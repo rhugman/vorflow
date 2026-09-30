@@ -46,12 +46,10 @@ or useful enough to port.
 
 ## Current Objective
 
-| # | Milestone | Status | Risk | Behavior change | Doc |
-|---|-----------|--------|------|-----------------|-----|
-| 6 | First PyPI release | TestPyPI verified | Low | None (packaging/metadata only) | [06-pypi-publishing.md](docs/roadmap/06-pypi-publishing.md) |
-
-`0.1.0rc1` was published to TestPyPI and verified on 2026-09-30. The
-milestone becomes **Done** once `0.1.0` is published to PyPI.
+No milestone is in progress. Follow-ups to the first release (CI on newer
+Python versions, a docs site, a citation/DOI, a conda-forge feedstock) are
+listed under Phase 3 in
+[06-pypi-publishing.md](docs/roadmap/06-pypi-publishing.md).
 
 ## Completed Milestones
 
@@ -62,8 +60,9 @@ milestone becomes **Done** once `0.1.0` is published to PyPI.
 | 3 | Boundary inset/mirror points | Done | [03-boundary-mirror-points.md](docs/roadmap/03-boundary-mirror-points.md) |
 | 4 | Structured-quad transfinite buffer | Done | [04-structured-quad-buffer.md](docs/roadmap/04-structured-quad-buffer.md) |
 | 5 | Triangular/mixed element-grid output | Done | [05-triangular-grid-output.md](docs/roadmap/05-triangular-grid-output.md) |
+| 6 | First PyPI release | Done (`0.1.0`, 2026-09-30) | [06-pypi-publishing.md](docs/roadmap/06-pypi-publishing.md) |
 
-All five milestones are implemented: quality metrics and connectivity reports
+All six milestones are complete: quality metrics and connectivity reports
 (`get_triangular_quality`, `utils.build_connectivity`), the active-domain
 workflow example (`examples/active_domain_quality_example.py`), opt-in boundary
 inset/mirror points (`VoronoiTessellator(boundary_centering="inset_mirror")`),
@@ -71,7 +70,8 @@ opt-in structured quad buffers (`add_polygon`/`add_line` with
 `quad_buffer=True`), and the element-grid exporter
 (`MeshGenerator.get_element_grid()`, see
 `examples/triangular_grid_example.py` and
-`examples/structured_buffer_example.py`).
+`examples/structured_buffer_example.py`). `vorflow` 0.1.0 is published on
+[PyPI](https://pypi.org/project/vorflow/).
 
 ## Summary per Milestone
 

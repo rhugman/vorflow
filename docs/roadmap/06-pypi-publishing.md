@@ -1,6 +1,6 @@
 # Milestone 6 — First PyPI release
 
-**Status:** TestPyPI verified · **Current target:** PyPI `0.1.0` · **Risk:** low · **Behavior change:** none (packaging/metadata only)
+**Status:** done — `0.1.0` published to [PyPI](https://pypi.org/project/vorflow/) on 2026-09-30 · **Risk:** low · **Behavior change:** none (packaging/metadata only)
 **Back to** [ROADMAP.md](../../ROADMAP.md)
 
 ## Goal
@@ -77,13 +77,22 @@ generated 2372 cells.
 - [x] Record the result as **TestPyPI verified**. Real PyPI publication remains
   a separate approval gate.
 
-## Final PyPI release (`0.1.0`)
+## Final PyPI release (`0.1.0`, published 2026-09-30)
+
+`v0.1.0` (46b07df) was built and tested by `release.yml` and published to PyPI
+after a manual approval. PyPI refused the first upload attempt
+(`invalid-publisher`: no Trusted Publisher matched the workflow's claims), so
+nothing was uploaded. After the pypi.org publisher was set up, re-running the
+failed job published the artifacts from the original build. A
+fresh venv installed `vorflow` from PyPI: `pip check` was clean,
+`vorflow.__version__` was `0.1.0`, and `examples/basic_usage.py` generated 2372
+cells.
 
 Only after the TestPyPI rehearsal is verified:
 
 - [x] Create the upstream `pypi` GitHub environment (with a required
   reviewer and a `v*` tag rule).
-- [ ] Add the PyPI pending Trusted Publisher (workflow `release.yml`,
+- [x] Add the PyPI pending Trusted Publisher (workflow `release.yml`,
   environment `pypi`).
 - [x] Bump `version` in `pyproject.toml` to `0.1.0`.
 - [x] In `README.md`, replace the "not yet published on PyPI" installation text
@@ -91,10 +100,10 @@ Only after the TestPyPI rehearsal is verified:
 - [x] In `CHANGELOG.md`, add a dated `## [0.1.0] - YYYY-MM-DD` section above
   `[0.1.0rc1]` (listing any changes since the candidate, or stating that there
   were none) and its compare link.
-- [ ] Merge to `main`, then create and push the annotated `v0.1.0` tag from
+- [x] Merge to `main`, then create and push the annotated `v0.1.0` tag from
   `main`.
-- [ ] Review the build and approve the protected `pypi` deployment.
-- [ ] Install `vorflow==0.1.0` from PyPI in a fresh environment, check
+- [x] Review the build and approve the protected `pypi` deployment.
+- [x] Install `vorflow==0.1.0` from PyPI in a fresh environment, check
   `vorflow.__version__`, and mark this milestone **Done**.
 
 ## Phase 3 — Nice-to-have (can follow in later 0.x releases)
