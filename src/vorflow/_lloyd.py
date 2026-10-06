@@ -17,6 +17,18 @@ scales as rho^(-1/4), so rho = h(x)^-4 keeps the spacing at the target mesh
 size h(x). h is interpolated from per-node sizes supplied by the caller
 (``size_interpolator``).
 
+*Smoothed sizes.* Gmsh's per-node sizes (mean incident edge length) jitter by
+7-12% (sd of log h) between neighbouring nodes once the intended grading is
+removed, which is +-30-46% in rho. At growth factor 1.05 that is twice the
+real size step between neighbours, and Lloyd converges to a CVT of the noise
+(rhugman/vorflow#31). ``smooth_log_sizes`` removes most of it with a few
+damped Jacobi passes over the mesh graph in log space: each pass moves a free
+node's log size halfway to the mean of its neighbours', while fixed nodes
+(boundaries, embedded points and lines, hex-ring seeds) keep their size and
+anchor the grading. On the #31 test model 5 passes cut the jitter 3-4x and
+gave the same regularity as the exact size field; from 10-20 passes on the
+smoothing starts to flatten steep grading.
+
 *Centroids.* For a cell that lies inside the domain the weighted centroid is
 integrated over a fan of triangles from the generator (a Voronoi cell is
 convex and contains its generator): sum(w_k x_k) / sum(w_k) over quadrature
@@ -85,6 +97,39 @@ def size_interpolator(nodes, sizes):
         return values
 
     return size_fn
+
+
+def smooth_log_sizes(sizes, free, edges, passes):
+    """Damped Jacobi smoothing of log(sizes) over the graph ``edges``; returns new sizes.
+
+    ``edges`` is an (m, 2) array of node positions. Each pass sets
+    log h_i = (log h_i + mean of log h over i's neighbours) / 2 for every
+    ``free`` node that has a neighbour; the other nodes are returned
+    bit-identical, and ``passes == 0`` returns an unchanged copy.
+    """
+    sizes = np.asarray(sizes, dtype=float)
+    free = np.asarray(free, dtype=bool)
+    edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    if sizes.ndim != 1 or free.shape != sizes.shape:
+        raise ValueError(f"sizes and free must have the same 1D shape. Got {sizes.shape} and {free.shape}.")
+    if len(edges) and (edges.min() < 0 or edges.max() >= len(sizes)):
+        raise ValueError(f"edges must hold node positions in [0, {len(sizes)}).")
+    if not np.all(np.isfinite(sizes)) or np.any(sizes <= 0):
+        raise ValueError("sizes must be positive finite numbers.")
+    validate_size_smoothing(passes)
+    result = sizes.copy()
+    ends = np.concatenate([edges[:, 0], edges[:, 1]])
+    others = np.concatenate([edges[:, 1], edges[:, 0]])
+    degree = np.bincount(ends, minlength=len(sizes))
+    moving = np.flatnonzero(free & (degree > 0))
+    if passes == 0 or len(moving) == 0:
+        return result
+    log_h = np.log(sizes)
+    for _ in range(passes):
+        neighbour_mean = np.bincount(ends, weights=log_h[others], minlength=len(sizes))[moving] / degree[moving]
+        log_h[moving] = 0.5 * log_h[moving] + 0.5 * neighbour_mean
+    result[moving] = np.exp(log_h[moving])
+    return result
 
 
 def _ghost_points(nodes):
@@ -261,19 +306,34 @@ def _is_real_number(value) -> bool:
     return not np.isnan(value)
 
 
-def validate_settings(iterations, damping, tolerance, prefix=""):
-    """Raise ValueError unless iterations is an int >= 0, damping a number in (0, 1] and tolerance a number >= 0.
+def _is_count(value) -> bool:
+    """True for a non-negative int or NumPy integer that is not a bool."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        return False
+    return value >= 0
 
-    Bools and NaN are rejected; iterations must be an integer type (2.0 is
-    rejected), damping and tolerance may be any int or float. ``prefix`` is
-    prepended to the setting names in the messages (e.g. ``"lloyd_"``).
+
+def validate_size_smoothing(size_smoothing, prefix=""):
+    """Raise ValueError unless size_smoothing is an int >= 0 (bools and 2.0 are rejected)."""
+    if not _is_count(size_smoothing):
+        raise ValueError(f"{prefix}size_smoothing must be a non-negative integer. Got {size_smoothing!r}.")
+
+
+def validate_settings(iterations, damping, tolerance, prefix="", size_smoothing=0):
+    """Raise ValueError unless iterations and size_smoothing are ints >= 0, damping a number in (0, 1] and tolerance a number >= 0.
+
+    Bools and NaN are rejected; iterations and size_smoothing must be integer
+    types (2.0 is rejected), damping and tolerance may be any int or float.
+    ``prefix`` is prepended to the setting names in the messages (e.g.
+    ``"lloyd_"``).
     """
-    if isinstance(iterations, (bool, np.bool_)) or not isinstance(iterations, (int, np.integer)) or iterations < 0:
+    if not _is_count(iterations):
         raise ValueError(f"{prefix}iterations must be a non-negative integer. Got {iterations!r}.")
     if not _is_real_number(damping) or not (0.0 < damping <= 1.0):
         raise ValueError(f"{prefix}damping must be a number in (0, 1]. Got {damping!r}.")
     if not _is_real_number(tolerance) or not (tolerance >= 0.0):
         raise ValueError(f"{prefix}tolerance must be a non-negative number. Got {tolerance!r}.")
+    validate_size_smoothing(size_smoothing, prefix=prefix)
 
 
 def _validate_relax_args(nodes, free, owner_polys, iterations, damping, tolerance):

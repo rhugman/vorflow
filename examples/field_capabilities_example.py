@@ -442,14 +442,15 @@ print(
     f"rings intact after meshing: {mesher.diagnostics['hex_rings']}"
 )
 
-lloyd_tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True, lloyd_iterations=10)
+# Lloyd is opt-in; use 100 or more passes (about 20 leaves the most very short faces).
+lloyd_tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True, lloyd_iterations=100)
 lloyd_grid = lloyd_tessellator.generate()
 print(f"Lloyd report: {lloyd_tessellator.lloyd_report}")
 lloyd_connectivity = build_connectivity(lloyd_grid, center="centroid")
 print(
     "p95 centroid ortho_error (degrees): "
     f"default {modflow_connectivity_report['ortho_error'].quantile(0.95):.2f}, "
-    f"lloyd_iterations=10 {lloyd_connectivity['ortho_error'].quantile(0.95):.2f}"
+    f"lloyd_iterations=100 {lloyd_connectivity['ortho_error'].quantile(0.95):.2f}"
 )
 
 fig, ax = plt.subplots(figsize=(14, 7))

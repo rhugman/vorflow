@@ -489,6 +489,7 @@ class VoronoiTessellator:
         lloyd_iterations=0,
         lloyd_damping=1.0,
         lloyd_tolerance=1e-3,
+        lloyd_size_smoothing=5,
     ):
         """
         Initializes the Voronoi tessellator.
@@ -531,9 +532,10 @@ class VoronoiTessellator:
                 their cell centroids (lower ``drift_ratio`` in
                 ``vorflow.utils.calculate_mesh_quality``). The centroids are
                 weighted by the density h**-4, where h is the local mesh size
-                interpolated from ``MeshGenerator.node_sizes``; this keeps the
-                mesh grading (the cell sizes around refined features) instead
-                of evening out the cell sizes. Only free nodes move: mesh
+                interpolated from ``MeshGenerator.node_sizes`` after
+                ``lloyd_size_smoothing``; this keeps the mesh grading (the
+                cell sizes around refined features) instead of evening out
+                the cell sizes. Only free nodes move: mesh
                 nodes inside the embedded polygon surfaces. Nodes on the domain
                 and zone boundaries, embedded points (and their hex-ring
                 seeds), embedded and barrier lines (including straddle pairs)
@@ -545,9 +547,21 @@ class VoronoiTessellator:
                 the run summary: passes run (``iterations``), the last pass's
                 largest relative residual (``max_rel_shift``, as for
                 ``lloyd_tolerance``), moves rejected (``rejected``) and the
-                number of free generators (``n_free``). Each pass costs about one Voronoi diagram of
-                all nodes plus the weighted centroids of the free cells; 20
-                passes take about as long as meshing and tessellating once.
+                number of free generators (``n_free``).
+
+                Lloyd is opt-in and mainly for models that use cell centroids
+                as cell centres, or for visually more regular cells. Head
+                accuracy is set mainly by ``growth_factor`` (how fine the
+                cells are relative to the curvature of the head), not by cell
+                shape. In a steady radial-flow (Thiem) test with generator
+                centres (rhugman/vorflow#31), 100 passes lowered the head
+                RMSE by at most about 5%. Each pass costs about one Voronoi
+                diagram of all nodes plus the weighted centroids of the free
+                cells; 100 passes took 5-10x the time of meshing and
+                tessellating once. Use 100 or more passes, together with
+                ``hex_ring=True`` on refined points. Avoid about 20 passes: a
+                partly relaxed grid passes through near-cocircular generators,
+                and the number of very short cell faces peaks there.
                 Requires a mesh generator that ran ``MeshGenerator.generate()``
                 before this tessellator was constructed.
             lloyd_damping (float): Fraction of the way each free generator
@@ -557,6 +571,16 @@ class VoronoiTessellator:
                 weighted centroid, relative to the local mesh size, is below
                 this (independent of ``lloyd_damping``). Default 1e-3.
                 Graded meshes usually run all ``lloyd_iterations`` passes.
+            lloyd_size_smoothing (int): Passes of smoothing applied to the
+                per-node sizes behind the Lloyd density (only used with
+                ``lloyd_iterations > 0``). Gmsh's node sizes jitter by about
+                10% between neighbouring nodes, i.e. +-30-45% in h**-4, and
+                Lloyd would otherwise converge to that noise. Each pass moves
+                the log size of every free node halfway to the mean over its
+                mesh-edge neighbours (``MeshGenerator.node_edges``); fixed
+                nodes keep their size and anchor the grading. Default 5;
+                from 10-20 passes on it starts to flatten steep grading. 0
+                uses ``node_sizes`` unchanged (the 0.2.0 behaviour).
         """
         if boundary_centering not in {"clip", "inset_mirror"}:
             raise ValueError("boundary_centering must be either 'clip' or 'inset_mirror'.")
@@ -566,7 +590,8 @@ class VoronoiTessellator:
             raise ValueError("boundary_corner_angle must be between 0 and 180 degrees.")
         if boundary_tolerance is not None and boundary_tolerance < 0:
             raise ValueError("boundary_tolerance must be non-negative when provided.")
-        _lloyd.validate_settings(lloyd_iterations, lloyd_damping, lloyd_tolerance, prefix="lloyd_")
+        _lloyd.validate_settings(lloyd_iterations, lloyd_damping, lloyd_tolerance, prefix="lloyd_",
+                                 size_smoothing=lloyd_size_smoothing)
 
         self.mg = mesh_generator
         self.cm = conceptual_mesh
@@ -579,6 +604,7 @@ class VoronoiTessellator:
         # None on mesh generators that do not provide them.
         self.node_is_free = getattr(mesh_generator, 'node_is_free', None)
         self.node_sizes = getattr(mesh_generator, 'node_sizes', None)
+        self.node_edges = getattr(mesh_generator, 'node_edges', None)
         self.buffer_footprints = getattr(mesh_generator, 'buffer_footprints', None)
         self.zones_gdf = mesh_generator.zones_gdf
         self.clip_to_boundary = clip_to_boundary
@@ -589,6 +615,7 @@ class VoronoiTessellator:
         self.lloyd_iterations = int(lloyd_iterations)
         self.lloyd_damping = float(lloyd_damping)
         self.lloyd_tolerance = float(lloyd_tolerance)
+        self.lloyd_size_smoothing = int(lloyd_size_smoothing)
         # {"iterations", "max_rel_shift", "rejected", "n_free"} after a Lloyd
         # run; max_rel_shift is the largest residual |centroid - node| / local
         # size over the accepted moves of the last pass (see _lloyd.relax).
@@ -612,6 +639,28 @@ class VoronoiTessellator:
             )
         return node_is_free, node_sizes, self.buffer_footprints
 
+    def _lloyd_node_edges(self, n_nodes):
+        """Mesh edges (m, 2) captured from the mesh generator, checked against ``n_nodes``."""
+        if self.node_edges is None:
+            raise ValueError(
+                "lloyd_size_smoothing > 0 needs MeshGenerator.node_edges; run MeshGenerator.generate() "
+                "before tessellating, or set lloyd_size_smoothing=0."
+            )
+        edges = np.asarray(self.node_edges)
+        if edges.size and (edges.ndim != 2 or edges.shape[1] != 2 or edges.min() < 0 or edges.max() >= n_nodes):
+            raise ValueError(
+                f"MeshGenerator.node_edges must be (m, 2) positions into its nodes ({n_nodes}). "
+                "Re-run MeshGenerator.generate() before tessellating."
+            )
+        return edges.reshape(-1, 2)
+
+    def _lloyd_sizes(self, node_sizes, free, n_nodes):
+        """Per-node sizes for the Lloyd density: ``node_sizes`` after ``lloyd_size_smoothing`` passes over the free nodes."""
+        if self.lloyd_size_smoothing == 0:
+            return node_sizes
+        logger.info(f"  -> Lloyd density from node sizes smoothed with {self.lloyd_size_smoothing} passes")
+        return _lloyd.smooth_log_sizes(node_sizes, free, self._lloyd_node_edges(n_nodes), self.lloyd_size_smoothing)
+
     def _lloyd_constraint_lines(self):
         """Union of the embedded clean lines (barriers and straddle lines included), or None."""
         lines = self.cm.clean_lines
@@ -632,10 +681,11 @@ class VoronoiTessellator:
         report = {"iterations": 0, "max_rel_shift": 0.0, "rejected": 0}
         if free.any():
             logger.info(f"Lloyd relaxation of {int(free.sum())} free generators...")
+            sizes = self._lloyd_sizes(node_sizes, free, len(nodes))
             nodes, report = _lloyd.relax(
                 nodes,
                 free,
-                _lloyd.size_interpolator(nodes, node_sizes),
+                _lloyd.size_interpolator(nodes, sizes),
                 self._domain_geometry(),
                 owners,
                 self._lloyd_constraint_lines(),
