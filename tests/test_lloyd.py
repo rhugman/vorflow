@@ -8,7 +8,7 @@ from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 
 from vorflow import _lloyd
 from vorflow.blueprint import ConceptualMesh
-from vorflow.engine import MeshGenerator, _node_sizes_from_elements
+from vorflow.engine import MeshGenerator, _node_edges_from_elements, _node_sizes_from_elements
 from vorflow.tessellator import VoronoiTessellator
 from vorflow.utils import calculate_mesh_quality
 
@@ -375,11 +375,101 @@ def test_validate_settings_rejects(iterations, damping, tolerance):
         _lloyd.validate_settings(iterations, damping, tolerance)
 
 
+@pytest.mark.parametrize("size_smoothing", [0, 5, np.int64(3)])
+def test_validate_settings_accepts_size_smoothing(size_smoothing):
+    _lloyd.validate_settings(3, 1.0, 1e-3, size_smoothing=size_smoothing)
+
+
+@pytest.mark.parametrize("size_smoothing", [-1, 2.0, True, "5", None, float("nan")])
+def test_validate_settings_rejects_size_smoothing(size_smoothing):
+    with pytest.raises(ValueError, match="lloyd_size_smoothing"):
+        _lloyd.validate_settings(3, 1.0, 1e-3, prefix="lloyd_", size_smoothing=size_smoothing)
+
+
 def test_relax_rejects_mismatched_owner_polys():
     nodes, free = _square_lattice(4)
     domain = box(0.0, 0.0, 3.0, 3.0)
     with pytest.raises(ValueError):
         _lloyd.relax(nodes, free, _constant(1.0), domain, [domain], None, iterations=1)
+
+
+# --- smooth_log_sizes -------------------------------------------------------
+
+
+def _lattice_edges(n):
+    """(m, 2) positions of the 4-neighbour edges of an n x n ``_square_lattice``."""
+    index = np.arange(n * n).reshape(n, n)
+    return np.vstack([
+        np.column_stack([index[:, :-1].ravel(), index[:, 1:].ravel()]),
+        np.column_stack([index[:-1, :].ravel(), index[1:, :].ravel()]),
+    ])
+
+
+def _edge_jitter(log_h, log_true, edges):
+    """sd over edges of the neighbour difference of log_h - log_true (noise after removing the grading)."""
+    residual = log_h - log_true
+    return np.std(residual[edges[:, 0]] - residual[edges[:, 1]])
+
+
+def test_smooth_log_sizes_keeps_fixed_nodes_bit_identical():
+    n = 8
+    nodes, free = _square_lattice(n)
+    rng = np.random.default_rng(0)
+    sizes = np.exp(rng.normal(0.0, 0.3, len(nodes))) * 3.7
+    smoothed = _lloyd.smooth_log_sizes(sizes, free, _lattice_edges(n), passes=5)
+    np.testing.assert_array_equal(smoothed[~free], sizes[~free])
+    assert np.all(smoothed[free] != sizes[free])
+    assert np.all(np.isfinite(smoothed)) and np.all(smoothed > 0)
+
+
+def test_smooth_log_sizes_leaves_free_nodes_without_neighbours():
+    sizes = np.array([1.0, 4.0, 2.5])
+    smoothed = _lloyd.smooth_log_sizes(sizes, np.array([True, True, True]), np.array([[0, 1]]), passes=3)
+    np.testing.assert_allclose(smoothed[:2], [2.0, 2.0])
+    assert smoothed[2] == 2.5
+
+
+def test_smooth_log_sizes_reduces_neighbour_jitter_and_keeps_grading():
+    # Sizes graded by a factor 1.2 per lattice spacing, with 10% (sd of log h)
+    # node-to-node noise like Gmsh's; the border carries the exact sizes.
+    n = 30
+    nodes, free = _square_lattice(n)
+    edges = _lattice_edges(n)
+    log_true = np.log(5.0) + np.log(1.2) * nodes[:, 0]
+    rng = np.random.default_rng(1)
+    noisy = np.where(free, log_true + rng.normal(0.0, 0.1, len(nodes)), log_true)
+    smoothed = np.log(_lloyd.smooth_log_sizes(np.exp(noisy), free, edges, passes=5))
+
+    before = _edge_jitter(noisy, log_true, edges)
+    after = _edge_jitter(smoothed, log_true, edges)
+    assert after < before / 3.0
+    assert np.abs(smoothed - log_true)[free].mean() < np.abs(noisy - log_true)[free].mean() / 2.0
+    # A linear log size is a fixed point of the averaging, so the grading stays.
+    slope = np.polyfit(nodes[free, 0], smoothed[free], 1)[0]
+    assert slope == pytest.approx(np.log(1.2), rel=0.02)
+
+
+def test_smooth_log_sizes_zero_passes_returns_unchanged_copy():
+    nodes, free = _square_lattice(5)
+    sizes = np.linspace(1.0, 2.0, len(nodes))
+    smoothed = _lloyd.smooth_log_sizes(sizes, free, _lattice_edges(5), passes=0)
+    np.testing.assert_array_equal(smoothed, sizes)
+    assert smoothed is not sizes
+
+
+@pytest.mark.parametrize("sizes, free, edges, passes", [
+    (np.ones(3), np.ones(2, dtype=bool), [[0, 1]], 1),
+    (np.ones(3), np.ones(3, dtype=bool), [[0, 3]], 1),
+    (np.ones(3), np.ones(3, dtype=bool), [[-1, 0]], 1),
+    (np.array([1.0, 0.0, 1.0]), np.ones(3, dtype=bool), [[0, 1]], 1),
+    (np.array([1.0, np.nan, 1.0]), np.ones(3, dtype=bool), [[0, 1]], 1),
+    (np.ones(3), np.ones(3, dtype=bool), [[0, 1]], -1),
+    (np.ones(3), np.ones(3, dtype=bool), [[0, 1]], 2.0),
+    (np.ones(3), np.ones(3, dtype=bool), [[0, 1]], True),
+])
+def test_smooth_log_sizes_rejects_invalid_arguments(sizes, free, edges, passes):
+    with pytest.raises(ValueError):
+        _lloyd.smooth_log_sizes(sizes, free, edges, passes)
 
 
 # --- MeshGenerator inputs ---------------------------------------------------
@@ -402,6 +492,25 @@ def test_node_sizes_from_elements_mean_incident_edge_length():
     np.testing.assert_allclose(sizes, [(1 + 1 + diag) / 3, (1 + 1 + 2) / 3, (2 + 1) / 2, 4.0])
 
 
+def test_node_edges_from_elements_are_positions_of_unique_edges():
+    element_data = {
+        "blocks": [
+            {"connectivity": np.array([[1, 2, 3], [1, 3, 4]])},
+            {"connectivity": np.array([[2, 5, 6, 3]])},
+        ],
+        "node_tags": np.array([1, 2, 3, 4, 5, 6]),
+        "node_xy": np.zeros((6, 2)),
+    }
+    # Node 6 is not a domain node, so edges 5-6 and 6-3 are dropped.
+    node_tags = np.array([5, 3, 1, 9, 2, 4], dtype=np.uint64)
+    edges = _node_edges_from_elements(element_data, node_tags)
+    as_tags = {tuple(sorted(pair)) for pair in node_tags[edges].astype(int).tolist()}
+    assert as_tags == {(1, 2), (2, 3), (1, 3), (3, 4), (1, 4), (2, 5)}
+    assert len(edges) == len(as_tags)
+    empty = _node_edges_from_elements({"blocks": [], "node_tags": [], "node_xy": np.zeros((0, 2))}, [1, 2])
+    assert empty.shape == (0, 2)
+
+
 def test_node_sizes_from_elements_without_elements_uses_fallback():
     element_data = {"blocks": [], "node_tags": np.array([1]), "node_xy": np.zeros((1, 2))}
     np.testing.assert_array_equal(_node_sizes_from_elements(element_data, [1, 2], fallback=3.0), [3.0, 3.0])
@@ -411,7 +520,7 @@ def test_node_sizes_from_elements_without_elements_uses_fallback():
 
 
 class _FakeMeshGenerator:
-    """Mesh generator stand-in without node_is_free / node_sizes (a 6 x 6 lattice)."""
+    """Mesh generator stand-in without node_is_free / node_sizes / node_edges (a 6 x 6 lattice)."""
 
     def __init__(self, zones_gdf):
         x, y = np.meshgrid(np.linspace(0.0, 1.0, 6), np.linspace(0.0, 1.0, 6))
@@ -445,7 +554,8 @@ def test_lloyd_uses_inputs_captured_with_the_nodes():
     fake = _FakeMeshGenerator(cm.clean_polygons)
     on_border = (fake.nodes == 0.0).any(axis=1) | (fake.nodes == 1.0).any(axis=1)
     fake.node_is_free = ~on_border
-    fake.node_sizes = np.full(len(fake.nodes), 0.2)
+    fake.node_sizes = np.linspace(0.15, 0.25, len(fake.nodes))
+    fake.node_edges = _lattice_edges(6)
     reference = VoronoiTessellator(fake, cm, lloyd_iterations=3)
     expected = reference.generate()
 
@@ -454,10 +564,67 @@ def test_lloyd_uses_inputs_captured_with_the_nodes():
     # arrays that belong to the nodes it captured.
     fake.node_is_free = None
     fake.node_sizes = np.ones(3)
+    fake.node_edges = np.array([[0, 1]])
     grid = tess.generate()
     assert tess.lloyd_report == reference.lloyd_report
     assert tess.lloyd_report["n_free"] == 16
     np.testing.assert_array_equal(grid[["x", "y", "lloyd_shift"]], expected[["x", "y", "lloyd_shift"]])
+
+
+def _fake_with_lloyd_inputs(cm):
+    """6 x 6 lattice fake with border nodes fixed, noisy sizes and its lattice edges."""
+    fake = _FakeMeshGenerator(cm.clean_polygons)
+    on_border = (fake.nodes == 0.0).any(axis=1) | (fake.nodes == 1.0).any(axis=1)
+    fake.node_is_free = ~on_border
+    fake.node_sizes = 0.2 * np.exp(np.random.default_rng(2).normal(0.0, 0.1, len(fake.nodes)))
+    fake.node_edges = _lattice_edges(6)
+    return fake
+
+
+def _density_sizes(monkeypatch, tess):
+    """Run ``tess.generate()`` and return the per-node sizes its Lloyd density was built from."""
+    captured = []
+    original = _lloyd.size_interpolator
+
+    def spy(nodes, sizes):
+        captured.append(np.array(sizes, copy=True))
+        return original(nodes, sizes)
+
+    monkeypatch.setattr(_lloyd, "size_interpolator", spy)
+    tess.generate()
+    assert len(captured) == 1
+    return captured[0]
+
+
+def test_lloyd_size_smoothing_zero_uses_node_sizes_unchanged(monkeypatch):
+    cm = _unit_square_mesh()
+    fake = _fake_with_lloyd_inputs(cm)
+    fake.node_edges = None   # not needed without smoothing
+    sizes = _density_sizes(monkeypatch, VoronoiTessellator(fake, cm, lloyd_iterations=2, lloyd_size_smoothing=0))
+    np.testing.assert_array_equal(sizes, fake.node_sizes)
+
+
+def test_lloyd_smooths_free_node_sizes_only(monkeypatch):
+    cm = _unit_square_mesh()
+    fake = _fake_with_lloyd_inputs(cm)
+    tess = VoronoiTessellator(fake, cm, lloyd_iterations=2)
+    assert tess.lloyd_size_smoothing == 5
+    sizes = _density_sizes(monkeypatch, tess)
+    expected = _lloyd.smooth_log_sizes(fake.node_sizes, fake.node_is_free, fake.node_edges, 5)
+    np.testing.assert_array_equal(sizes, expected)
+    np.testing.assert_array_equal(sizes[~fake.node_is_free], fake.node_sizes[~fake.node_is_free])
+    assert np.all(sizes[fake.node_is_free] != fake.node_sizes[fake.node_is_free])
+
+
+def test_lloyd_size_smoothing_needs_node_edges():
+    cm = _unit_square_mesh()
+    fake = _fake_with_lloyd_inputs(cm)
+    fake.node_edges = None
+    with pytest.raises(ValueError, match="node_edges"):
+        VoronoiTessellator(fake, cm, lloyd_iterations=2).generate()
+    fake.node_edges = np.array([[0, len(fake.nodes)]])
+    with pytest.raises(ValueError, match="node_edges"):
+        VoronoiTessellator(fake, cm, lloyd_iterations=2).generate()
 
 
 def test_lloyd_off_ignores_missing_node_classification():
@@ -476,6 +643,10 @@ def test_lloyd_off_ignores_missing_node_classification():
     {"lloyd_damping": float("nan")},
     {"lloyd_tolerance": -1e-3},
     {"lloyd_tolerance": float("nan")},
+    {"lloyd_size_smoothing": -1},
+    {"lloyd_size_smoothing": 5.0},
+    {"lloyd_size_smoothing": False},
+    {"lloyd_size_smoothing": None},
 ])
 def test_lloyd_rejects_invalid_kwargs(kwargs):
     cm = _unit_square_mesh()
@@ -536,6 +707,16 @@ def test_mesh_generator_lloyd_inputs_are_aligned(well_case):
     assert 0 < mg.node_is_free.sum() < len(mg.nodes)
     assert np.all(mg.node_sizes > 0)
     assert mg.buffer_footprints is None
+    # node_edges are the unique mesh edges between domain nodes; their mean
+    # length at each node is node_sizes.
+    edges = mg.node_edges
+    assert edges.ndim == 2 and edges.shape[1] == 2 and len(edges) > len(mg.nodes)
+    assert edges.min() >= 0 and edges.max() < len(mg.nodes)
+    assert len(np.unique(np.sort(edges, axis=1), axis=0)) == len(edges)
+    length = np.hypot(*(mg.nodes[edges[:, 0]] - mg.nodes[edges[:, 1]]).T)
+    ends = edges.ravel()
+    mean = np.bincount(ends, np.repeat(length, 2), len(mg.nodes)) / np.bincount(ends, minlength=len(mg.nodes))
+    np.testing.assert_allclose(mean, mg.node_sizes, rtol=1e-12)
     # Wells and domain/zone boundary nodes are fixed.
     for well in WELLS.values():
         at_well = np.hypot(*(mg.nodes - [well.x, well.y]).T) < 1e-9
@@ -544,6 +725,37 @@ def test_mesh_generator_lloyd_inputs_are_aligned(well_case):
         shapely.union(DOMAIN.boundary, INNER_ZONE.boundary), shapely.points(mg.nodes), 1e-6
     )
     assert not (mg.node_is_free & on_boundary).any()
+
+
+@pytest.mark.slow
+def test_lloyd_size_smoothing_reduces_mesh_size_jitter(well_case):
+    _, mg, _, _, _ = well_case
+    edges = mg.node_edges
+    # The intended grading: min over wells of res + (1.2 - 1) * distance, capped at background_lc.
+    spec = np.full(len(mg.nodes), 25.0)
+    for well, res in [(WELLS["w1"], 2.0), (WELLS["w2"], 3.0)]:
+        spec = np.minimum(spec, res + 0.2 * np.hypot(*(mg.nodes - [well.x, well.y]).T))
+    log_spec = np.log(spec)
+    free = mg.node_is_free
+    inner = free[edges[:, 0]] & free[edges[:, 1]]
+    smoothed = _lloyd.smooth_log_sizes(mg.node_sizes, free, edges, 5)
+    before = _edge_jitter(np.log(mg.node_sizes), log_spec, edges[inner])
+    after = _edge_jitter(np.log(smoothed), log_spec, edges[inner])
+    assert after < before / 2.0
+
+
+@pytest.mark.slow
+def test_lloyd_size_smoothing_zero_output_independent_of_node_edges(well_case):
+    cm, mg, _, _, _ = well_case
+    reference = VoronoiTessellator(mg, cm, lloyd_iterations=3, lloyd_size_smoothing=0)
+    expected = reference.generate()
+    tess = VoronoiTessellator(mg, cm, lloyd_iterations=3, lloyd_size_smoothing=0)
+    tess.node_edges = None
+    grid = tess.generate()
+    assert tess.lloyd_report == reference.lloyd_report
+    np.testing.assert_array_equal(grid[["x", "y", "lloyd_shift"]], expected[["x", "y", "lloyd_shift"]])
+    smoothed = VoronoiTessellator(mg, cm, lloyd_iterations=3).generate()
+    assert not np.array_equal(smoothed[["x", "y"]].to_numpy(), expected[["x", "y"]].to_numpy())
 
 
 @pytest.mark.slow

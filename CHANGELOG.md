@@ -7,6 +7,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `VoronoiTessellator(..., lloyd_size_smoothing=5)` smooths the per-node
+  sizes behind the Lloyd density before relaxing
+  ([#31](https://github.com/rhugman/vorflow/issues/31)). Gmsh's node sizes
+  jitter by 7-12% (sd of log h) between neighbouring nodes once the intended
+  grading is removed, i.e. +-30-46% in the density h^-4, and Lloyd converged
+  to that noise. Each pass moves the log size of every free node halfway to
+  the mean over its mesh-edge neighbours; fixed nodes keep their size and
+  anchor the grading. On the #31 model (growth factor 1.2, 100 passes,
+  `hex_ring`) this lowers the area-ratio p95 from 1.78 to 1.57, the p95
+  `drift_ratio` from 0.105 to 0.070, the share of non-hexagonal cells from
+  28.5% to 21.8% and the p95 centroid `ortho_error` from 2.4 to 1.25
+  degrees, as well as the exact analytic size field does. 0 keeps the raw
+  `node_sizes` and reproduces 0.2.0 bit for bit.
+- `MeshGenerator.node_edges`: the unique mesh edges between two of `nodes`,
+  as (m, 2) positions into `nodes`, set by `generate()`. `node_sizes` is
+  unchanged.
+
+### Changed
+
+- With `lloyd_iterations > 0` the grid differs from 0.2.0, because the Lloyd
+  density now uses the smoothed sizes. Pass `lloyd_size_smoothing=0` for the
+  0.2.0 grid. Without `hex_ring`, the cells of refined points can grow by
+  up to about 60% towards the size the field asks for, because Gmsh makes
+  the first ring of nodes around a point 5-15% finer than that.
+- Lloyd guidance in the `lloyd_iterations` docstring, the README and
+  `examples/point_centring_demo.ipynb`: Lloyd stays opt-in, mainly for models
+  that use cell centroids as cell centres or for visually more regular cells.
+  Use 100 or more passes with `hex_ring=True`, and avoid about 20, where the
+  share of cells with very short faces peaks. Head accuracy depends mainly on
+  `growth_factor`: in a Thiem test, 100 passes improved the head RMSE by at
+  most about 5% at 5-10 times the build time.
+
 ## [0.2.0] - 2026-10-05
 
 Centred point cells (`hex_ring`) and size-weighted Lloyd relaxation

@@ -292,22 +292,49 @@ def _free_node_tags(gmsh_map, polygons_gdf):
     return free
 
 
-def _node_sizes_from_elements(element_data, node_tags, fallback):
-    """Mean length of the unique element edges at each of ``node_tags``; ``fallback`` where a node has none.
+def _element_edges(element_data):
+    """Unique element edges as sorted (m, 2) node-tag pairs; (0, 2) without elements.
 
     ``element_data`` is the dict from ``MeshGenerator._capture_element_data``
     (primary-node connectivity per element block, all node tags and xy).
     """
-    node_tags = np.asarray(node_tags, dtype=np.int64)
-    sizes = np.full(len(node_tags), float(fallback))
     blocks = [np.asarray(block["connectivity"], dtype=np.int64) for block in element_data["blocks"]]
-    if not blocks or len(node_tags) == 0:
-        return sizes
+    if not blocks:
+        return np.empty((0, 2), dtype=np.int64)
     # Each element's edges join consecutive corners (closing back to the first).
     edges = np.concatenate([
         np.stack([conn, np.roll(conn, -1, axis=1)], axis=-1).reshape(-1, 2) for conn in blocks
     ])
-    edges = np.unique(np.sort(edges, axis=1), axis=0)
+    return np.unique(np.sort(edges, axis=1), axis=0)
+
+
+def _node_edges_from_elements(element_data, node_tags):
+    """Unique element edges between two of ``node_tags``, as (m, 2) positions into ``node_tags``.
+
+    Edges with an end outside ``node_tags`` are dropped. ``element_data`` is
+    as for ``_element_edges``.
+    """
+    node_tags = np.asarray(node_tags, dtype=np.int64)
+    edges = _element_edges(element_data)
+    if len(edges) == 0 or len(node_tags) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    order = np.argsort(node_tags, kind="stable")
+    sorted_tags = node_tags[order]
+    at = np.minimum(np.searchsorted(sorted_tags, edges), len(sorted_tags) - 1)
+    known = (sorted_tags[at] == edges).all(axis=1)
+    return order[at[known]].astype(np.int64)
+
+
+def _node_sizes_from_elements(element_data, node_tags, fallback):
+    """Mean length of the unique element edges at each of ``node_tags``; ``fallback`` where a node has none.
+
+    ``element_data`` is as for ``_element_edges``.
+    """
+    node_tags = np.asarray(node_tags, dtype=np.int64)
+    sizes = np.full(len(node_tags), float(fallback))
+    edges = _element_edges(element_data)
+    if len(edges) == 0 or len(node_tags) == 0:
+        return sizes
 
     known_tags, first = np.unique(np.asarray(element_data["node_tags"], dtype=np.int64), return_index=True)
     known_xy = np.asarray(element_data["node_xy"], dtype=float)[first]
@@ -847,10 +874,13 @@ class MeshGenerator:
         # Inputs to VoronoiTessellator(lloyd_iterations=...), set by generate():
         # node_is_free / node_sizes are aligned with self.nodes (True for
         # nodes inside embedded polygon surfaces, off every curve and point;
-        # mean incident mesh-edge length), buffer_footprints is the union of
-        # the quad-buffer strip and band footprints (None without any).
+        # mean incident mesh-edge length), node_edges holds the unique mesh
+        # edges between two of self.nodes as (m, 2) positions into it (the
+        # graph the Lloyd density is smoothed over), buffer_footprints is the
+        # union of the quad-buffer strip and band footprints (None without any).
         self.node_is_free = None
         self.node_sizes = None
+        self.node_edges = None
         self.buffer_footprints = None
         self.diagnostics = {}
 
@@ -2719,8 +2749,8 @@ class MeshGenerator:
         4. Generates the 2D triangular mesh.
         5. Performs optional post-generation optimization.
         6. Extracts the resulting nodes and their tags, plus the per-node
-           ``node_is_free`` and ``node_sizes`` and the ``buffer_footprints``
-           that ``VoronoiTessellator(lloyd_iterations=...)`` relies on.
+           ``node_is_free`` and ``node_sizes``, the mesh ``node_edges`` and
+           the ``buffer_footprints`` that ``VoronoiTessellator(lloyd_iterations=...)`` relies on.
 
         Args:
             clean_polys (GeoDataFrame): Non-overlapping polygons.
@@ -2750,6 +2780,7 @@ class MeshGenerator:
         self._element_data = None
         self.node_is_free = None
         self.node_sizes = None
+        self.node_edges = None
         self.buffer_footprints = None
         self._initialize_gmsh()
         try:
@@ -2784,6 +2815,7 @@ class MeshGenerator:
             self.node_sizes = _node_sizes_from_elements(
                 self._element_data, self.node_tags, self.background_lc
             )
+            self.node_edges = _node_edges_from_elements(self._element_data, self.node_tags)
             self.zones_gdf = clean_polys
             if launch_gmsh_gui:
                 gmsh.fltk.run()

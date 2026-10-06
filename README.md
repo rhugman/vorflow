@@ -201,19 +201,33 @@ whether each ring came out intact.
 `lloyd_iterations` moves the free generators (interior nodes of the zones)
 towards the centroids of their cells before the grid is built. The centroids
 are weighted by the local mesh size (density h^-4), so the grading is kept;
-boundary, zone-edge, point and line nodes stay fixed.
+boundary, zone-edge, point and line nodes stay fixed. h comes from Gmsh's
+per-node sizes, smoothed over the mesh edges first (`lloyd_size_smoothing`,
+5 passes by default; 0 uses the raw sizes) because their node-to-node noise
+would otherwise set the cell shapes.
 
 ```python
-tessellator = VoronoiTessellator(mesher, blueprint, lloyd_iterations=20)
+tessellator = VoronoiTessellator(mesher, blueprint, lloyd_iterations=100)
 grid_gdf = tessellator.generate()
 print(tessellator.lloyd_report)  # passes run, last residual, rejected moves
 ```
 
-The mesh generator must have run before the tessellator is constructed. On a
-2 km model with four refined wells, 20 passes lower the p95
-centroid-to-centroid `ortho_error` from 4.1 to 2.7 degrees for about 0.4 s of
-extra runtime; the grid is then no longer the exact dual of
-`MeshGenerator.get_element_grid()`.
+Lloyd is off by default. It is mainly for models that use cell centroids as
+cell centres, or for visually more regular cells. Use 100 or more passes
+together with `hex_ring=True` on refined points, and avoid about 20 passes:
+a partly relaxed grid has the most very short faces. On a 2 km model with
+four refined wells, 100 passes lower the p95 centroid-to-centroid
+`ortho_error` from 4.1 to 1.4 degrees, for several times the runtime of
+meshing and tessellating once. The grid is then no longer the exact dual of
+`MeshGenerator.get_element_grid()`. The mesh generator must have run before
+the tessellator is constructed.
+
+Head accuracy is set mainly by `growth_factor`, not by cell shape. In a
+steady radial-flow (Thiem) test
+([#31](https://github.com/rhugman/vorflow/issues/31)), halving
+`growth_factor - 1` roughly doubled the cell count and cut the head RMSE about
+threefold, while 100 Lloyd passes improved it by at most about 5%. Lower
+`growth_factor` (or the resolution) where accuracy matters.
 
 ## Examples
 
