@@ -23,18 +23,23 @@ from ..grid import Grid, grid_from_polygons
 TOOL = "vorflow"
 
 
-def build(case: Case, scale: float, ws: Path) -> Grid:
-    """Generate the vorflow grid for one case at one spec scale."""
+def build(case: Case, scale: float, ws: Path, tessellator_kwargs: dict | None = None,
+          tool: str = TOOL) -> Grid:
+    """Generate the vorflow grid for one case at one spec scale.
+
+    ``tessellator_kwargs`` go to ``VoronoiTessellator`` (e.g. Lloyd settings);
+    ``tool`` names the grid, so variants are reported as separate tools.
+    """
     set_verbosity(0)
     t0 = time.perf_counter()
     blueprint = _blueprint(case, scale)
     clean_polys, clean_lines, clean_pts = blueprint.generate()
     mesher = MeshGenerator(background_lc=case.h_max * scale, verbosity=0)
     mesher.generate(clean_polys, clean_lines, clean_pts)
-    tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True)
+    tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True, **(tessellator_kwargs or {}))
     cells = tessellator.generate()
     t1 = time.perf_counter()
-    grid = _to_grid(cells)
+    grid = _to_grid(cells, tool)
     grid.timings = {"mesh_s": t1 - t0, "export_s": time.perf_counter() - t1}
     n_mirrors = getattr(tessellator, "n_barrier_mirrors", 0)
     grid.info["n_barrier_mirrors"] = n_mirrors
@@ -58,7 +63,7 @@ def _blueprint(case: Case, scale: float) -> ConceptualMesh:
     return blueprint
 
 
-def _to_grid(cells) -> Grid:
+def _to_grid(cells, tool: str = TOOL) -> Grid:
     """Grid from the tessellator output; x, y are the written centres."""
     xy = cells[["x", "y"]].to_numpy()
-    return grid_from_polygons(TOOL, list(cells.geometry), xc=xy, generators=xy)
+    return grid_from_polygons(tool, list(cells.geometry), xc=xy, generators=xy)

@@ -5,7 +5,7 @@ name: benchmark
 #    takes over an hour. Downloads the VOROGRIDGEN freeware from Hydrosymple
 #    at run time (it is never committed here), checks it on the example it
 #    ships with, then runs every benchmark case.
-#  - others:      vorflow, mf6Voronoi and FloPy on Linux, in tool-benchmark/environment.yml.
+#  - others:      vorflow (plain and with Lloyd), mf6Voronoi and FloPy on Linux, in tool-benchmark/environment.yml.
 #  - report:      merges both jobs' result rows and grids, then compiles the
 #                 tables and figures into the benchmark-results artifact.
 

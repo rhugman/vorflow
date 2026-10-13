@@ -58,6 +58,7 @@ def tool_kwargs(bin_d: Path, mf6voronoi_multiplier: float | None) -> dict:
     vorogridgen_exe = bin_d / "vorogridgen.exe"
     kwargs = {
         "vorflow": {},
+        "vorflow_lloyd": {},
         "mf6voronoi": {},
         "flopy": {"triangle_exe": str(exe_path(bin_d, "triangle"))},
         "vorogridgen": {"exe": str(vorogridgen_exe) if vorogridgen_exe.exists() else None},
