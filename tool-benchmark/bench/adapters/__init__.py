@@ -6,7 +6,7 @@ job runs only VOROGRIDGEN) never needs the others installed.
 
 import importlib
 
-TOOLS = ("vorflow", "mf6voronoi", "flopy", "vorogridgen")
+TOOLS = ("vorflow", "vorflow_lloyd", "mf6voronoi", "flopy", "vorogridgen")
 
 
 def get_adapter(tool: str):

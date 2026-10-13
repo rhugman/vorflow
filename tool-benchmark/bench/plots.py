@@ -23,6 +23,7 @@ from .metrics import face_metrics, face_table
 
 TOOL_STYLE = {
     "vorflow": {"color": "#2a78d6", "marker": "o"},
+    "vorflow_lloyd": {"color": "#8a4fd6", "marker": "o"},
     "mf6voronoi": {"color": "#eb6834", "marker": "s"},
     "flopy": {"color": "#1baf7a", "marker": "^"},
     "vorogridgen": {"color": "#eda100", "marker": "D"},

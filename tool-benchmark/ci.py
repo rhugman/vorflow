@@ -13,7 +13,7 @@ import workflow
 
 JOBS = {
     "windows": {"tools": ("vorogridgen",), "report": False},
-    "others": {"tools": ("vorflow", "mf6voronoi", "flopy"), "report": False},
+    "others": {"tools": ("vorflow", "vorflow_lloyd", "mf6voronoi", "flopy"), "report": False},
     "report": {"build": False, "report": True},
 }
 
