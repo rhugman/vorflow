@@ -214,8 +214,9 @@ print(tessellator.lloyd_report)  # passes run, last residual, rejected moves
 
 Lloyd is off by default. It is mainly for models that use cell centroids as
 cell centres, or for visually more regular cells. Use 100 or more passes
-together with `hex_ring=True` on refined points, and avoid about 20 passes:
-a partly relaxed grid has the most very short faces. On a 2 km model with
+together with `hex_ring=True` on refined points. Lloyd leaves about 1% of
+faces very short (four generators almost on one circle); add
+`min_face_fraction=0.2` to remove them. On a 2 km model with
 four refined wells, 100 passes lower the p95 centroid-to-centroid
 `ortho_error` from 4.1 to 1.4 degrees, for several times the runtime of
 meshing and tessellating once. The grid is then no longer the exact dual of
@@ -228,6 +229,38 @@ steady radial-flow (Thiem) test
 `growth_factor - 1` roughly doubled the cell count and cut the head RMSE about
 threefold, while 100 Lloyd passes improved it by at most about 5%. Lower
 `growth_factor` (or the resolution) where accuracy matters.
+
+### Cell centres in MODFLOW 6
+
+The grid has two candidate cell centres: the generator (`x`, `y`) and the
+centroid (`centroid_x`, `centroid_y`). Write one of them as the DISV cell
+centre (`xc`, `yc`) and match the NPF option to it:
+
+| DISV centre | NPF | Use |
+|---|---|---|
+| generator (`x`, `y`) | standard (no XT3D) | default; every connection is exactly perpendicular to its face |
+| centroid (`centroid_x`, `centroid_y`) | `XT3D` | head represents the cell average; slightly more accurate on smooth problems, at XT3D's cost |
+| centroid | standard (no XT3D) | **avoid**: connections are no longer perpendicular to the faces |
+
+MODFLOW 6's standard flow formulation uses only the head difference between
+two cell centres, which is exact when the line joining them is perpendicular
+to the shared face. A Voronoi cell's face is always perpendicular to the line
+between the two generators, so generator centres meet that condition on every
+face, whatever the cell shape. Centroids do not, so they need XT3D, which
+reconstructs the full head gradient. With isotropic K and generator centres,
+XT3D gives the same result as the standard formulation, so it adds cost for
+no gain.
+
+In the benchmark (`tool-benchmark/`, smooth manufactured solution, about 2000
+cells), the head L2 error was 0.00039 for generator centres without XT3D,
+0.00023 for centroid centres with XT3D, and 0.0030 for centroid centres
+without XT3D. Lloyd relaxation (`lloyd_iterations=100`) did not change these
+errors by more than 10%. Some other Voronoi tools write centroids; compare
+grids under the same convention.
+
+Horizontal anisotropy (K22 ≠ K11 or a rotated K) needs XT3D with either
+convention, because Voronoi faces are perpendicular to the connections but
+not K-orthogonal.
 
 ## Examples
 
