@@ -61,3 +61,6 @@ Grid quality and utilities
    summarize_quality
    check_geometry_resolution
    resample_geometry
+   grid_to_disv
+   grid_to_mfusg_disu
+   grid_to_gsf

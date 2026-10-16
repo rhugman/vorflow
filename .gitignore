@@ -222,6 +222,9 @@ benchmarks/
 # Local conda environment in repo root
 .conda/
 
+# Locally downloaded MODFLOW executables
+.bin/
+
 # Sphinx build artefacts
 docs/generated/
 docs/examples/

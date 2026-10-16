@@ -210,6 +210,70 @@ gwf = flopy.mf6.ModflowGwf(sim, modelname="vorflow")
 tessellator.to_modflowgwfdisv(gwf, top=10.0, botm=[0.0, -10.0], nlay=2)
 ```
 
+### MODFLOW-USG DISU and GSF export
+
+MODFLOW-USG and MODFLOW 6 both have a package called **DISU**, but their
+input formats differ. `to_mfusg_disu()` explicitly targets **MODFLOW-USG**;
+its arrays must not be passed to `flopy.mf6.ModflowGwfdisu`.
+
+```python
+grid = tessellator.to_mfusg_disu(top=10.0, botm=[0.0, -10.0], nlay=2)
+```
+
+The result contains `MfUsgDisU` grid inputs, including zero-based `ja`,
+`iac`, `cl12`, `fahl`, `ivsd=-1` and `idsymrd=0`. `fahl` is interface
+**area**, including thickness for horizontal connections; MF6's `hwva`
+uses horizontal **width** instead. The flags for vertical connections also
+differ between engines. Geometry helpers can be shared; solver inputs cannot
+be interchanged.
+
+As with DISV, final `x`/`y` centres and grid row order are preserved. Layers
+repeat the same horizontal mesh, with nodes numbered by layer then cell.
+`node_id`, `cell_map` and `connectivity` are metadata, **not** FloPy package
+arguments: `cell_map` relates each zero-based model node to its layer, input
+row and original index/IDs; `connectivity` reports face lengths, distances
+and orthogonality errors. Review these diagnostics before modelling; the
+exporter does not generate ghost-node corrections.
+
+With FloPy installed (`pip install "vorflow[examples]"`), the package wrapper
+excludes metadata automatically:
+
+```python
+import flopy
+
+model = flopy.mfusg.MfUsg(modelname="model", model_ws="model", structured=False)
+disu = tessellator.to_mfusgdisu(model, top=10.0, botm=[0.0, -10.0], nlay=2)
+disu.write_file()  # Or model.write_input() after adding the other packages.
+tessellator.to_gsf("model/model.gsf", top=10.0, botm=[0.0, -10.0], nlay=2)
+```
+
+Use the same elevations for both exports. GSF stores original 3D cell
+geometry with one-based IDs and XYZ vertices; it is not a solver input or
+the particle-tracking-specific GSF variant. FloPy can read it using
+`UnstructuredGrid.from_gridspec()`. The DISU/GSF pair is intended for external
+mesh import into Groundwater Vistas, but has not been manually verified in
+Vistas. GSF does not retain CRS metadata, so keep your projected CRS separately.
+
+`top` accepts a scalar or `(ncpl,)`; `botm` accepts a scalar, `(nlay,)`, or
+`(nlay, ncpl)`. All cells must have finite, positive thickness. Pinch-outs,
+pass-through cells, confining beds and different meshes per layer are not
+supported. Grid arrays cannot be overridden through the FloPy wrapper;
+time settings and units can be passed as extra keywords. Barrier geometry
+does not assign hydraulic resistance automatically.
+
+DISU and GSF currently require contiguous, straight shared faces. A barrier
+that changes direction inside a cell can create a bent face and prevent both
+exports; disconnected shared faces are also rejected. Effective connection
+distances for bent faces are not yet implemented. Centre and overlap checks
+allow coordinate roundoff while preserving the supplied centres and polygons.
+
+For an existing GeoDataFrame, use `vorflow.utils.grid_to_mfusg_disu()` and
+`vorflow.utils.grid_to_gsf()`. Plain arrays and GSF output do not need FloPy.
+The [simple MFUSG notebook](examples/basic_example_mfusg.ipynb) runs a
+single confined layer between two fixed heads and plots the result. It
+requires the separate `mfusg` executable on PATH or an `MFUSG_EXE` path;
+install it outside the notebook with `get-modflow /path/to/bin --subset mfusg`.
+
 ### Optional file export
 
 GeoPandas writes formats such as Shapefile and GeoPackage through an I/O engine

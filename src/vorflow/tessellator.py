@@ -16,7 +16,7 @@ from shapely.validation import make_valid
 from . import _lloyd
 from ._features import polygon_parts
 from ._plot import get_ax
-from .utils import grid_to_disv
+from .utils import grid_to_disv, grid_to_gsf, grid_to_mfusg_disu
 
 logger = logging.getLogger(__name__)
 
@@ -1450,6 +1450,100 @@ class VoronoiTessellator:
             botm=botm,
             **kwargs,
         )
+
+    def to_mfusg_disu(self, top, botm, nlay=1):
+        """Return MODFLOW-USG DISU arrays and metadata for the last grid.
+
+        See :func:`vorflow.utils.grid_to_mfusg_disu` for shapes, validation,
+        node mapping and face diagnostics. FloPy is not required. The arrays
+        use USG ``IVSD``/``FAHL`` conventions, **not MF6 DISU** conventions.
+        Bent or disconnected shared faces are unsupported; a barrier kink
+        inside a cell can create such a face and prevent export.
+
+        Args:
+            top: Scalar or one value per horizontal cell.
+            botm: Scalar, one bottom per layer, or ``(nlay, ncpl)`` array.
+            nlay (int): Number of stacked layers. Default 1.
+
+        Returns:
+            dict: USG DISU arguments plus ``node_id``, ``cell_map`` and
+            ``connectivity`` metadata. Node numbers are zero-based.
+
+        Raises:
+            RuntimeError: If ``generate()`` has not run.
+            ValueError: If geometry or elevations are unsupported.
+        """
+        return grid_to_mfusg_disu(self.grid, top, botm, nlay)
+
+    def to_mfusgdisu(self, model, top, botm, nlay=1, **kwargs):
+        """Attach a FloPy ``MfUsgDisU`` package to a MODFLOW-USG model.
+
+        FloPy is imported only here. Mapping/diagnostic metadata are excluded
+        from the constructor arguments. Use ``model.write_input()`` or the
+        returned package's ``write_file()`` to write DISU. This method does
+        not create an MF6 ``ModflowGwfdisu`` package.
+
+        Args:
+            model (flopy.mfusg.MfUsg): An unstructured (``structured=False``)
+                MODFLOW-USG model.
+            top: Scalar or one value per horizontal cell.
+            botm: Scalar, one bottom per layer, or ``(nlay, ncpl)`` array.
+            nlay (int): Number of stacked layers. Default 1.
+            **kwargs: Other ``MfUsgDisU`` options, e.g. ``nper``, ``perlen``,
+                ``steady``, ``itmuni`` and ``lenuni``. Grid arrays/flags and
+                confining beds cannot be overridden.
+
+        Returns:
+            flopy.mfusg.MfUsgDisU: The attached package.
+
+        Raises:
+            ImportError: If FloPy is not installed.
+            RuntimeError: If ``generate()`` has not run.
+            ValueError: For invalid model, grid or conflicting options.
+        """
+        try:
+            import flopy
+        except ImportError as err:
+            raise ImportError(
+                "to_mfusgdisu() needs flopy; install `vorflow[examples]` or "
+                "`flopy`, or use to_mfusg_disu() for the plain arrays."
+            ) from err
+        from ._mfusg import METADATA_KEYS
+
+        if not isinstance(model, flopy.mfusg.MfUsg) or model.structured:
+            raise ValueError("model must be a flopy.mfusg.MfUsg with structured=False, not an MF6 model.")
+        grid = self.to_mfusg_disu(top, botm, nlay)
+        args = {key: value for key, value in grid.items() if key not in METADATA_KEYS}
+        protected = set(args) | METADATA_KEYS | {"ivc", "cl1", "cl2"}
+        conflicts = protected.intersection(kwargs)
+        if conflicts:
+            raise ValueError(f"Cannot override generated MFUSG grid arguments: {sorted(conflicts)}.")
+        if np.any(np.asarray(kwargs.get("laycbd", 0)) != 0):
+            raise ValueError("Confining beds (laycbd != 0) are not supported.")
+        return flopy.mfusg.MfUsgDisU(model, **args, **kwargs)
+
+    def to_gsf(self, filepath, top, botm, nlay=1):
+        """Write original 3D GSF geometry matching :meth:`to_mfusg_disu`.
+
+        See :func:`vorflow.utils.grid_to_gsf`. FloPy is not required. Use
+        identical top/bottom inputs for DISU and GSF to keep the pair aligned.
+        Shared validation rejects bent faces, including barrier kinks inside
+        cells, and disconnected shared faces.
+
+        Args:
+            filepath (str or Path): Destination file.
+            top: Scalar or one value per horizontal cell.
+            botm: Scalar, one bottom per layer, or ``(nlay, ncpl)`` array.
+            nlay (int): Number of stacked layers. Default 1.
+
+        Returns:
+            pathlib.Path: The written file.
+
+        Raises:
+            RuntimeError: If ``generate()`` has not run.
+            ValueError: If geometry or elevations are unsupported.
+        """
+        return grid_to_gsf(self.grid, filepath, top, botm, nlay)
 
     def plot(self, ax=None, column="zone_id", show_generators=False, **kwargs):
         """

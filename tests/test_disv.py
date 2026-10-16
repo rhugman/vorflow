@@ -51,6 +51,14 @@ def test_counter_clockwise_input_is_reversed():
     assert _signed_area(_cell_rings(disv)[0]) < 0
 
 
+def test_small_clockwise_cell_at_utm_coordinates_stays_clockwise():
+    x, y = 500000., 5000000.
+    polygon = Polygon([(x, y), (x, y + .01), (x + .01, y + .01), (x + .01, y)])
+    disv = grid_to_disv(_grid([polygon]))
+    ring = np.asarray(_cell_rings(disv)[0])
+    assert _signed_area(ring - ring[0]) < 0
+
+
 def test_cell_centres_are_generator_points_not_centroids():
     disv = grid_to_disv(_grid([box(0, 0, 1, 1)], centres=[(0.2, 0.3)]))
     assert disv["cell2d"][0][1:3] == [0.2, 0.3]

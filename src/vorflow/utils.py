@@ -817,6 +817,88 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
 def _clockwise(ids, vertex_xy):
     """Ring vertex ids in clockwise order (negative shoelace area), as MODFLOW 6 expects."""
     xy = vertex_xy[np.asarray(ids)]
+    # Translation avoids cancellation of large UTM-coordinate products.
+    xy = xy - xy[0]
     x, y = xy[:, 0], xy[:, 1]
     signed_area = 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(np.roll(x, -1), y))
     return list(ids) if signed_area < 0 else list(ids)[::-1]
+
+
+def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1) -> dict:
+    """Build **MODFLOW-USG**, not MODFLOW 6, DISU input from a polygon grid.
+
+    Uses the same horizontal mesh in every layer, with the grid's ``x``/``y``
+    as numerical centres. ``top`` is scalar or ``(ncpl,)``; ``botm`` is scalar,
+    ``(nlay,)`` or ``(nlay, ncpl)``. The upper surface of each lower layer is
+    the preceding layer's bottom. All thicknesses must be positive.
+
+    Centre containment and overlap checks allow coordinate roundoff (32
+    machine epsilons times the coordinate scale), preserving input centres
+    and polygons. Roundoff-sized overlap faces are resolved at that precision.
+    Shared faces must be contiguous and straight; a kinked barrier can create
+    a bent face that is rejected. Disconnected shared faces are also rejected.
+
+    Returns:
+        dict: Inputs for ``flopy.mfusg.MfUsgDisU``: ``nodes``, ``nlay``,
+        ``njag``, ``nodelay``, ``top``, ``bot``, ``area``, ``iac``, ``ja``,
+        ``cl12``, ``fahl``, ``ivsd=-1`` and ``idsymrd=0``. Node arrays are
+        flattened in layer/row order, ``ja`` is zero-based, and ``area`` is
+        supplied for one layer. Diagonal geometry entries are zero.
+
+        Three additional entries are metadata, **not FloPy constructor
+        arguments**: ``node_id`` (one original ID per model node),
+        ``cell_map`` (a DataFrame with zero-based ``model_node``, ``layer``,
+        ``cell_id``, ``orig_index``, ``node_id`` and optional ``zone_id``),
+        and ``connectivity`` (horizontal face lengths, perpendicular centre
+        distances and ``ortho_error`` in degrees).
+
+        MFUSG ``FAHL`` is interface area, including thickness for horizontal
+        connections; MF6 ``HWVA`` uses horizontal width instead. MFUSG and
+        MF6 also use different vertical-connection flags. These arrays must
+        not be passed to ``flopy.mf6.ModflowGwfdisu``.
+
+    Raises:
+        ValueError: For invalid/overlapping cells, missing or invalid centres,
+            unsupported shared faces, bad array shapes or nonpositive thickness.
+
+    FloPy is optional. Remove the three metadata entries before unpacking
+    into ``MfUsgDisU``; FloPy may modify its ``ja`` argument in place, so copy
+    it if retaining the original zero-based arrays. No GNC or hydraulic
+    barrier properties are generated. Inspect ``connectivity`` to assess
+    nonorthogonal faces before using the mesh in a simulation.
+    """
+    from ._mfusg import _disu_arrays, _prepare_grid
+
+    return _disu_arrays(_prepare_grid(gdf, top, botm, nlay))
+
+
+def grid_to_gsf(gdf: gpd.GeoDataFrame, filepath, top, botm, nlay: int = 1):
+    """Write an original 3D grid specification file (GSF), returning its Path.
+
+    Geometry, elevations, validation and node order match
+    :func:`grid_to_mfusg_disu`. Vertices are deduplicated by XYZ; each node
+    lists clockwise top and bottom rings, without repeated closing vertices.
+    Node/vertex/layer numbers in the file are one-based. Flat cell surfaces
+    reproduce the supplied cell elevations; no vertex interpolation is done.
+    The shared validation rejects bent/disconnected faces, including faces
+    created where a barrier changes direction inside a cell.
+
+    GSF is a geometry companion, not a DISU package or a particle-tracking
+    GSF variant. It does not store hydraulic properties, CRS metadata or
+    boundary conditions. FloPy is not required. The format can be read by
+    ``flopy.discretization.UnstructuredGrid.from_gridspec``; compatibility
+    with a particular Vistas version should be checked by importing the pair.
+
+    Args:
+        gdf (GeoDataFrame): Polygon grid with ``x`` and ``y`` centres.
+        filepath (str or Path): Destination file; parent directory must exist.
+        top: Scalar or one top elevation per horizontal cell.
+        botm: Scalar, one bottom per layer, or ``(nlay, ncpl)`` array.
+        nlay (int): Number of stacked layers. Default 1.
+
+    Raises:
+        ValueError: If geometry or elevations fail MFUSG export validation.
+    """
+    from ._mfusg import _prepare_grid, _write_gsf
+
+    return _write_gsf(_prepare_grid(gdf, top, botm, nlay), filepath)
