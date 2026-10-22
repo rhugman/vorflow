@@ -3,11 +3,14 @@ import logging
 import geopandas as gpd
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
 from vorflow.utils import (
+    build_connectivity,
     calculate_mesh_quality,
+    cells_on,
     check_geometry_resolution,
+    faces_on,
     resample_geometry,
     summarize_quality,
 )
@@ -40,6 +43,76 @@ def test_calculate_mesh_quality_computes_expected_scalar_metrics(paired_polygons
     assert quality["compactness"].iloc[0] == pytest.approx(np.pi / 4, rel=1e-5)
     assert quality["drift_ratio"].iloc[0] == pytest.approx(0.0, abs=1e-8)
     assert quality["ortho_error"].iloc[0] == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        LineString([(-1, 0.5), (3, 0.5)]),
+        MultiLineString([[(-1, 0.5), (1, 0.5)], [(1, 0.5), (3, 0.5)]]),
+    ],
+)
+def test_cells_on_line_returns_cell_areas_and_intersection_lengths(paired_polygons, line):
+    cells = cells_on(paired_polygons, line)
+
+    assert cells["cell_area"].tolist() == pytest.approx([1.0, 1.0])
+    assert cells["length"].tolist() == pytest.approx([1.0, 1.0])
+
+
+def test_cells_on_point_returns_containing_cell_and_zero_length(paired_polygons):
+    cells = cells_on(paired_polygons, Point(0.5, 0.5))
+
+    assert len(cells) == 1
+    assert cells["cell_area"].tolist() == pytest.approx([1.0])
+    assert cells["length"].tolist() == pytest.approx([0.0])
+
+
+def test_cells_on_point_on_shared_edge_returns_both_touching_cells(paired_polygons):
+    cells = cells_on(paired_polygons, Point(1.0, 0.5))
+
+    assert len(cells) == 2
+
+
+def test_cells_on_rejects_unsupported_geometry(paired_polygons):
+    with pytest.raises(TypeError, match="Point, LineString, or MultiLineString"):
+        cells_on(paired_polygons, Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]))
+
+
+def test_faces_on_returns_shared_face_length_and_connected_cell_ids(paired_polygons):
+    connectivity = build_connectivity(paired_polygons, center="centroid")
+    faces = faces_on(connectivity, LineString([(1, -1), (1, 2)]))
+
+    assert len(faces) == 1
+    assert faces[["cell_id_1", "cell_id_2"]].iloc[0].tolist() == [0, 1]
+    assert faces["face_length"].tolist() == pytest.approx([1.0])
+
+
+def test_faces_on_tolerance_selects_nearby_shared_faces(paired_polygons):
+    connectivity = build_connectivity(paired_polygons, center="centroid")
+    faces = faces_on(
+        connectivity,
+        LineString([(0.99, -1), (0.99, 2)]),
+        tolerance=0.02,
+    )
+
+    assert len(faces) == 1
+    assert faces["face_length"].tolist() == pytest.approx([1.0])
+
+
+def test_faces_on_rejects_negative_tolerance(paired_polygons):
+    with pytest.raises(ValueError, match="tolerance must be non-negative"):
+        faces_on(paired_polygons, LineString([(0, 0), (1, 1)]), tolerance=-1)
+
+
+def test_faces_on_rejects_non_line_geometry(paired_polygons):
+    connectivity = build_connectivity(paired_polygons, center="centroid")
+    with pytest.raises(TypeError, match="LineString or MultiLineString"):
+        faces_on(connectivity, Point(0.5, 0.5))
+
+
+def test_faces_on_requires_connectivity_geodataframe(paired_polygons):
+    with pytest.raises(ValueError, match="connectivity GeoDataFrame"):
+        faces_on(paired_polygons, LineString([(0, 0), (1, 1)]))
 
 
 class TestCheckGeometryResolution:

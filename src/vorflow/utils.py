@@ -7,7 +7,8 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 import shapely
-from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon
+from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon, Point
+from .blueprint import DEFAULT_CONNECTIVITY_TOLERANCE
 
 
 logger = logging.getLogger(__name__)
@@ -831,3 +832,49 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
         pos = edge_pos[e] + 1
         ring[pos:pos] = inserted
     return out
+
+
+def cells_on(gdf, geometry):
+    """Return cells intersecting a point or line with area and line-length metrics.
+
+    ``cell_area`` is each full cell's area. For line inputs, ``length`` is the
+    portion of the input line inside each cell; for point inputs it is zero.
+    """
+    if not isinstance(geometry, (Point, LineString, MultiLineString)):
+        raise TypeError("geometry must be a Point, LineString, or MultiLineString.")
+
+    cells = gdf.loc[gdf.geometry.intersects(geometry)].copy()
+    cells["cell_area"] = cells.geometry.area
+    if isinstance(geometry, (LineString, MultiLineString)):
+        cells["length"] = cells.geometry.intersection(geometry).length
+    else:
+        cells["length"] = 0.0
+    cells["cell_id"] = cells.index
+    return cells
+
+
+def faces_on(gdf, geometry, tolerance=None):
+    """Return rows from a connectivity GeoDataFrame whose faces are near a line.
+
+    Pass the result of :func:`build_connectivity` as ``gdf``. ``tolerance``
+    buffers the line for selecting candidate shared edges; ``face_length`` is
+    the length of each full shared edge.
+    """
+    if tolerance is None:
+        tolerance = DEFAULT_CONNECTIVITY_TOLERANCE
+    if tolerance < 0:
+        raise ValueError("tolerance must be non-negative.")
+    if not isinstance(geometry, (LineString, MultiLineString)):
+        raise TypeError("geometry must be a LineString or MultiLineString.")
+
+    required = {"cell_id_1", "cell_id_2", "shared_edge"}
+    missing = required.difference(gdf.columns)
+    if missing:
+        raise ValueError(
+            f"faces_on requires a connectivity GeoDataFrame with columns: {sorted(required)}; "
+            f"missing {sorted(missing)}."
+        )
+
+    faces = gdf.loc[gdf.geometry.within(geometry.buffer(tolerance))].copy()
+    faces["face_length"] = faces.geometry.length
+    return faces
