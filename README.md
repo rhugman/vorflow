@@ -199,6 +199,11 @@ and `node_id` maps each `icell2d` back to its grid row:
 disv = tessellator.to_disv()
 ```
 
+MODFLOW 6 sets each DISV connection's width from the first edge two cells share,
+so where a face has several edges (e.g. bent where a barrier kinks inside a
+cell) the width is too small; `to_disv()` logs a warning and lists those pairs
+in `multi_edge_pairs`.
+
 With flopy installed, `to_modflowgwfdisv()` adds the DISV package to a model
 directly; further keywords go to `flopy.mf6.ModflowGwfdisv`:
 

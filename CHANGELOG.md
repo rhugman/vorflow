@@ -7,6 +7,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `grid_to_disv()` / `to_disv()` warn when neighbouring cells share a face of
+  more than one edge, e.g. a face bent where a barrier kinks inside a cell.
+  MODFLOW 6 DISV takes the connection width from only the first shared edge,
+  so it underestimates conductance there. The pairs are returned as
+  `multi_edge_pairs`; the exported arrays are unchanged.
+
 ## [0.3.0] - 2026-10-15
 
 MODFLOW 6 DISV export (`to_disv()`, `to_modflowgwfdisv()`), `plot()` methods
