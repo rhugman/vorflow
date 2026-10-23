@@ -16,10 +16,14 @@ from shapely.geometry import Polygon, LineString, Point, box
 from vorflow import buffer
 from vorflow.blueprint import ConceptualMesh
 from vorflow._straddle import (
+    KINK_INNER_MARGIN,
     _straddle_distances,
     _straddle_pair,
     _unit_tangent,
+    kink_fill_points,
+    kink_offset,
     plan_barrier_crossings,
+    straddle_kinks,
 )
 from vorflow.engine import MeshGenerator
 from vorflow.tessellator import VoronoiTessellator
@@ -345,3 +349,56 @@ class TestBarrierCrossingPlan:
     def test_lines_without_crossings_are_left_out_of_the_plan(self):
         plan, _ = _crossing_plan(LineString([(0, 50), (40, 50)]))
         assert plan.fixed == {} and plan.line_parts == {}
+
+
+def _densified(coords, step=1.0):
+    """``coords`` as a LineString with extra collinear vertices about ``step`` apart."""
+    return LineString(LineString(coords).segmentize(step).coords)
+
+
+def test_straddle_kinks_finds_turns_and_ignores_collinear_vertices():
+    line = _densified([(0, 0), (20, 0), (20, 20)])
+    kinks = straddle_kinks(line, lc=4.0, epsilon=0.8)
+    assert len(kinks) == 1
+    d, h, slope = kinks[0]
+    assert d == pytest.approx(20.0) and h == pytest.approx(2.0)
+    assert slope == pytest.approx(np.tan(np.radians(45)) / KINK_INNER_MARGIN)
+
+
+def test_straddle_kinks_drops_kinks_with_a_short_leg():
+    # A 1 m jog in a 4 m-resolution line keeps the evenly spaced pairs.
+    line = LineString([(0, 0), (20, 0), (20, 1), (40, 1)])
+    assert straddle_kinks(line, lc=4.0, epsilon=0.8) == []
+
+
+def test_kink_pairs_and_fill_points_are_equidistant_from_the_vertex():
+    # The vertex must be a Voronoi vertex of the barrier pairs: its nearest
+    # generators are the two kink pairs and the fill points, all at one radius.
+    line = _densified([(0, 0), (20, 0), (30, 25)])
+    lc, eps = 4.0, 0.8
+    kinks = straddle_kinks(line, lc, eps)
+    probe = 1e-4 * line.length
+    distances = _straddle_distances(line, lc, eps, probe, None, eps * 1e-6, kinks=kinks)
+    (d, h, _), = kinks
+    assert not any(d - h < x < d + h for x in distances)
+    assert np.diff(distances).max() <= lc + 1e-9
+    pairs = [xy for x in distances for xy in _straddle_pair(line, x, kink_offset(x, kinks, eps), probe)]
+    fill = kink_fill_points(line, kinks, eps)
+    assert fill
+    radius = np.hypot(*(np.array(pairs + fill) - (20, 0)).T)
+    nearest = np.sort(radius)[:4 + len(fill)]
+    np.testing.assert_allclose(nearest, nearest[0], rtol=1e-9)
+    assert np.sort(radius)[4 + len(fill)] > nearest[0] * 1.01
+
+
+def test_sharp_kink_pairs_use_a_smaller_offset():
+    # Interior angle 20 degrees: full-offset inner points of the two legs
+    # would be nearer each other than their own partners.
+    end = 20 * np.array([np.cos(np.radians(20)), np.sin(np.radians(20))])
+    line = _densified([(20, 0), (0, 0), tuple(end)])
+    kinks = straddle_kinks(line, lc=4.0, epsilon=0.8)
+    (d, h, _), = kinks
+    expected = h * np.tan(np.radians(10)) / KINK_INNER_MARGIN
+    assert kink_offset(d - h, kinks, 0.8) == pytest.approx(expected)
+    assert kink_offset(d + h, kinks, 0.8) == pytest.approx(expected)
+    assert kink_offset(d + h + 4.0, kinks, 0.8) == 0.8

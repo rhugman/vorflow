@@ -49,10 +49,15 @@ from ._log import current_verbosity, verbosity_scope
 from ._plot import get_ax
 from . import buffer
 from ._straddle import (
+    KINK_WARN_DEGREES,
     _straddle_distances,
     _straddle_pair,
+    kink_fill_points,
+    kink_interior_degrees,
+    kink_offset,
     plan_barrier_crossings,
     straddle_epsilon,
+    straddle_kinks,
     straddle_probe,
 )
 from ._features import (
@@ -1622,7 +1627,9 @@ class MeshGenerator:
         the domain is dropped, since no surface could embed it. ``fixed``
         maps distances along the line to pairs placed exactly there (at
         crossings of standard lines, whose nodes they share; OCC dedup
-        merges the coincident points).
+        merges the coincident points). Each kink gets a pair on both legs,
+        equidistant from its vertex, plus fill points on its outer side
+        (see _straddle.straddle_kinks).
         """
         fixed = fixed or {}
         epsilon = straddle_epsilon(lc, straddle)
@@ -1631,9 +1638,23 @@ class MeshGenerator:
         probe = straddle_probe(line)
         clip = domain if embedded else None
         tol = epsilon * 1e-6
-        distances = _straddle_distances(line, lc, epsilon, probe, clip, tol, anchors=list(fixed))
+        kinks = straddle_kinks(line, lc, epsilon)
+        for d, _, slope in kinks:
+            angle = kink_interior_degrees(slope)
+            if angle < KINK_WARN_DEGREES:
+                vertex = line.interpolate(d)
+                logger.warning(
+                    f"Warning: Line {idx} turns back sharply at ({vertex.x:.6g}, {vertex.y:.6g}) "
+                    f"(interior angle {angle:.0f} degrees). Cells there may still be cut along "
+                    f"the line after tessellation."
+                )
+        distances = _straddle_distances(line, lc, epsilon, probe, clip, tol, anchors=list(fixed),
+                                        kinks=kinks)
+        # The two pairs of a sharp kink use a smaller offset (see kink_offset).
         coords = [xy for d in distances
-                  for xy in (fixed[d] if d in fixed else _straddle_pair(line, d, epsilon, probe))]
+                  for xy in (fixed[d] if d in fixed
+                             else _straddle_pair(line, d, kink_offset(d, kinks, epsilon), probe))]
+        coords += kink_fill_points(line, kinks, epsilon)
         if clip is not None and coords:
             coords = self._clip_straddle_points(idx, coords, clip, tol)
         for x, y in coords:
