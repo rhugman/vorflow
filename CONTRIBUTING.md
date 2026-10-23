@@ -33,16 +33,29 @@ may already be planned.
 ## Development setup
 
 The Conda environment matches CI and installs the package in editable mode
-with the `dev` extra:
+with the `dev` and `examples` extras, including FloPy for the model examples:
 
 ```bash
 micromamba env create -f etc/environment.yml
 ```
 
+To update an existing environment, run this from the checkout or worktree
+you want to experiment with:
+
+```bash
+conda env update -n vorflow -f etc/environment.yml
+```
+
+The editable `..` path is relative to the environment file's `etc/`
+directory. It follows that checkout, not other worktrees automatically.
+Check the active source with `python -c "import vorflow; print(vorflow.__file__)"`
+and restart any running notebook kernel after changing the installation.
+The MODFLOW executables are installed separately as described below.
+
 If Gmsh and the geospatial stack are already installed:
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,examples]"
 ```
 
 If another `vorflow` is installed in the environment, run with
@@ -59,8 +72,11 @@ ruff check src tests scripts
 CI runs the full suite on Linux, Windows and macOS with Python 3.10 to 3.12,
 a minimum-dependencies job, and `ruff`. Pull requests must pass all of them.
 
-The documentation executes the example notebooks, so it needs Gmsh and the
-`mf6` binary (for example `conda install -c conda-forge modflow6`):
+The documentation executes the example notebooks, so it needs Gmsh, `mf6`
+and `mfusg`. After installing the Python dependencies, create a binary
+directory and run `get-modflow /path/to/bin --subset mf6,mfusg`. Add that
+directory to PATH; the MFUSG notebook also accepts `MFUSG_EXE` as a full path.
+The notebooks do not download executables. Then build:
 
 ```bash
 pip install -e ".[docs]"

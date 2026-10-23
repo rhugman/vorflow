@@ -18,5 +18,6 @@ dependencies:
   - pytest
   - jupyter
   - matplotlib
+  - flopy>=3.10
   - pip:
-      - -e ..[dev]
+      - -e ..[dev,examples]
