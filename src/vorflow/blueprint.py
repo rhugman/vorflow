@@ -609,7 +609,10 @@ class ConceptualMesh:
             snap_to_polygons (bool): If True, the line's endpoints will be snapped to
                 nearby polygon boundaries to ensure connectivity.
             is_barrier (bool): If True, the line is treated as a flow barrier. The mesh
-                will be constructed to prevent cell faces from crossing it.
+                will be constructed to prevent cell faces from crossing it. Where the
+                line turns, the faces on its two legs meet at the vertex. Corners
+                sharper than 30 degrees log a warning, since cells there may still be
+                cut along the line.
             straddle_width (float, optional): If set, forces Voronoi cell edges to align
                 perfectly with the line by creating a "virtual straddle" of mesh nodes.
             fields (list, optional): List of MeshField objects.

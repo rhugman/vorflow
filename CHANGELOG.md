@@ -14,6 +14,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sdist attached (`scripts/release_notes.py`). A tag without a changelog
   section now fails the build before anything is uploaded.
 
+### Fixed
+
+- Barriers and straddle lines that change direction no longer leave cells
+  reaching across the line at each corner. Straddle pairs were spaced evenly
+  along the line, so a vertex usually fell between two of them; the
+  tessellator then cut the corner cell and merged the piece into a
+  neighbour, leaving cells that met along two edges and faces up to about
+  50 degrees off orthogonal
+  ([#67](https://github.com/rhugman/vorflow/issues/67)). Each kink now gets
+  a pair on both legs at the same distance from its vertex, which becomes a
+  Voronoi vertex, plus points filling the gap on its outer side; at a sharp
+  kink the two pairs use a smaller offset. Kinks with a leg shorter than
+  half the line's resolution (a finely sampled curve) keep the even spacing.
+  Corners sharper than 30 degrees log a warning, as cells there may still
+  be cut.
+
 ## [0.3.0] - 2026-10-15
 
 MODFLOW 6 DISV export (`to_disv()`, `to_modflowgwfdisv()`), `plot()` methods

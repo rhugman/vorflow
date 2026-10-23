@@ -521,3 +521,52 @@ def test_curved_barrier_leaves_no_sliver_cells(amplitude, wavelength, lc):
 
     faces = build_connectivity(grid, center="generator").geometry
     assert not any(_face_crosses(face, barrier) for face in faces)
+
+
+@pytest.mark.parametrize("coords", [
+    [(30, 40), (140, 170), (160, 150), (270, 260)],
+    [(20, 150), (80, 210), (100, 190), (160, 250), (175, 235), (280, 280)],
+    [(40, 60), (150, 250), (180, 60)],  # 34 degree spike
+], ids=["single-kink", "zigzag", "spike"])
+def test_kinked_barrier_cells_need_no_cut(coords):
+    # A barrier vertex fell between two evenly spaced straddle pairs, so the
+    # cell at the corner reached across the line. The tessellator then cut
+    # it and merged the small piece into a neighbour, leaving cells that met
+    # along two edges and faces up to 50 degrees off orthogonal. Each kink
+    # now gets a pair on both legs equidistant from its vertex.
+    from vorflow import VoronoiTessellator
+    from vorflow.utils import build_connectivity
+
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 300, 300), zone_id=1, resolution=20)
+    cm.add_line(LineString(coords), line_id="barrier", resolution=8, is_barrier=True)
+    polys, lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=20, verbosity=0)
+    assert mg.generate(polys, lines, points)
+    vt = VoronoiTessellator(mg, cm)
+    grid = vt.generate()
+
+    assert vt.n_barrier_mirrors == 0
+    # Every cell is a whole Voronoi cell: none was cut off by the barrier.
+    assert len(grid) == len(mg.nodes)
+    barrier = lines.geometry.iloc[0]
+    connectivity = build_connectivity(grid, center="generator")
+    assert not any(_face_crosses(face, barrier) for face in connectivity.geometry)
+    near = connectivity.geometry.distance(barrier) < 16
+    assert connectivity.loc[near, "ortho_error"].max() < 1e-6
+
+
+def test_sharp_barrier_kink_warns(caplog):
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 300, 300), zone_id=1, resolution=20)
+    cm.add_line(LineString([(100, 60), (150, 250), (170, 60)]), line_id="barrier",  # 21 degrees
+                resolution=8, is_barrier=True)
+    model = cm.generate()
+    vorflow.set_verbosity(1, console=False)
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="vorflow"):
+            MeshGenerator(background_lc=20, verbosity=0).generate(*model)
+    finally:
+        vorflow.set_verbosity(1)
+    assert any("turns back sharply" in r.getMessage() for r in caplog.records)

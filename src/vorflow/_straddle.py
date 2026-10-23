@@ -12,6 +12,26 @@ the Voronoi edge between the two points of a pair, their perpendicular
 bisector, lies on the line. End pairs on an oblique domain boundary slide
 inward along the line until both points are inside (``_end_pair_slide``).
 
+*Kinks.* A pair placed across a vertex where the line turns cannot be
+symmetric about both legs, so the cell next to the corner reaches across the
+line and has to be cut after tessellation. Instead each kink gets one pair
+on each leg, both at the same distance ``h`` from the vertex
+(``straddle_kinks``). The vertex is then equidistant from those four points
+and becomes a Voronoi vertex: the barrier faces of the two legs meet there.
+No pair is placed between the two, and pairs elsewhere on each leg are
+spaced evenly as before. On the outer side of a sharp kink the two pairs
+leave a gap that the mesher would fill with a node of its own, nearer the
+vertex than the pairs; points on the same circle about the vertex fill it
+instead (``kink_fill_points``). On the inner side of a sharp kink the two
+legs' inner points would come closer to each other than to their own
+partners, so the two kink pairs use a smaller offset, ``h * tan(theta / 2)
+/ KINK_INNER_MARGIN`` (``theta`` the interior angle), where that is below
+``eps`` (``kink_offset``). Moving the pairs away from the vertex instead
+would leave an empty wedge that the mesher fills with nodes of its own;
+reducing the offset of further pairs too lets mesh nodes reach the thinner
+pairs. Crossing anchors and mirror pairs keep
+clear of kinks.
+
 *Crossings.* An embedded standard line that crosses an embedded straddle line
 would otherwise be trimmed back by the barrier corridor (1.2 * eps), leaving
 its end node at an arbitrary offset from the nearest pair. Instead the
@@ -60,6 +80,23 @@ CROSSING_MIRROR_DISTANCE = 0.6
 # A mirrored node closer than this many barrier cell sizes (along the
 # barrier) to another fixed pair is left unmirrored.
 CROSSING_MIRROR_MIN_GAP = 0.25
+# A vertex where a straddle line turns by more than this many degrees is a
+# kink and gets its own pairs. Below it the line counts as straight; the
+# vertices that densification adds turn by round-off only.
+KINK_MIN_TURN_DEGREES = 1.0
+# Both legs at a kink must be at least this many cell sizes long. Shorter
+# legs (a finely sampled curve) keep the evenly spaced pairs, and the
+# tessellator cuts what still reaches across the line.
+KINK_MIN_LEG = 0.5
+# The two pairs of a sharp kink use the offset h * tan(theta / 2) /
+# KINK_INNER_MARGIN (theta the interior angle) when that is below eps,
+# keeping each leg's inner points nearer their own partners than the other
+# leg's.
+KINK_INNER_MARGIN = 1.1
+# Below this interior angle the pairs cannot keep every cell on its side of
+# the line at the line's resolution (in tests, spikes of 25 degrees or less
+# still needed a cut), so MeshGenerator warns.
+KINK_WARN_DEGREES = 30.0
 
 
 def _unit_tangent(line, d, probe):
@@ -119,15 +156,116 @@ def _end_pair_slide(line, at_end, epsilon, probe, domain, limit, tol):
     return slide
 
 
-def _anchored_grid(length, lc, anchors):
+def straddle_kinks(line, lc, epsilon):
+    """(distance along ``line``, half-spacing ``h``, offset slope) of each kink that gets its own pairs.
+
+    A kink is a vertex where the line turns by more than
+    KINK_MIN_TURN_DEGREES, with both legs (to the neighbouring kinks or the
+    line ends) at least KINK_MIN_LEG * ``lc`` long. ``h`` is ``lc / 2``,
+    capped at a quarter of each adjacent leg so the pairs of two
+    neighbouring kinks never cross. The slope is ``tan(theta / 2) /
+    KINK_INNER_MARGIN``; see kink_offset.
+    """
+    xy = np.asarray(line.coords, dtype=float)[:, :2]
+    steps = np.hypot(*np.diff(xy, axis=0).T)
+    xy = np.vstack([xy[:1], xy[1:][steps > 0]])
+    if len(xy) < 3:
+        return []
+    seg = np.diff(xy, axis=0)
+    heading = np.arctan2(seg[:, 1], seg[:, 0])
+    turn = np.abs((np.diff(heading) + np.pi) % (2 * np.pi) - np.pi)
+    along = np.concatenate([[0.0], np.cumsum(np.hypot(*seg.T))])
+    is_kink = turn > math.radians(KINK_MIN_TURN_DEGREES)
+    kinks = list(along[1:-1][is_kink])
+    half_angle = dict(zip(kinks, (np.pi - turn[is_kink]) / 2.0))
+    # Dropping a kink lengthens its neighbours' legs, so repeat until stable.
+    while True:
+        legs = np.diff([0.0, *kinks, line.length])
+        short = {k for k in range(len(kinks)) if min(legs[k], legs[k + 1]) < KINK_MIN_LEG * lc}
+        if not short:
+            break
+        kinks = [d for k, d in enumerate(kinks) if k not in short]
+    legs = np.diff([0.0, *kinks, line.length])
+    out = []
+    for k, d in enumerate(kinks):
+        h = min(0.5 * lc, legs[k] / 4.0, legs[k + 1] / 4.0)
+        out.append((float(d), h, math.tan(half_angle[d]) / KINK_INNER_MARGIN))
+    return out
+
+
+def kink_interior_degrees(slope):
+    """Interior angle of a kink from its offset slope (see straddle_kinks)."""
+    return math.degrees(2.0 * math.atan(slope * KINK_INNER_MARGIN))
+
+
+def kink_offset(d, kinks, epsilon):
+    """Offset of the pair at distance ``d``: ``epsilon``, or less for the two pairs of a sharp kink.
+
+    A kink pair, ``h`` from the vertex, is offset by at most ``h * slope``
+    (see straddle_kinks). The bisector of a pair stays on the leg whatever
+    the offset.
+    """
+    for k, h, slope in kinks:
+        if d in (k - h, k + h):
+            return min(epsilon, h * slope)
+    return epsilon
+
+
+def kink_fill_points(line, kinks, epsilon):
+    """Points on the outer side of each kink, on the circle through its four pair points.
+
+    The pairs at ``d -/+ h`` sit on a circle of radius ``sqrt(h**2 +
+    eps_k**2)`` about the vertex, ``eps_k`` their offset (kink_offset). On a straight line the outer points of two
+    neighbouring pairs span an arc of ``pi - 2 * alpha`` on that circle
+    (``alpha = atan(eps_k / h)``); at a kink the outer arc is wider. It is
+    split into pieces no wider than that, and a point is placed at each
+    division, so the mesher has no room to put a node nearer the vertex.
+    """
+    points = []
+    for d, h, _ in kinks:
+        eps_k = kink_offset(d - h, kinks, epsilon)
+        vertex = line.interpolate(d)
+        before = np.array(line.interpolate(d - h).coords[0])
+        after = np.array(line.interpolate(d + h).coords[0])
+        centre = np.array(vertex.coords[0])
+        a1 = math.atan2(*(before - centre)[::-1])
+        a2 = math.atan2(*(after - centre)[::-1])
+        alpha = math.atan2(eps_k, h)
+        radius = math.hypot(h, eps_k)
+        ccw = (a2 - a1) % (2 * math.pi)
+        # The interior wedge is the smaller angle between the legs.
+        if ccw < math.pi:
+            start, span = a2 + alpha, 2 * math.pi - ccw - 2 * alpha
+        else:
+            start, span = a1 + alpha, ccw - 2 * alpha
+        pieces = math.ceil(span / (math.pi - 2 * alpha) - 1e-9)
+        for j in range(1, pieces):
+            angle = start + span * j / pieces
+            points.append((centre[0] + radius * math.cos(angle), centre[1] + radius * math.sin(angle)))
+    return points
+
+
+def _near_kink(barrier, d, gap):
+    """True if distance ``d`` lies within ``gap`` of the pairs of one of ``barrier``'s kinks."""
+    return any(abs(d - k) < h + gap for k, h, _ in barrier.kinks)
+
+
+def _anchored_grid(length, lc, anchors, kinks=()):
     """Distances 0..length through every anchor, each gap split evenly into ~``lc`` steps.
 
-    Returns (distances, first gap spacing, last gap spacing). Without anchors
-    this is ``np.linspace(0, length, ceil(length / lc) + 1)``.
+    Each kink ``(d, h, eps_k)`` adds breaks at ``d - h`` and ``d + h`` and leaves
+    the gap between them empty. Returns (distances, first gap spacing, last
+    gap spacing). Without anchors or kinks this is
+    ``np.linspace(0, length, ceil(length / lc) + 1)``.
     """
-    breaks = [0.0, *anchors, length]
+    windows = [(d - h, d + h) for d, h, _ in kinks]
+    breaks = sorted([0.0, *anchors, length, *(edge for window in windows for edge in window)])
     pieces, spacings = [], []
     for a, b in zip(breaks[:-1], breaks[1:]):
+        if (a, b) in windows:
+            pieces.append(np.array([a]))
+            spacings.append(b - a)
+            continue
         num_segments = int(max(1, np.ceil((b - a) / lc)))
         pieces.append(np.linspace(a, b, num_segments + 1)[:-1])
         spacings.append((b - a) / num_segments)
@@ -135,12 +273,13 @@ def _anchored_grid(length, lc, anchors):
     return distances, spacings[0], spacings[-1]
 
 
-def _straddle_distances(line, lc, epsilon, probe, domain, tol, anchors=()):
+def _straddle_distances(line, lc, epsilon, probe, domain, tol, anchors=(), kinks=()):
     """Distances along ``line`` of its straddle pairs, with end pairs slid inside ``domain``.
 
-    Pairs are spaced about ``lc`` apart and include both endpoints and every
-    distance in ``anchors``; each gap between consecutive anchors is split
-    evenly. Where a line meets the domain boundary obliquely, a pair at the
+    Pairs are spaced about ``lc`` apart and include both endpoints, every
+    distance in ``anchors`` and the pairs ``d -/+ h`` of every kink in
+    ``kinks`` (see straddle_kinks); each gap between consecutive breaks is
+    split evenly, and no pair is placed inside a kink. Where a line meets the domain boundary obliquely, a pair at the
     endpoint has one point outside; that pair moves inward along the line
     (see _end_pair_slide) and interior pairs it comes within half a spacing
     of are dropped. Anchors are always kept (plan_barrier_crossings only
@@ -149,14 +288,14 @@ def _straddle_distances(line, lc, epsilon, probe, domain, tol, anchors=()):
     """
     length = line.length
     anchors = sorted(anchors)
-    distances, first_spacing, last_spacing = _anchored_grid(length, lc, anchors)
+    distances, first_spacing, last_spacing = _anchored_grid(length, lc, anchors, kinks)
     if domain is None:
         return distances
     start = _end_pair_slide(line, False, epsilon, probe, domain, length / 2.0, tol)
     end = _end_pair_slide(line, True, epsilon, probe, domain, length / 2.0, tol)
     lo = 0.0 if start is None else start + first_spacing / 2.0
     hi = length if end is None else length - end - last_spacing / 2.0
-    anchor_set = set(anchors)
+    anchor_set = set(anchors) | {edge for d, h, _ in kinks for edge in (d - h, d + h)}
     positions = [] if start is None else [start]
     positions += [d for d in distances[1:-1] if lo < d < hi or d in anchor_set]
     # On a short line the two slid end pairs can meet; keep only the first.
@@ -194,6 +333,7 @@ class _Barrier:
     tol: float
     lo: float  # first and last pair positions (slid ends)
     hi: float
+    kinks: list = dataclasses.field(default_factory=list)  # see straddle_kinks
 
     @property
     def corridor(self):
@@ -249,7 +389,8 @@ def _barrier_info(idx, row, background_lc, domain):
         end = _end_pair_slide(line, True, epsilon, probe, domain, length / 2.0, tol)
         lo = 0.0 if start is None else start
         hi = length if end is None else length - end
-    return _Barrier(int(idx), line, lc, epsilon, probe, tol, lo, hi)
+    return _Barrier(int(idx), line, lc, epsilon, probe, tol, lo, hi,
+                    straddle_kinks(line, lc, epsilon))
 
 
 def _crossing_candidates(line, barrier, corridor):
@@ -281,6 +422,8 @@ def _anchor_crossings(barrier, standard, background_lc, domain):
     accepted, crossings = [], {}
     for _kind, d, l_idx, l_row in candidates:
         if not (barrier.lo + min_gap <= d <= barrier.hi - min_gap):
+            continue
+        if _near_kink(barrier, d, min_gap):
             continue
         shared = next((a for a in accepted if abs(a - d) <= barrier.tol), None)
         if shared is None and any(abs(a - d) < min_gap for a in accepted):
@@ -448,6 +591,8 @@ def _add_mirrors(plan, mirrors, domain):
         fixed = plan.fixed.setdefault(barrier.idx, {})
         min_gap = CROSSING_MIRROR_MIN_GAP * barrier.lc
         if not (barrier.lo + min_gap <= d <= barrier.hi - min_gap):
+            continue
+        if _near_kink(barrier, d, min_gap):
             continue
         if any(abs(d - other) < min_gap for other in fixed):
             continue
