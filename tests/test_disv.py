@@ -1,9 +1,13 @@
+import logging
+
 import geopandas as gpd
 import numpy as np
 import pytest
 from shapely.geometry import LineString, Polygon, box
 
+import vorflow
 from vorflow.blueprint import ConceptualMesh
+from vorflow.engine import MeshGenerator
 from vorflow.tessellator import VoronoiTessellator
 from vorflow.utils import build_connectivity, grid_to_disv
 
@@ -161,3 +165,53 @@ def test_to_modflowgwfdisv_without_flopy_raises(monkeypatch):
     monkeypatch.setitem(sys.modules, "flopy", None)
     with pytest.raises(ImportError, match="to_disv"):
         _tessellated().to_modflowgwfdisv(gwf=None, top=1.0, botm=0.0)
+
+
+def _multi_edge_warnings(caplog, grid):
+    vorflow.set_verbosity(1, console=False)
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="vorflow"):
+            disv = grid_to_disv(grid)
+    finally:
+        vorflow.set_verbosity(1)
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    return disv, [m for m in messages if "more than one edge" in m]
+
+
+def test_l_shaped_shared_face_is_flagged(caplog):
+    # The two cells meet along three edges; MODFLOW 6 would use only one.
+    ell = Polygon([(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2)])
+    rest = Polygon([(2, 0), (3, 0), (3, 2), (1, 2), (1, 1), (2, 1)])
+    plain = grid_to_disv(_grid([ell, rest]))
+    disv, warned = _multi_edge_warnings(caplog, _grid([ell, rest]))
+
+    assert len(warned) == 1
+    assert "1 neighbouring cell pairs" in warned[0]
+    np.testing.assert_array_equal(disv["multi_edge_pairs"], [[0, 1]])
+    assert disv["cell2d"] == plain["cell2d"]
+    assert disv["vertices"] == plain["vertices"]
+
+
+def test_plain_grid_is_not_flagged(caplog):
+    grid = _grid([box(0, 0, 1, 2), box(1, 0, 2, 1), box(1, 1, 2, 2), box(2, 0, 3, 2)])
+    disv, warned = _multi_edge_warnings(caplog, grid)
+
+    assert warned == []
+    assert disv["multi_edge_pairs"].shape == (0, 2)
+
+
+@pytest.mark.slow
+def test_bent_barrier_face_is_flagged(caplog):
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 300, 300), zone_id=1, resolution=20)
+    cm.add_line(
+        LineString([(30, 40), (140, 170), (160, 150), (270, 260)]), "f", resolution=8, is_barrier=True
+    )
+    mg = MeshGenerator(background_lc=20, conceptual_mesh=cm)
+    mg.generate()
+    grid = VoronoiTessellator(mg, cm).generate()
+    disv, warned = _multi_edge_warnings(caplog, grid)
+
+    assert len(warned) == 1
+    assert len(disv["multi_edge_pairs"]) > 0

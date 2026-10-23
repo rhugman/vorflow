@@ -717,6 +717,14 @@ def grid_to_disv(gdf: gpd.GeoDataFrame, tolerance: float | None = None) -> dict:
     split a cell) is inserted into that edge too, because MODFLOW 6 finds
     connections from shared vertex pairs.
 
+    MODFLOW 6 builds one connection per neighbouring pair from the first
+    shared edge it finds in the vertex rings; that edge alone sets the
+    connection width. Where two cells share a face of several edges (a face
+    bent where a barrier kinks inside a cell, or a straight face split by a
+    hanging vertex), MODFLOW 6 therefore underestimates the width. The arrays
+    cannot change that, so such pairs are logged as a warning and returned as
+    ``multi_edge_pairs``.
+
     Args:
         gdf (GeoDataFrame): Grid of single-part polygons without holes, with
             ``x`` and ``y`` columns (e.g. ``VoronoiTessellator.grid``).
@@ -725,7 +733,9 @@ def grid_to_disv(gdf: gpd.GeoDataFrame, tolerance: float | None = None) -> dict:
             coordinate scale.
 
     Returns:
-        dict: ``ncpl``, ``nvert``, ``vertices``, ``cell2d`` and ``node_id``.
+        dict: ``ncpl``, ``nvert``, ``vertices``, ``cell2d``, ``node_id`` and
+        ``multi_edge_pairs`` (``(n, 2)`` int array of the ``icell2d`` pairs,
+        lower first, that share more than one edge; empty if none).
 
     Raises:
         ValueError: If columns are missing, the grid is empty, or a cell is
@@ -770,13 +780,39 @@ def grid_to_disv(gdf: gpd.GeoDataFrame, tolerance: float | None = None) -> dict:
         for icell, ids in enumerate(cell_vertices)
     ]
     node_id = gdf["node_id"].to_numpy() if "node_id" in gdf.columns else np.arange(len(gdf))
+    multi_edge_pairs = _multi_edge_pairs(cell_vertices)
+    if len(multi_edge_pairs):
+        examples = ", ".join(f"({a}, {b})" for a, b in multi_edge_pairs[:5])
+        logger.warning(
+            f"{len(multi_edge_pairs)} neighbouring cell pairs share a face of more than one "
+            f"edge (icell2d pairs, e.g. {examples}). MODFLOW 6 DISV uses only the first "
+            "shared edge it finds for each pair, so the connection width (HWVA) of these "
+            "faces is too small. Pairs are in the 'multi_edge_pairs' entry."
+        )
     return {
         "ncpl": len(cell2d),
         "nvert": len(vertices),
         "vertices": vertices,
         "cell2d": cell2d,
         "node_id": node_id,
+        "multi_edge_pairs": multi_edge_pairs,
     }
+
+
+def _multi_edge_pairs(cell_vertices):
+    """``(n, 2)`` array of the cell pairs ``(i, j)``, ``i < j``, whose rings share more than one edge."""
+    edge_cell = np.repeat(np.arange(len(cell_vertices)), [len(ids) for ids in cell_vertices])
+    starts = np.concatenate([np.asarray(ids) for ids in cell_vertices])
+    ends = np.concatenate([np.roll(np.asarray(ids), -1) for ids in cell_vertices])
+    edges = np.sort(np.stack([starts, ends], axis=1), axis=1)
+    _, edge_id, counts = np.unique(edges, axis=0, return_inverse=True, return_counts=True)
+    edge_id = edge_id.ravel()
+    # An edge both neighbours list once each is one shared edge of that pair.
+    shared = counts[edge_id] == 2
+    order = np.lexsort((edge_cell[shared], edge_id[shared]))
+    cells = edge_cell[shared][order].reshape(-1, 2)
+    pairs, pair_counts = np.unique(np.sort(cells, axis=1), axis=0, return_counts=True)
+    return pairs[pair_counts > 1].astype(np.int64)
 
 
 def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):

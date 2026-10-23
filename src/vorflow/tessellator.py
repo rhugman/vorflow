@@ -1397,10 +1397,14 @@ class VoronoiTessellator:
         See ``vorflow.utils.grid_to_disv``: returns ``ncpl``, ``nvert``,
         ``vertices`` and ``cell2d`` in the zero-based form flopy takes, with
         the generator points as cell centres, plus ``node_id`` per
-        ``icell2d`` (grid row order) to map results back to the grid.
+        ``icell2d`` (grid row order) to map results back to the grid, and
+        ``multi_edge_pairs``: the cell pairs sharing a face of more than one
+        edge, which MODFLOW 6 connects through only one of them (logged as a
+        warning).
 
         Returns:
-            dict: ``ncpl``, ``nvert``, ``vertices``, ``cell2d`` and ``node_id``.
+            dict: ``ncpl``, ``nvert``, ``vertices``, ``cell2d``, ``node_id``
+            and ``multi_edge_pairs``.
 
         Raises:
             RuntimeError: If ``generate()`` has not run.
