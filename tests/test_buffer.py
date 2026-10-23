@@ -3,12 +3,130 @@ import warnings
 import gmsh
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Polygon, box
+import shapely
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import split
 
 from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
+from vorflow.buffer import plan_line_strip, plan_polygon_band, plan_quad_buffers
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("start", [0, 1, 2, 3])
+def test_closed_line_buffer_is_complete_annulus(reverse, start):
+    # An exterior offset_curve of a closed line can omit two sides at its
+    # start point. A closed feature must use polygon buffering, without fake
+    # end caps, so every side receives the requested footprint.
+    corners = [(134, 134), (166, 134), (166, 166), (134, 166)]
+    if reverse:
+        corners.reverse()
+    corners = corners[start:] + corners[:start]
+    line = LineString(corners + [corners[0]])
+    parts = plan_line_strip(line, 8.0, 1, box(0, 0, 300, 300), "loop")
+
+    assert len(parts) == 1
+    part = parts[0]
+    expected = box(130, 130, 170, 170).difference(box(138, 138, 162, 162))
+    assert part.strip.is_valid
+    assert part.strip.symmetric_difference(expected).area == pytest.approx(0.0)
+    assert part.strip.area == pytest.approx(1024.0)
+    assert len(part.strip.interiors) == 1
+    assert part.corners == []
+    assert part.side_lines == ()
+
+
+@pytest.mark.parametrize("thickness", [1, 2])
+def test_closed_line_buffer_matches_polygon_band(thickness):
+    # This also exercises a non-rectangular loop and preserves the domain's
+    # interior: converting the outline to a band does not create a new zone.
+    polygon = Polygon([(20, 20), (84, 20), (84, 84), (52, 100), (20, 84)])
+    line = LineString(polygon.exterior.coords)
+    part = plan_line_strip(line, 8.0, thickness, None, "loop")[0]
+    expected = plan_polygon_band(polygon, 8.0, thickness, "polygon")
+    assert part.strip.symmetric_difference(expected).area == pytest.approx(0.0)
+
+
+def test_closed_line_buffer_rejects_self_intersection():
+    line = LineString([(0, 0), (32, 32), (0, 32), (32, 0), (0, 0)])
+    with pytest.warns(UserWarning, match="must form a simple polygon ring"):
+        assert plan_line_strip(line, 8.0, 1, None, "bow-tie") == []
+
+
+def test_explicit_zero_buffer_simplification_preserves_gentle_turn():
+    line = LineString([(0, 0), (16, 2), (32, 0)])
+    exact = plan_line_strip(line, 8, 1, None, "gentle", simplify_tolerance=0)[0]
+    legacy = plan_line_strip(line, 8, 1, None, "gentle")[0]
+    explicit_legacy = plan_line_strip(line, 8, 1, None, "gentle", simplify_tolerance=12)[0]
+    expected = line.buffer(4, cap_style=2, join_style=2, mitre_limit=5)
+    assert exact.strip.symmetric_difference(expected).area == pytest.approx(0, abs=1e-12)
+    assert legacy.strip.symmetric_difference(exact.strip).area > 0
+    assert legacy.strip.equals(explicit_legacy.strip)
+
+
+def test_explicit_zero_closed_buffer_preserves_rounded_boundary():
+    polygon = Point(40, 40).buffer(32, quad_segs=8)
+    line = LineString(polygon.exterior.coords)
+    exact = plan_line_strip(line, 8, 1, None, "rounded", simplify_tolerance=0)[0]
+    expected = polygon.buffer(4, join_style=2).difference(polygon.buffer(-4, join_style=2))
+    assert exact.strip.symmetric_difference(expected).area == pytest.approx(0, abs=1e-10)
+    legacy = plan_line_strip(line, 8, 1, None, "rounded")[0]
+    assert legacy.strip.symmetric_difference(exact.strip).area > 1
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_quad_buffer_planning_propagates_feature_simplification_zero(closed):
+    line = (LineString(Point(40, 40).buffer(32, quad_segs=8).exterior.coords)
+            if closed else LineString([(8, 24), (40, 28), (72, 24)]))
+    cm = ConceptualMesh(crs=None)
+    cm.add_polygon(box(-8, -8, 88, 88), zone_id=1, resolution=8)
+    cm.add_line(line, line_id="exact", resolution=8, quad_buffer=True,
+                simplify_tolerance=0, densify=False)
+    polygons, lines, _ = cm.generate()
+    plans = plan_quad_buffers(polygons, lines, 8, box(-8, -8, 88, 88))
+    expected = plan_line_strip(line, 8, 1, None, "expected", simplify_tolerance=0)[0].strip
+    assert plans[('line', 0)].footprint.symmetric_difference(expected).area == pytest.approx(0)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_closed_line_quad_buffer_mesh_covers_every_side_without_cutting(reverse):
+    corners = [(16, 16), (48, 16), (48, 48), (16, 48)]
+    if reverse:
+        corners.reverse()
+    loop = LineString(corners + [corners[0]])
+    cm = ConceptualMesh(crs=None)
+    cm.add_polygon(box(0, 0, 64, 64), zone_id="domain", resolution=8.0)
+    cm.add_line(
+        loop,
+        line_id="closed-barrier",
+        resolution=8.0,
+        is_barrier=True,
+        barrier_policy="preserve",
+        quad_buffer=True,
+    )
+    mesher = MeshGenerator(
+        background_lc=8.0, verbosity=0, smoothing_steps=0, optimization_cycles=0
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert mesher.generate(*cm.generate())
+    assert not [w for w in caught if "transfinite structure" in str(w.message)]
+    elements = mesher.get_element_grid()
+    quads = mesher.get_element_grid("quads")
+    expected = box(12, 12, 52, 52).difference(box(20, 20, 44, 44))
+    quad_footprint = shapely.union_all(quads.geometry.to_numpy())
+    assert quad_footprint.symmetric_difference(expected).area == pytest.approx(0.0)
+    assert elements.geometry.area.sum() == pytest.approx(64.0**2)
+    assert elements["zone_id"].eq("domain").all()
+    assert len(quads) == 16
+
+    tessellator = VoronoiTessellator(mesher, cm, clip_to_boundary=True)
+    grid = tessellator.generate()
+    report = tessellator.barrier_report()
+    assert report["crossings"].empty
+    assert report["unmatched"].empty
+    assert grid.geometry.area.sum() == pytest.approx(64.0**2)
 
 
 
@@ -25,7 +143,8 @@ def _capture_crossings(mesher, monkeypatch):
     return captured
 
 
-def _generate_line_buffer_mesh(*, thickness=1, add_crossing_line=False, return_context=False):
+def _generate_line_buffer_mesh(*, thickness=1, add_crossing_line=False, return_context=False,
+                               barrier_policy='auto'):
     cm = ConceptualMesh(crs=None)
     cm.add_polygon(
         box(0, 0, 10, 4),
@@ -38,6 +157,7 @@ def _generate_line_buffer_mesh(*, thickness=1, add_crossing_line=False, return_c
         line_id="buffered-line",
         resolution=1.0,
         is_barrier=True,
+        barrier_policy=barrier_policy,
         quad_buffer=True,
         quad_buffer_thickness=thickness,
         dist_min=0.5,
@@ -246,8 +366,8 @@ def _straddling_cell_count(grid, line, sliver_fraction=1e-6):
     return count
 
 
-def test_structured_quad_buffer_barrier_is_only_cut_where_cells_straddle_it():
-    mesher, cm = _generate_line_buffer_mesh(thickness=1, return_context=True)
+def test_structured_quad_buffer_explicit_cut_only_splits_straddling_cells():
+    mesher, cm = _generate_line_buffer_mesh(thickness=1, return_context=True, barrier_policy='cut')
     line = cm.clean_lines.iloc[0].geometry
 
     tessellator = VoronoiTessellator(mesher, cm, clip_to_boundary=True)
@@ -264,9 +384,9 @@ def test_structured_quad_buffer_barrier_is_only_cut_where_cells_straddle_it():
     assert _straddling_cell_count(grid, line) == 0
 
 
-def test_structured_quad_buffer_thickness2_barrier_is_enforced():
-    """Catches quad-buffered barriers being skipped when a node row sits on the line."""
-    mesher, cm = _generate_line_buffer_mesh(thickness=2, return_context=True)
+def test_structured_quad_buffer_thickness2_explicit_cut_is_enforced():
+    """Explicit cutting retains the legacy enforcement on a centreline node row."""
+    mesher, cm = _generate_line_buffer_mesh(thickness=2, return_context=True, barrier_policy='cut')
     line = cm.clean_lines.iloc[0].geometry
 
     grid = VoronoiTessellator(mesher, cm, clip_to_boundary=True).generate()

@@ -56,8 +56,49 @@ Grid quality and utilities
 
    build_connectivity
    boundary_connectivity_report
+   grid_barrier_report
+   grid_quality_report
    calculate_orthogonality
    calculate_mesh_quality
    summarize_quality
    check_geometry_resolution
    resample_geometry
+   cells_on
+   faces_on
+   grid_to_disv
+
+Barrier source layouts and optional repairs
+-------------------------------------------
+
+``cells_on`` returns a GeoDataFrame for zero, one or many matches, with
+``cell_id`` as zero-based row positions and the original index retained.
+``faces_on`` takes connectivity from ``build_connectivity`` and uses the
+additive ``full_shared_edge`` geometry to select and measure whole interfaces.
+Its returned active geometry is the complete shared edge. Legacy manually
+constructed connectivity without that column is treated as already complete.
+Neither lookup assigns hydraulic properties or certifies numerical suitability.
+
+Keep authoring geometry with ``ConceptualMesh.add_line`` and ``add_polygon``.
+On a line, ``is_barrier=True`` selects straddle sites unless ``quad_buffer=True``
+selects a quad band. ``barrier_policy="preserve"`` leaves the source cells
+unchanged; ``"cut"`` enables clipping. ``barrier_mirrors`` independently controls
+reflected generators. With clipping, ``barrier_merge="restore"`` conservatively
+restores a failed parent cut; ``"checked"`` retains rejected fragments and
+``"none"`` disables merging. Existing defaults remain compatible.
+
+Polygon bands use ``add_polygon(..., quad_buffer=True)``. An ordinary line may
+also use ``quad_buffer=True`` or a positive ``straddle_width`` without being a
+barrier. No geometry authoring call assigns hydraulic resistance. Multiple
+features and multipart input remain supported; inspect crossing diagnostics
+where buffered features intersect.
+
+``MeshGenerator.source_report`` records actual source-buffer coverage and
+Gmsh element types and meshing modes. ``VoronoiTessellator.quality_report``
+separates hard cell/shared-face defects from quality warnings. Neither certifies
+head or flow accuracy. ``barrier_report(approximate=True)`` additionally proposes
+real shared-face approximations, with offsets and topology diagnostics, without
+changing the grid or assigning hydraulic resistance.
+``closed_ties="majority"`` explicitly assigns closed-loop centre ties by polygon
+area; balanced areas go outside. The default ``"exclude"`` retains conservative
+exclusion. ``approximate_ties`` identifies every choice, while usable-route
+topology and offsets in both directions expose incomplete or unsafe routes.

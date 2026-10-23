@@ -31,7 +31,7 @@ The library is built around three main classes that work in sequence:
 
 2.  **`MeshGenerator`**: This is the engine that generates a triangular mesh based on the blueprint from `ConceptualMesh`. It uses `Gmsh` as its backend to create a quality-conforming Delaunay triangulation.
 
-3.  **`VoronoiTessellator`**: This class takes the triangular mesh from `MeshGenerator` and computes its dual: the Voronoi diagram. The result is a grid of polygonal cells. It includes logic to clip the grid to the domain boundary and enforce barrier features by cutting through cells.
+3.  **`VoronoiTessellator`**: This class computes a Voronoi diagram from the mesh nodes, clips it to the domain and handles barrier features according to their policy. Original Gmsh connectivity is not necessarily the final Voronoi dual. Existing `add_line` barriers retain historical mirror/cut enforcement; `barrier_policy="preserve"` explicitly retains the generated layout.
 
 ## Workflow
 
@@ -187,6 +187,211 @@ plt.show()
        alt="Basic Usage grid: cells refine towards the fault barrier at x = 100 and around the well at (25, 25)"
        width="60%">
 </p>
+
+### Quad barriers and tracking the cells on each side
+
+`vorflow.utils.cells_on(gdf, geometry)` returns selected cells with zero-based
+row-position `cell_id` values, full-cell areas and line-intersection lengths.
+It always returns a GeoDataFrame, including empty and single-cell results, and
+keeps the original index and metadata. Points on a shared boundary select all
+touching cells; decide explicitly which cells should receive a model condition.
+
+`faces_on(build_connectivity(gdf), line, tolerance=...)` selects complete shared
+faces. Connectivity retains its representative `shared_edge` and metrics for
+compatibility, and adds `full_shared_edge` containing all linear segments.
+The lookup returns the full geometry and total `face_length`; an incomplete
+target match selects no face. Zero tolerance requests exact coverage. Face
+selection does not certify numerical suitability: use the quality and barrier
+coverage reports before assigning hydraulic resistance. These lookup helpers
+build on Erik Toller's [PR #64](https://github.com/rhugman/vorflow/pull/64).
+
+A transfinite quad strip controls the generator arrangement. When a one-row
+strip already aligns the Voronoi faces with a straight barrier, cutting adds
+nothing. A two-row strip puts generators on the line, so cells can cross it.
+Cutting those cells enforces the geometry, but can leave centres on faces,
+nonorthogonal connections or bent shared faces. Sharp bends, curves, ends and
+trimmed strips can also leave crossings; there is no universal safe angle.
+
+Keep authoring features through `add_line()` and `add_polygon()`. For a line,
+choose straddle sites or a quad buffer and make optional repairs explicit:
+
+```python
+cm.add_line(
+    fault_line, "fault", resolution=5.0, is_barrier=True,
+    quad_buffer=False,          # True selects a one-row Gmsh quad buffer.
+    barrier_policy="preserve", # Retain source cells without cutting.
+    barrier_mirrors=False,      # Independent optional reflected generators.
+    simplify_tolerance=0,
+)
+# To clip instead: barrier_policy="cut", barrier_merge="restore".
+# "checked" keeps rejected fragments; "none" disables merging.
+```
+
+Polygon quad bands already use `add_polygon(..., quad_buffer=True)`. For an
+outline that should guide the mesh without becoming a zone or a hydraulic
+barrier, use `add_line(polygon.boundary, ..., quad_buffer=True,
+is_barrier=False)`. Positive `straddle_width` also enables straddle meshing on
+ordinary lines. Hydraulic properties are assigned separately in the model.
+
+`straddle` places pairs across sampled stations. `quad` meshes a buffer with
+Gmsh and uses its nodes as generators. Open strips attempt transfinite rows;
+closed rings use complete annular geometry with recombination. This fixes the
+previous missing sides on closed square strips. Recombination cannot promise
+paired rows around every curve. Inspect `mesh_generator.source_report`: it
+counts actual quads/triangles, transfinite/recombine surfaces, missing footprint
+area and target length outside the generated buffer. Requested input flags alone
+do not establish successful application.
+
+Mirrors add generators and recompute Voronoi cells. Clipping changes polygons.
+Clipping is followed by the selected `barrier_merge` policy: `checked` attempts
+merges and keeps rejected fragments; `restore` attempts the same merges and then
+undoes failed parent cuts; `none` disables merging. Only fragments smaller than
+20% of their original cell are candidates. Inspect
+`tessellator.barrier_merge_diagnostics` for actual final merges, retained
+fragments, restored parent cells and rejection checks.
+`barrier_merge="restore"` starts every retry from the pre-cut partition, undoing all
+dependent fragment absorption when a parent cut is refused. It retains original
+IDs/centres and allows an imperfect barrier instead of leftover fragment cells.
+It checks convexity, all affected faces, retained-parent compactness (at least
+0.4) and retained-parent area (at least 5% of its original area). These are
+conservative geometry checks, not a guarantee of orthogonality or flow accuracy.
+
+```python
+quality = tessellator.quality_report(cell_size=5.0, domain=domain)
+print(quality["summary"])  # Hard geometry failures separate from quality warnings.
+tracking = tessellator.barrier_report(approximate=True)
+```
+
+Exact `tracking["faces"]` remains separate from proposed
+`tracking["approximate_faces"]`. The latter uses **existing full shared faces**
+between inside/outside centres for closed rings, or crossed centre connections
+for open lines. Inspect `usable`, `max_offset` and `approximate_summary` topology
+before choosing this approximation. Open routes can be disconnected; closed
+routes must form the intended single cycle. Centres on the target and ambiguous
+crossings are excluded. No hydraulic resistance is assigned automatically.
+Changing the target to a cell-face approximation is an explicit modelling choice.
+
+For a closed loop, `barrier_report(approximate=True, closed_ties="majority")`
+can assign cells whose centres lie on the target by their inside/outside polygon
+area, using outside for balanced areas. Inspect `approximate_ties`, offsets in
+both directions, and `usable_single_cycle` before choosing these real-face
+connections. The default `closed_ties="exclude"` still leaves these cells
+unassigned. Open-line ties are always excluded; neither option changes the mesh
+or creates an HFB package.
+
+Run `python scripts/validate_barrier_flow.py --engines mf6` after installing
+`.[examples]` and providing the executable through `MF6_EXE` or PATH. Optional
+USG benchmarks also require the separate MFUSG export support.
+It retains fresh model inputs, heads, budgets and measured errors under `.bin/`.
+It compares heads **and total flow** against analytical linear/HFB solutions;
+normal termination and budget balance alone are insufficient.
+
+Closed straddle layouts can retain unmatched corners even after conservative
+repairs. The exact closed-barrier benchmark refuses those configurations rather
+than assigning an incomplete HFB. A quad layout may give complete coverage;
+check the report instead of assuming that a requested source layout guarantees it.
+
+The existing `add_line` API retains historical defaults: all barriers, including
+quad buffers, receive mirror/cut enforcement and legacy fragment merging.
+Missing policy/merge columns in loaded feature frames retain those defaults.
+To preserve a quad layout through the older API, opt in explicitly.
+Domain-boundary clipping remains independent:
+
+```python
+cm.add_line(
+    fault_line, line_id="fault", resolution=5.0,
+    is_barrier=True, quad_buffer=True, quad_buffer_thickness=1,
+    barrier_policy="preserve",  # Explicit opt-in; the compatibility default enforces cuts.
+)
+```
+
+The per-line policies are:
+
+| Policy | Behaviour |
+| --- | --- |
+| `"auto"` (default) | Historical mirror/cut fallback on every barrier, including quad buffers. |
+| `"preserve"` | No cuts or fragment merges; mirrors off unless explicitly enabled; report unresolved crossings. |
+| `"strict"` | Preserve the layout and reject the result if the barrier enters a cell interior. |
+| `"cut"` | Allow barrier mirrors and fallback cuts, including for quad barriers. Merging is controlled separately. |
+
+Cutting and fragment merging are independent. For a line using the cut policy:
+
+```python
+cm.add_line(
+    fault_line, line_id="fault", resolution=5.0, is_barrier=True,
+    barrier_policy="cut", barrier_merge="none",  # Cut, but retain all fragments.
+)
+```
+
+`barrier_merge="legacy"` retains the historical `add_line` default.
+Explicit `barrier_merge="checked"` considers the same small fragments
+(less than 20% of their source cell area), but accepts a merge only when the
+union is convex to coordinate roundoff, retains its numerical centre, and all
+affected shared faces are contiguous and straight with positive centre-to-face
+distances on opposite sides. It also checks contacts with other retained
+fragments. The geometry and centres are not moved to make a proposal pass.
+Refused proposals retain their fragments as separate cells. Inspect
+`tessellator.barrier_merge_diagnostics` for merged/retained counts and reasons
+such as `nonconvex_union`, `bent_face` or `invalid_face_centres`. Reason counts
+refer to candidate checks, which can repeat when neighbouring fragments merge.
+
+`barrier_merge="none"` disables merging; `"legacy"` explicitly restores the old
+longest-shared-boundary rule. Convexity alone is insufficient: a convex merged
+cell can share two bent edges with a concave neighbour. Checked merging does
+not repair defects introduced by the cut itself, certify orthogonality or
+eliminate retained slivers. Final geometry and flow still need validation.
+Merge settings have no effect on a line using `preserve` or `strict`.
+`barrier_mirrors=True/False` overrides policy-dependent mirroring independently
+of cutting, including mirror-only repair with `barrier_policy="preserve"`.
+They control cell-fragment unions; roundoff cleanup of duplicate vertices is
+a separate operation.
+
+`tessellator.barrier_diagnostics` gives final crossing counts and zero-based cell
+positions for each barrier. Preserved crossings produce a warning; they must
+not be interpreted as an enforced hydraulic barrier. To obtain the actual
+paired cells along the line, request the optional, solver-independent report:
+
+```python
+report = tessellator.barrier_report()
+faces = report["faces"]
+print(faces[["line_id", "left_cell", "right_cell",
+             "left_node_id", "right_node_id", "centres_opposite", "length"]])
+print(report["summary"])
+
+# Inspect the barrier sections entering cell interiors or lacking a unique pair.
+crossings = report["crossings"]
+unmatched = report["unmatched"]
+
+# Unique horizontal pairs for later, engine-specific hydraulic assignment.
+import numpy as np
+pairs = np.unique(
+    np.sort(faces[["left_cell", "right_cell"]].to_numpy(dtype=int), axis=1), axis=0,
+)
+```
+
+An **unresolved crossing** is a barrier section inside a cell; the polygon can
+still be valid. Optional `strict` mode stops on that alignment condition and
+does not cut or merge that barrier. Refusing a proposed merge is different:
+the merge is skipped and its fragment retained; that alone does not fail grid
+generation. The report's summary includes the effective policy and merge mode.
+
+Left/right follow the coordinate direction of each **cleaned line part**;
+reversing it swaps sides. Cell IDs are positions in the final grid, matching
+the horizontal DISV and USG-export cell order. Original grid indices and node
+IDs remain available. Hanging vertices yield multiple pairs, corner-only
+contacts yield none, and bent interfaces retain their individual segments.
+One pair can have several segment records; deduplicate pairs when constructing
+a hydraulic package. Keep `line_id` when different barriers need different
+properties, and resolve any overlapping assignments deliberately.
+
+Matching tolerance is in CRS units; it changes the report, not the grid.
+For an existing GeoDataFrame, use
+`vorflow.utils.grid_barrier_report(gdf, cm.clean_lines, tolerance=...)`.
+Inspect unmatched lengths, crossings, `centres_opposite` and orthogonality
+before creating model inputs. This report assigns no resistance, expands no
+layers and writes no HFB package. MF6 and MODFLOW-USG require their own cell/node
+formats and hydraulic parameters; expand horizontal pairs through the model's
+layer mapping when needed.
 
 ### MODFLOW 6 export
 

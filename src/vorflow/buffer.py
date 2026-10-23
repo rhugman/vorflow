@@ -7,13 +7,14 @@ after fragmentation (see ``engine.py``).
 Methodology
 -----------
 *Footprints.* A quad-buffered line becomes one strip polygon per line part:
-the line is simplified (``1.5 * lc``) and segmentized (``lc``) so its two
+the line is simplified (legacy default ``1.5 * lc``, or the feature's explicit
+``simplify_tolerance``; zero disables it) and segmentized (``lc``) so its two
 mitred offsets at ``+/- thickness * lc / 2`` are symmetric and split into
 ~lc-long segments, keeping the transfinite divisions equal on opposite sides.
 The offset lines (not the strip) are clipped to the domain so their endpoints
-stay the true strip corners. A quad-buffered polygon becomes an annular band
-between the +/- offsets of its simplified outline; bands have no 4-corner
-structure, so they are meshed recombine-only.
+stay the true strip corners. Closed lines and quad-buffered polygons become
+annular bands between the +/- offsets of their simplified outlines; bands
+have no end caps or 4-corner structure, so they are meshed recombine-only.
 
 *Crossing priority.* Every footprint is planned before any is trimmed. When
 two cross, the one with the lower priority key stays continuous and only the
@@ -73,8 +74,8 @@ class StripPart:
     """Untrimmed strip for one part of a quad-buffered line."""
 
     strip: Polygon
-    corners: list  # [(x, y)] * 4, ordered for setTransfiniteSurface "Left"
-    side_lines: tuple  # (positive offset, negative offset) LineStrings
+    corners: list  # Four ordered corners for an open strip; [] for an annulus.
+    side_lines: tuple  # Open-strip offsets; () for an annulus with no end caps.
 
 
 @dataclass
@@ -154,14 +155,56 @@ def domain_union_geometry(polygons_gdf):
     return make_valid(unary_union(embedded))
 
 
-def plan_line_strip(line, lc, thickness, domain, feature_name) -> list[StripPart]:
-    """Untrimmed strip polygon(s), one per part of a quad-buffered line."""
+def _buffer_simplification(lc, tolerance):
+    """Resolve the legacy buffer default while honoring explicit zero."""
+    if tolerance is None or pd.isna(tolerance):
+        return 1.5 * lc
+    if isinstance(tolerance, bool):
+        raise ValueError("simplify_tolerance must be a finite non-negative distance or None.")
+    try:
+        value = float(tolerance)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("simplify_tolerance must be a finite non-negative distance or None.")
+    return value
+
+
+def plan_line_strip(line, lc, thickness, domain, feature_name,
+                    simplify_tolerance=None) -> list[StripPart]:
+    """Untrimmed strips for open lines and annular bands for closed lines.
+
+    Closed offsets cannot be joined like an open strip: GEOS can return an
+    open exterior offset at the ring's starting vertex. Build the band from
+    polygon buffers instead, independent of ring winding and starting vertex.
+    Its interior remains part of the original domain, not a material zone.
+    Explicit ``simplify_tolerance=0`` preserves all source turns; ``None``
+    retains the legacy buffer simplification of ``1.5 * lc``.
+    """
     offset = thickness * lc / 2.0
+    simplify = _buffer_simplification(lc, simplify_tolerance)
     plans = []
     for part in line_parts(line):
         if part.length <= 0:
             continue
-        work = part.simplify(lc * 1.5)
+        if part.is_closed:
+            polygon = Polygon(part.coords)
+            if not polygon.is_valid or polygon.area <= 0:
+                warnings.warn(
+                    f"Skipping structured buffer for closed line feature {feature_name}: "
+                    "the line must form a simple polygon ring."
+                )
+                continue
+            band = plan_polygon_band(
+                polygon, lc, thickness, feature_name, simplify_tolerance=simplify
+            )
+            if band is not None and not band.is_empty:
+                # An annulus has two closed boundary loops, not two offset
+                # sides joined by caps. Do not invent four corners for the
+                # engine's open-strip transfinite interpolation.
+                plans.append(StripPart(strip=band, corners=[], side_lines=()))
+            continue
+        work = part.simplify(simplify) if simplify else part
         work = work.segmentize(lc)
         pos = coerce_offset_line(
             work.offset_curve(offset, quad_segs=1, join_style=2, mitre_limit=5.0)
@@ -202,7 +245,7 @@ def plan_line_strip(line, lc, thickness, domain, feature_name) -> list[StripPart
     return plans
 
 
-def plan_polygon_band(geom, lc, thickness, feature_name):
+def plan_polygon_band(geom, lc, thickness, feature_name, simplify_tolerance=None):
     """Untrimmed annular band around a quad-buffered polygon's outline, or None.
 
     gmshflow parity (create_surfacegrid_from_buffer_poly): the zone interior
@@ -211,8 +254,10 @@ def plan_polygon_band(geom, lc, thickness, feature_name):
     trace the shape); thickness=2 puts a node row on it.
     """
     offset = thickness * lc / 2.0
-    # The band leaves little room to mesh, so simplify first.
-    work = make_valid(geom.simplify(lc * 1.5))
+    # Retain the legacy simplification unless explicitly disabled, including
+    # for closed lines routed through this shared annular planner.
+    simplify = _buffer_simplification(lc, simplify_tolerance)
+    work = make_valid(geom.simplify(simplify) if simplify else geom)
     inner = make_valid(work.buffer(-offset, quad_segs=1, join_style=2, mitre_limit=5.0))
     outer = make_valid(work.buffer(offset, quad_segs=1, join_style=2, mitre_limit=5.0))
     inner_parts = [
@@ -244,7 +289,10 @@ def plan_quad_buffers(polygons_gdf, lines_gdf, background_lc, domain) -> dict:
             continue
         lc = feature_lc(row, background_lc)
         thickness = quad_buffer_thickness(row)
-        parts = plan_line_strip(row.geometry, lc, thickness, domain, row.name)
+        parts = plan_line_strip(
+            row.geometry, lc, thickness, domain, row.name,
+            simplify_tolerance=row.get('simplify_tolerance'),
+        )
         if not parts:
             continue
         plans[('line', int(idx))] = BufferPlan(
@@ -262,7 +310,10 @@ def plan_quad_buffers(polygons_gdf, lines_gdf, background_lc, domain) -> dict:
                 continue
             lc = feature_lc(row, background_lc)
             thickness = quad_buffer_thickness(row)
-            band = plan_polygon_band(row.geometry, lc, thickness, row.name)
+            band = plan_polygon_band(
+                row.geometry, lc, thickness, row.name,
+                simplify_tolerance=row.get('simplify_tolerance'),
+            )
             if band is None or band.is_empty:
                 continue
             plans[('poly', int(idx))] = BufferPlan(

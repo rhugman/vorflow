@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 import warnings
+from numbers import Real
 
 import numpy as np
 import geopandas as gpd
 import pandas as pd
 import shapely
-from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon
+from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon, Point
+from .blueprint import DEFAULT_CONNECTIVITY_TOLERANCE
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,7 @@ CONNECTIVITY_COLUMNS = [
     "skewness",
     "connector",
     "shared_edge",
+    "full_shared_edge",
 ]
 
 
@@ -94,13 +97,37 @@ def _neighbour_pairs(geoms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return left[keep], right[keep]
 
 
-def _shared_edges(geoms: np.ndarray, left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    """Longest shared line of each (left, right) pair; None where they share no line."""
+def _linear_geometry(geom):
+    """Retain every linear component, excluding any isolated point contacts."""
+    if isinstance(geom, (LineString, MultiLineString)):
+        return geom if geom.length > 0 else None
+    lines = []
+    for part in getattr(geom, "geoms", ()):
+        linear = _linear_geometry(part)
+        if isinstance(linear, LineString):
+            lines.append(linear)
+        elif isinstance(linear, MultiLineString):
+            lines.extend(linear.geoms)
+    if not lines:
+        return None
+    return lines[0] if len(lines) == 1 else MultiLineString(lines)
+
+
+def _shared_edges(
+    geoms: np.ndarray, left: np.ndarray, right: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return representative and complete linear interfaces for each pair."""
     edges = shapely.intersection(geoms[left], geoms[right])
+    full_edges = edges.copy()
+    is_linear = np.isin(
+        shapely.get_type_id(full_edges),
+        [shapely.GeometryType.LINESTRING, shapely.GeometryType.MULTILINESTRING],
+    )
+    full_edges[~is_linear] = [_linear_geometry(geom) for geom in full_edges[~is_linear]]
     is_line = shapely.get_type_id(edges) == shapely.GeometryType.LINESTRING
     edges[~is_line] = [_longest_line(geom) for geom in edges[~is_line]]
     edges[is_line & (shapely.length(edges) <= 0)] = None
-    return edges
+    return edges, full_edges
 
 
 def _cell_centers(gdf: gpd.GeoDataFrame, center: str) -> np.ndarray:
@@ -140,6 +167,10 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
     ``gdf`` and are therefore unique even when the GeoDataFrame index is not. ``orig_index_1``
     and ``orig_index_2`` preserve the input index for traceability. The active
     geometry is ``shared_edge``; ``connector`` stores the center-to-center line.
+    ``shared_edge`` and its metrics retain the representative longest line for
+    multipart interfaces. ``full_shared_edge`` additionally preserves every
+    shared line segment, including bent or disconnected interfaces, for feature
+    lookup. It does not change how the representative quality metrics are computed.
     """
     if center not in {"generator", "centroid"}:
         raise ValueError("center must be either 'generator' or 'centroid'.")
@@ -159,7 +190,7 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
 
     geoms = gdf.geometry.to_numpy()
     left, right = _neighbour_pairs(geoms)
-    edges = _shared_edges(geoms, left, right)
+    edges, full_edges = _shared_edges(geoms, left, right)
     start, end = _end_points(edges)
 
     centers = _cell_centers(gdf, center)
@@ -204,6 +235,7 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
         "skewness": _face_skewness(xy1, xy2, start, end),
         "connector": shapely.linestrings(np.stack([xy1, xy2], axis=1)),
         "shared_edge": edges,
+        "full_shared_edge": full_edges[valid],
     }
     if "node_id" in gdf.columns:
         node_id = gdf["node_id"].infer_objects().to_numpy()
@@ -831,3 +863,161 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
         pos = edge_pos[e] + 1
         ring[pos:pos] = inserted
     return out
+
+
+def cells_on(gdf: gpd.GeoDataFrame, geometry) -> gpd.GeoDataFrame:
+    """Return cells intersecting a point or line with area and line-length metrics.
+
+    ``cell_area`` is each full cell's area. For line inputs, ``length`` is the
+    portion of the input line inside each cell; for point inputs it is zero.
+    ``cell_id`` is the zero-based row position in ``gdf``, independent of its
+    index labels. Original indices and other columns are retained. The result
+    is a GeoDataFrame for zero, one, or multiple matches; a point on a shared
+    boundary selects every touching cell.
+    """
+    if not isinstance(geometry, (Point, LineString, MultiLineString)):
+        raise TypeError("geometry must be a Point, LineString, or MultiLineString.")
+
+    positions = np.flatnonzero(gdf.geometry.intersects(geometry).to_numpy())
+    cells = gdf.iloc[positions].copy()
+    cells["cell_area"] = cells.geometry.area
+    if isinstance(geometry, (LineString, MultiLineString)):
+        cells["length"] = cells.geometry.intersection(geometry).length
+    else:
+        cells["length"] = 0.0
+    cells["cell_id"] = positions
+    return cells
+
+
+def faces_on(connectivity, line, tolerance=None) -> gpd.GeoDataFrame:
+    """Return complete shared faces covered by a line or its tolerance buffer.
+
+    Pass the result of :func:`build_connectivity` as ``connectivity``. Every
+    segment in ``full_shared_edge`` must be covered by ``line`` (when tolerance
+    is zero) or its buffer. ``None`` uses ``DEFAULT_CONNECTIVITY_TOLERANCE``;
+    explicit tolerances must be finite, non-negative real numbers.
+
+    The result retains the original indices and columns, with the complete
+    interface as its active ``shared_edge`` geometry and its full length in
+    ``face_length``. Hand-built legacy reports without ``full_shared_edge``
+    fall back to their supplied ``shared_edge`` geometry; missing segments
+    cannot be recovered from such reports. Representative quality metrics
+    remain unchanged and do not certify the complete interface's quality.
+    """
+    if tolerance is None:
+        tolerance = DEFAULT_CONNECTIVITY_TOLERANCE
+    if (
+        isinstance(tolerance, (bool, np.bool_))
+        or not isinstance(tolerance, Real)
+        or not np.isfinite(tolerance)
+        or tolerance < 0
+    ):
+        raise ValueError("tolerance must be non-negative and finite, and not boolean.")
+    if not isinstance(line, (LineString, MultiLineString)):
+        raise TypeError("line must be a LineString or MultiLineString.")
+
+    required = {"cell_id_1", "cell_id_2", "shared_edge"}
+    missing = required.difference(connectivity.columns)
+    if missing:
+        raise ValueError(
+            f"faces_on requires a connectivity GeoDataFrame with columns: {sorted(required)}; "
+            f"missing {sorted(missing)}."
+        )
+
+    full_edges = connectivity[
+        "full_shared_edge" if "full_shared_edge" in connectivity.columns else "shared_edge"
+    ].to_numpy()
+    target = line if tolerance == 0 else line.buffer(tolerance)
+    selected = np.flatnonzero(shapely.covered_by(full_edges, target))
+    faces = connectivity.iloc[selected].copy()
+    faces["shared_edge"] = full_edges[selected]
+    faces = faces.set_geometry("shared_edge")
+    faces["face_length"] = shapely.length(full_edges[selected])
+    return faces
+
+
+def grid_barrier_report(gdf: gpd.GeoDataFrame, barriers: gpd.GeoDataFrame, *, tolerance=None,
+                        approximate=False, closed_ties='exclude') -> dict:
+    """Track cell pairs along directed barrier lines without constructing a model.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Final Polygon cells with finite ``x``/``y`` numerical centres. Row
+        positions define zero-based horizontal model cell IDs; the index and
+        optional ``node_id`` are retained for traceability.
+    barriers : geopandas.GeoDataFrame
+        Lines with ``is_barrier=True``, typically ``cm.clean_lines``. Other
+        lines are ignored. ``line_id`` identifies the source feature. Left
+        and right follow each cleaned LineString part's coordinate direction.
+        Reversing that direction exchanges left/right. CRS must match ``gdf``.
+    tolerance : float, optional
+        Non-negative matching distance in CRS units. Defaults to the greater
+        of 1e-9 times the coordinate extent (at least one unit) and 32 machine
+        epsilons times the absolute coordinate scale. Geometry is not modified.
+    approximate : bool, default False
+        Also propose existing shared faces separating inside/outside numerical
+        centres for closed rings, or crossed once by centre connectors for open
+        lines. Adds ``approximate_faces`` and ``approximate_summary``. These
+        full-face approximations can depart from the target and be disconnected;
+        inspect ``max_offset``, ``usable``, ``components`` and ``single_cycle``.
+        ``max_offset`` samples each full face at intervals at most its length/128;
+        ``offset_upper_bound`` adds half that spacing as a conservative bound.
+        ``usable`` checks the local connection; require the whole grid's quality
+        report separately before constructing a hydraulic package.
+        Centres on the target and ambiguous intersections are excluded by default.
+    closed_ties : {'exclude', 'majority'}, default 'exclude'
+        With approximation enabled, optionally assign a closed-ring cell whose
+        centre lies on the target to the side containing most of its polygon
+        area. Balanced areas (within tolerance times cell perimeter) are assigned
+        outside. This creates a whole-cell partition approximation, not an exact
+        feature match. Adds ``approximate_ties`` with each assignment, area
+        fraction and reason. Open-line centre ties remain excluded. Inspect
+        route topology and offsets; this option cannot repair invalid cells.
+
+    Returns
+    -------
+    dict
+        ``faces``: one row per matched barrier-segment interval, with directed
+        geometry, ``line_id``, ``part_id``, ``segment_id``, ``left_cell`` and
+        ``right_cell`` positions, original indices, node IDs, ``length`` and
+        ``centres_opposite``. ``barrier_index`` is the barrier's zero-based
+        input row position, even when its index labels repeat.
+        One cell pair can occur more than once; retain
+        segment rows for geometry, but deduplicate pairs for hydraulic input.
+        ``crossings``: positive-length barrier sections inside cell interiors,
+        including internal ends. ``unmatched``: sections without a unique
+        cell on each side (including domain edges and ambiguous contacts).
+        ``summary``: per-line matched/unmatched lengths and crossing counts.
+        These four tables are GeoDataFrames; ``tolerance`` records the distance
+        used. Corner-only contacts never become pairs. No FloPy, layer/node
+        expansion, hydraulic properties or package assignment is performed.
+
+    Notes
+    -----
+    A matched face locates geometry; it does not certify orthogonality, a
+    supported MODFLOW face, or hydraulic accuracy. Inspect crossings and
+    unmatched coverage before using pairs. ``centres_opposite=False`` flags
+    centres on the face or on its wrong side, including some cut cells.
+    """
+    from ._barriers import grid_barrier_report as report
+
+    return report(gdf, barriers, tolerance=tolerance, approximate=approximate,
+                  closed_ties=closed_ties)
+
+
+def grid_quality_report(gdf: gpd.GeoDataFrame, *, cell_size=None, domain=None, tolerance=None) -> dict:
+    """Inspect cells and complete shared faces without solver dependencies.
+
+    Returns ``cells`` and ``faces`` GeoDataFrames plus a ``summary`` separating
+    hard geometry failures from quality warnings. Numerical centres are the
+    ``x``/``y`` columns. ``cell_size`` (CRS units) enables a small-area warning
+    below 0.05 times its square; compactness below 0.4 and face nonorthogonality
+    above one degree are warnings, not universal flow-error thresholds. An
+    optional polygon ``domain`` enables coverage checks. No geometry is changed.
+    A geometrically usable grid still needs head and flow validation for the
+    intended model; a small water-budget discrepancy alone cannot establish it.
+    """
+    from ._quality import grid_quality_report as report
+
+    return report(gdf, cell_size=cell_size, domain=domain, tolerance=tolerance)

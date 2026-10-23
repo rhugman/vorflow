@@ -139,10 +139,10 @@ def test_enforce_barriers_keeps_id_on_piece_holding_the_generator():
     assert result[result["node_id"] == 3].iloc[0].geometry.area == pytest.approx(0.75)
 
 
-def test_enforce_barriers_merges_small_fragment_into_cell_on_its_side():
-    """Catches a curved barrier's bulge across a face becoming a sliver cell of its own."""
+def test_enforce_barriers_legacy_merge_retains_historical_small_fragment_rule():
+    """Legacy mode reproduces the old union, even with a bent shared face."""
     line = LineString([(1, 0), (0.9, 0.5), (1, 1)])
-    tessellator = _barrier_tessellator(line, densify=False)
+    tessellator = _barrier_tessellator(line, densify=False, barrier_merge='legacy')
 
     result = tessellator._enforce_barriers(_two_cell_grid())
 

@@ -69,6 +69,7 @@ def test_build_connectivity_reports_generator_based_pair_metrics(paired_polygons
     assert {row["node_id_1"], row["node_id_2"]} == {10, 20}
     assert row["center_mode"] == "generator"
     assert row["shared_edge"].length == pytest.approx(1.0)
+    assert row["full_shared_edge"].equals(row["shared_edge"])
     assert row["connector"].length == pytest.approx(1.0)
     assert row["angle"] == pytest.approx(90.0, abs=1e-6)
     assert row["ortho_error"] == pytest.approx(0.0, abs=1e-6)
@@ -165,7 +166,9 @@ def test_build_connectivity_skips_point_only_touching_cells():
         }
     )
 
-    assert build_connectivity(gdf).empty
+    connectivity = build_connectivity(gdf)
+    assert connectivity.empty
+    assert "full_shared_edge" in connectivity.columns
 
 
 def test_build_connectivity_uses_longest_multilinestring_shared_boundary():
@@ -183,6 +186,42 @@ def test_build_connectivity_uses_longest_multilinestring_shared_boundary():
 
     assert len(connectivity) == 1
     assert connectivity.iloc[0]["shared_edge"].length == pytest.approx(2.0)
+    assert connectivity.iloc[0]["full_shared_edge"].equals(left.intersection(right))
+    assert connectivity.iloc[0]["full_shared_edge"].length == pytest.approx(3.0)
+
+
+def test_build_connectivity_preserves_bent_face_without_changing_representative_metrics():
+    left = Polygon([(0, 0), (2, 0), (2, 1), (1, 1), (1, 3), (0, 3)])
+    right = box(1, 1, 3, 3)
+    grid = gpd.GeoDataFrame(
+        {"x": [0.5, 2.0], "y": [2.0, 2.0], "geometry": [left, right]}
+    )
+
+    connectivity = build_connectivity(grid)
+
+    row = connectivity.iloc[0]
+    assert row["full_shared_edge"].equals(left.intersection(right))
+    assert row["full_shared_edge"].length == pytest.approx(3.0)
+    assert row["shared_edge"].length == pytest.approx(2.0)
+    assert row["angle"] == pytest.approx(90.0)
+    assert row["ortho_error"] == pytest.approx(0.0)
+    assert row["skewness"] == pytest.approx(0.0)
+
+
+def test_build_connectivity_full_face_excludes_isolated_point_contact():
+    left = MultiPolygon([box(0, 0, 1, 1), box(0, 2, 1, 3)])
+    right = MultiPolygon([box(1, 0, 2, 1), box(1, 3, 2, 4)])
+    grid = gpd.GeoDataFrame(
+        {"x": [0.5, 1.5], "y": [0.5, 0.5], "geometry": [left, right]}
+    )
+
+    connectivity = build_connectivity(grid)
+
+    assert left.intersection(right).geom_type == "GeometryCollection"
+    assert len(connectivity) == 1
+    row = connectivity.iloc[0]
+    assert row["full_shared_edge"].equals(LineString([(1, 0), (1, 1)]))
+    assert row["full_shared_edge"].equals(row["shared_edge"])
 
 
 def test_build_connectivity_skewness_uses_face_line_when_connector_misses_face():

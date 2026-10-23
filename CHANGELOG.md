@@ -9,11 +9,54 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Solver-independent `cells_on()` and `faces_on()` lookups, adapted from Erik
+  Toller's PR #64 with consistent row-position IDs, exact zero-tolerance
+  matching and complete shared-face geometry. Connectivity adds
+  `full_shared_edge` while retaining representative-edge metrics.
+- Explicit optional mirror/clip controls on the existing `add_line()` API,
+  conservative parent-cut restoration, actual
+  Gmsh source-buffer diagnostics, and solver-independent cell/shared-face quality
+  reports. Optional tracking proposes existing faces for imperfect barriers,
+  keeping them distinct from exact target matches.
+- Optional closed-loop tie handling by whole-cell area, with explicit assignment
+  records, usable-route topology and offsets in both directions. Conservative
+  exclusion remains the API default; the report compares both choices.
+- Reproducible analytical head and flow benchmarks using actual MF6 runs,
+  including a resistive MF6 HFB case and retained numerical evidence.
+- Per-line `barrier_policy` with `auto`, `preserve`, `strict` and `cut`
+  modes, plus final unresolved-crossing diagnostics.
+- Independent per-line `barrier_merge="none"`, `"checked"`, `"restore"` or
+  `"legacy"`, with merge diagnostics. Checked merges require a convex union,
+  unchanged usable centre and contiguous straight affected faces with positive
+  opposite-side centre distances, including faces against retained fragments.
+  Refused proposals retain the fragment; they do not fail grid generation.
+- Optional `VoronoiTessellator.barrier_report()` and
+  `vorflow.utils.grid_barrier_report()` track directed left/right cell pairs,
+  node IDs, full segment geometry, unmatched lengths and crossing cells.
+  These geometry reports require no FloPy and assign no hydraulic resistance.
 - The release workflow creates the GitHub Release for each final tag once it
   is on PyPI, with notes from the tag's changelog section and the wheel and
   sdist attached (`scripts/release_notes.py`). A tag without a changelog
   section now fails the build before anything is uploaded.
+### Changed
 
+- Closed-line quad buffers use complete annular footprints instead of joining
+  incomplete offset curves with fictitious end caps; annuli use recombination.
+- Existing `add_line` calls and feature rows without policy columns retain
+  historical mirrors, cuts and legacy fragment merging for every barrier.
+  Source preservation and conservative restoration are explicit opt-ins through
+  `barrier_policy` and `barrier_merge`; geometry authoring remains on
+  `add_line()` and `add_polygon()`.
+- Checked merging is optional and refuses problematic unions; the legacy
+  rule remains the compatibility default for `add_line`.
+  Strict-policy crossing errors distinguish barrier alignment from polygon
+  validity and do not imply that a cut or merge was attempted.
+
+### Fixed
+
+- Optional approximate barrier tracking retains proper generator connections
+  crossing exactly at a polyline bend, while excluding tangent touches and
+  ambiguous intersections. Mesh generation and legacy defaults are unchanged.
 ## [0.3.0] - 2026-10-15
 
 MODFLOW 6 DISV export (`to_disv()`, `to_modflowgwfdisv()`), `plot()` methods

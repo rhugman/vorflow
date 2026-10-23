@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from collections import Counter
 import numpy as np
 import geopandas as gpd
 import pandas as pd
@@ -14,9 +15,11 @@ from shapely.ops import unary_union, split
 from shapely.validation import make_valid
 
 from . import _lloyd
+from ._barriers import barrier_merge, barrier_mirrors, barrier_policy, barrier_rows, crossing_records, tracking_tolerance
 from ._features import polygon_parts
+from ._geometry import straight_face
 from ._plot import get_ax
-from .utils import grid_to_disv
+from .utils import grid_barrier_report, grid_to_disv
 
 logger = logging.getLogger(__name__)
 
@@ -307,7 +310,7 @@ def _primary_piece_position(pieces, generator):
     return max(candidates, key=lambda i: pieces[i].area)
 
 
-def _fragment_merge(piece, geometries, tree, barriers):
+def _fragment_merge(piece, geometries, tree, barriers, accept=None):
     """Return (position, merged geometry) of the cell ``piece`` joins, or None if no cell qualifies.
 
     The cell must share a boundary with the piece, the union must be one
@@ -336,6 +339,8 @@ def _fragment_merge(piece, geometries, tree, barriers):
             continue
         if any(_straddled_pieces(merged, line) for line in barriers if merged.intersects(line)):
             continue
+        if accept is not None and not accept(int(position), merged):
+            continue
         best, best_shared = (position, merged), shared
     return best
 
@@ -353,7 +358,43 @@ def _clip_to_domain(gdf, domain_geom):
     return clipped
 
 
-def _merge_barrier_fragments(geometries, fragments, barriers):
+def _checked_fragment_union(position, merged, geometries, centres, tree, other_fragments):
+    """Return a rejection reason, or None; do not modify any geometry or centre."""
+    xy = shapely.get_coordinates(merged)
+    tolerance = 32 * np.finfo(float).eps * max(1.0, float(np.abs(xy).max()))
+    # A concave vertex lies inside the convex hull, away from its perimeter.
+    departure = shapely.distance(shapely.points(xy), merged.convex_hull.boundary)
+    if departure.max() > tolerance:
+        return 'nonconvex_union'
+    centre = centres[position]
+    if not np.isfinite(centre).all() or not shapely.dwithin(merged, Point(centre), tolerance):
+        return 'centre_outside_union'
+    neighbours = [(geometries[i], centres[i])
+                  for i in tree.query(merged.buffer(2 * tolerance), predicate='intersects')
+                  if i != position]
+    # Retained fragments become cells too. Omitting them here can approve a
+    # merge that looks good against primary cells but has a bad fragment face.
+    neighbours.extend((piece, np.array([piece.centroid.x, piece.centroid.y]))
+                      for piece, _, _ in other_fragments)
+    for other, other_centre in neighbours:
+        if merged.intersection(other).area > tolerance * (merged.length + other.length):
+            return 'overlap'
+        shared = shapely.intersection(merged.boundary, other.boundary, grid_size=tolerance)
+        try:
+            face = straight_face(shared, np.asarray([centre, other_centre]), (position, -1), tolerance)
+        except ValueError as error:
+            if str(error).startswith('Noncollinear'):
+                return 'bent_face'
+            if str(error).startswith('Disconnected'):
+                return 'disconnected_face'
+            return 'invalid_face_centres'
+        if face is not None and min(face['distance_1'], face['distance_2']) <= tolerance:
+            return 'centre_on_face'
+    return None
+
+
+def _merge_barrier_fragments(geometries, fragments, barriers, *, mode='legacy', centres=None,
+                             rejected=None):
     """Merge small barrier-split fragments into neighbouring cells; return the fragments left over.
 
     ``geometries`` (the grid's cell geometries, an object array) is updated
@@ -362,6 +403,14 @@ def _merge_barrier_fragments(geometries, fragments, barriers):
     BARRIER_FRAGMENT_MERGE_FRACTION of the cell it was cut from. Fragments
     that only touch other fragments are retried once those have merged.
     """
+    if mode == 'none':
+        return list(fragments)
+    if mode not in {'checked', 'legacy'}:
+        raise ValueError("barrier_merge must be 'none', 'checked' or 'legacy'.")
+    if mode == 'checked' and centres is None:
+        raise ValueError('Checked barrier merging requires the numerical cell centres.')
+    rejected = rejected if rejected is not None else Counter()
+    active = {id(f): f for f in fragments}
     pending = [f for f in fragments if f[0].area < BARRIER_FRAGMENT_MERGE_FRACTION * f[1]]
     leftover = [f for f in fragments if f[0].area >= BARRIER_FRAGMENT_MERGE_FRACTION * f[1]]
     while pending:
@@ -369,16 +418,93 @@ def _merge_barrier_fragments(geometries, fragments, barriers):
         tree = shapely.STRtree(geometries.copy())
         unmerged = []
         for fragment in pending:
-            merge = _fragment_merge(fragment[0], geometries, tree, barriers)
+            def accept(position, merged):
+                try:
+                    reason = _checked_fragment_union(
+                        position, merged, geometries, centres, tree,
+                        [f for key, f in active.items() if key != id(fragment)],
+                    )
+                except shapely.errors.GEOSException:
+                    reason = 'geometry_check_failed'
+                if reason is not None:
+                    rejected[reason] += 1
+                return reason is None
+
+            merge = _fragment_merge(fragment[0], geometries, tree, barriers,
+                                    accept=accept if mode == 'checked' else None)
             if merge is None:
                 unmerged.append(fragment)
             else:
                 geometries[merge[0]] = merge[1]
+                active.pop(id(fragment))
         if len(unmerged) == len(pending):
             break
         pending = unmerged
     kept = {id(f) for f in leftover + pending}
     return [f for f in fragments if id(f) in kept]
+
+
+def _restore_barrier_cuts(before, line, barriers):
+    """Commit only complete, checked parent cuts; undo dependent merges on retry.
+
+    Each trial starts from the pre-cut partition. The restored-parent set only
+    grows, so at most n_cut_parents + 1 trials are needed. Row order, IDs and
+    numerical centres remain unchanged, including for restored parents.
+    """
+    before = before.reset_index(drop=True)
+    plans = {}
+    rejected = Counter()
+    for position in before.sindex.query(line, predicate='intersects'):
+        cell = before.iloc[position]
+        pieces = _straddled_pieces(cell.geometry, line)
+        if pieces:
+            primary = _primary_piece_position(pieces, Point(cell.x, cell.y))
+            plans[int(position)] = (pieces[primary],
+                                    [p for i, p in enumerate(pieces) if i != primary])
+    restored = set()
+    for _ in range(len(plans) + 1):
+        trial = before.copy(deep=True)
+        fragments = []
+        for parent, (primary, others) in plans.items():
+            if parent in restored:
+                continue
+            trial.at[parent, trial.geometry.name] = primary
+            source = before.iloc[parent].copy()
+            source['_barrier_parent'] = parent
+            fragments.extend((p, source.geometry.area, source) for p in others)
+        geometries = trial.geometry.to_numpy().copy()
+        centres = trial[['x', 'y']].to_numpy(float)
+        leftover = _merge_barrier_fragments(geometries, fragments, barriers,
+                                           mode='checked', centres=centres, rejected=rejected)
+        newly = {int(f[2]['_barrier_parent']) for f in leftover}
+        tree = shapely.STRtree(geometries.copy())
+        # Check retained cut parents as well as candidate receiving cells. A
+        # convex receiving union alone cannot validate its opposite neighbour.
+        for parent in plans.keys() - restored - newly:
+            polygon = geometries[parent]
+            try:
+                reason = _checked_fragment_union(parent, polygon, geometries,
+                                                  centres, tree, leftover)
+                if polygon.area < .05 * before.geometry.iloc[parent].area:
+                    reason = 'small_retained_parent'
+                if 4 * np.pi * polygon.area / polygon.length**2 < .4:
+                    reason = 'poor_retained_parent_compactness'
+            except (ValueError, shapely.errors.GEOSException):
+                reason = 'geometry_check_failed'
+            if reason:
+                newly.add(parent)
+                rejected[reason] += 1
+        added = newly - restored
+        if not added:
+            trial[trial.geometry.name] = gpd.GeoSeries(geometries, index=trial.index, crs=trial.crs)
+            return trial, dict(
+                fragments=sum(len(others) for _, others in plans.values()),
+                merged=len(fragments), retained=0, restored=len(restored),
+                restored_node_ids=[before.node_id.iloc[p] for p in sorted(restored)],
+                rejected_candidates=dict(rejected),
+            )
+        restored.update(added)
+    raise RuntimeError('Barrier cut restoration did not converge.')
 
 
 def _join_unmatched_to_nearest_zone(joined, pts_gdf, zones):
@@ -628,6 +754,8 @@ class VoronoiTessellator:
         self.voronoi_gdf = None
         self.final_grid = None
         self.n_barrier_mirrors = 0
+        self.barrier_diagnostics = None
+        self.barrier_merge_diagnostics = None
         self.nodes = mesh_generator.nodes
         self.node_tags = mesh_generator.node_tags
         # Lloyd inputs, captured with the nodes so they stay paired with them;
@@ -918,12 +1046,9 @@ class VoronoiTessellator:
         return gdf
 
     def _barrier_lines(self):
-        """Return the geometries of the clean lines marked is_barrier=True."""
-        lines = self.cm.clean_lines
-        if lines is None or lines.empty or 'is_barrier' not in lines.columns:
-            return []
-        mask = lines['is_barrier'].fillna(False).astype(bool)
-        return [geom for geom in lines.loc[mask].geometry if geom is not None and not geom.is_empty]
+        """Barriers with reflected-generator repair enabled."""
+        return [row.geometry for _, row in barrier_rows(self.cm.clean_lines)
+                if barrier_mirrors(row) and row.geometry is not None and not row.geometry.is_empty]
 
     def _barrier_mirror_points(self, raw_gdf, generators, domain_geom):
         """
@@ -1029,8 +1154,11 @@ class VoronoiTessellator:
         """
         Splits Voronoi cells that are still straddled by barrier lines.
 
-        Every line marked `is_barrier=True` is checked, whatever its meshing
-        method. Barrier mirror generators (_barrier_mirror_points) already
+        Only barriers with an effective ``barrier_policy="cut"`` are split.
+        The legacy add_line default cuts all barriers, including quad buffers.
+        Explicit ``barrier_policy="preserve"`` keeps the source layout.
+        Barrier mirror
+        generators (_barrier_mirror_points) already
         stop most cells at the line; what is left here is mainly nodes that
         lie on the line itself (quad_buffer_thickness=2 puts a node row on
         it), cells the mirror passes did not finish, and the bulges of a
@@ -1042,10 +1170,13 @@ class VoronoiTessellator:
         zero-length edges.
 
         The piece covering the generator point (else the largest piece)
-        keeps the original node_id and x/y. A piece smaller than
-        BARRIER_FRAGMENT_MERGE_FRACTION of the cell joins the neighbouring
-        cell on its side of the barrier (_merge_barrier_fragments), so the
-        barrier face follows the line instead of leaving a sliver cell. The
+        keeps the original node_id and x/y. Fragment merging is independent:
+        ``barrier_merge="none"`` retains all pieces; ``"checked"``
+        requires a convex union and valid straight affected faces with
+        positive opposite-side centre distances; ``"legacy"`` uses the old
+        longest-boundary rule. Only fragments smaller than
+        BARRIER_FRAGMENT_MERGE_FRACTION of their source cell are candidates.
+        Rejected merge proposals retain their fragments. The
         other pieces get new, unique IDs above the current maximum. These
         fragments have no generator of their own, so their x/y are set to
         the fragment centroid and do not denote a mesh node; their
@@ -1057,13 +1188,16 @@ class VoronoiTessellator:
         Returns:
             gpd.GeoDataFrame: An updated grid with cells split along barrier lines.
         """
+        merge_columns = ['barrier_index', 'line_id', 'mode', 'fragments', 'merged',
+                         'retained', 'restored', 'restored_node_ids', 'rejected_candidates']
+        self.barrier_merge_diagnostics = pd.DataFrame(columns=merge_columns)
         if self.cm.clean_lines.empty:
             return grid_gdf
 
         # fillna keeps the old `== True` semantics: rows with a missing
         # is_barrier value are treated as non-barriers, not as errors.
-        mask_barrier = self.cm.clean_lines['is_barrier'].fillna(False).astype(bool)
-        barriers_to_cut = self.cm.clean_lines[mask_barrier]
+        indices = [i for i, row in barrier_rows(self.cm.clean_lines) if barrier_policy(row) == 'cut']
+        barriers_to_cut = self.cm.clean_lines.iloc[indices]
 
         if barriers_to_cut.empty:
             return grid_gdf
@@ -1071,16 +1205,30 @@ class VoronoiTessellator:
         logger.info(f"Enforcing Barrier Cuts on {len(barriers_to_cut)} lines...")
 
         current_grid = grid_gdf
-        barrier_lines = list(barriers_to_cut.geometry)
+        # A cut fragment must never be merged across a preserved barrier.
+        barrier_lines = [row.geometry for _, row in barrier_rows(self.cm.clean_lines)]
 
         # Keep the caller's integer dtype while assigning fragment IDs with
         # Python integers, avoiding NumPy scalar arithmetic during increments.
         node_id_dtype = grid_gdf['node_id'].dtype
         max_id = int(grid_gdf['node_id'].max())
         n_merged = 0
+        merge_stats = []
 
-        for idx, row in barriers_to_cut.iterrows():
+        for idx in indices:
+            row = self.cm.clean_lines.iloc[idx]
             line = row.geometry
+            mode = barrier_merge(row)
+            stats = dict(barrier_index=idx, line_id=row.get('line_id', idx), mode=mode,
+                         fragments=0, merged=0, retained=0, restored=0,
+                         restored_node_ids=[], rejected_candidates={})
+            merge_stats.append(stats)
+
+            if mode == 'restore':
+                current_grid, restored_stats = _restore_barrier_cuts(current_grid, line, barrier_lines)
+                stats.update(restored_stats)
+                n_merged += stats['merged']
+                continue
 
             # Use a spatial index to quickly find cells that might intersect the line.
             possible_matches_index = list(current_grid.sindex.query(line, predicate='intersects'))
@@ -1129,7 +1277,13 @@ class VoronoiTessellator:
                 ignore_index=True,
             )
             geometries = current_grid.geometry.to_numpy().copy()
-            leftover = _merge_barrier_fragments(geometries, fragments, barrier_lines)
+            rejected = Counter()
+            leftover = _merge_barrier_fragments(
+                geometries, fragments, barrier_lines, mode=mode,
+                centres=current_grid[['x', 'y']].to_numpy(dtype=float), rejected=rejected,
+            )
+            stats.update(fragments=len(fragments), merged=len(fragments) - len(leftover),
+                         retained=len(leftover), rejected_candidates=dict(rejected))
             n_merged += len(fragments) - len(leftover)
             current_grid[current_grid.geometry.name] = gpd.GeoSeries(
                 geometries, index=current_grid.index, crs=current_grid.crs
@@ -1152,6 +1306,7 @@ class VoronoiTessellator:
         if n_merged:
             logger.info(f"  -> Merged {n_merged} barrier fragments into the neighbouring cell on their side")
         current_grid['node_id'] = current_grid['node_id'].astype(node_id_dtype)
+        self.barrier_merge_diagnostics = pd.DataFrame(merge_stats, columns=merge_columns)
         return current_grid
 
     @property
@@ -1160,6 +1315,55 @@ class VoronoiTessellator:
         if self.final_grid is None:
             raise RuntimeError("Grid is not available. Call VoronoiTessellator.generate() first.")
         return self.final_grid
+
+    def quality_report(self, *, cell_size=None, domain=None, tolerance=None):
+        """Inspect final cells and whole shared faces; see utils.grid_quality_report."""
+        from .utils import grid_quality_report
+
+        return grid_quality_report(self.grid, cell_size=cell_size, domain=domain, tolerance=tolerance)
+
+    def barrier_report(self, *, tolerance=None, approximate=False, closed_ties='exclude'):
+        """Track final cells on both sides of each barrier, without FloPy.
+
+        Returns the same dictionary as :func:`vorflow.utils.grid_barrier_report`:
+        ``faces``, ``crossings``, ``unmatched`` and ``summary`` GeoDataFrames,
+        plus the matching ``tolerance`` in CRS units. Left/right follow each
+        cleaned line part's coordinate direction. Cell IDs are zero-based
+        final row positions; node IDs and original row labels are retained.
+        This is geometry tracking, not a hydraulic package or a flow check.
+        """
+        return grid_barrier_report(self.grid, self.cm.clean_lines, tolerance=tolerance,
+                                   approximate=approximate, closed_ties=closed_ties)
+
+    def _check_barriers(self):
+        """Cheap automatic crossing diagnostics; full face tracking is opt-in."""
+        lines = self.cm.clean_lines
+        tolerance = tracking_tolerance(self.final_grid, lines, None)
+        records = crossing_records(self.final_grid, lines, tolerance)
+        rows = []
+        failed = []
+        for index, row in barrier_rows(lines):
+            ids = [r['cell_id'] for r in records if r['barrier_index'] == index]
+            policy = barrier_policy(row)
+            line_id = row.get('line_id', index)
+            rows.append(dict(barrier_index=index, line_id=line_id, policy=policy,
+                             crossing_cells=len(ids), cell_ids=ids))
+            if ids and policy == 'strict':
+                failed.append(f"{line_id!r}: {len(ids)} cell(s)")
+            elif ids and policy == 'preserve':
+                logger.warning(
+                    "Barrier %r: layout preserved; %d cell(s) contain unresolved barrier "
+                    "sections. Inspect barrier_diagnostics or barrier_report(); no hydraulic "
+                    "barrier has been assigned.", line_id, len(ids),
+                )
+        self.barrier_diagnostics = pd.DataFrame(
+            rows, columns=['barrier_index', 'line_id', 'policy', 'crossing_cells', 'cell_ids']
+        )
+        if failed:
+            raise ValueError("Strict barrier policy found unresolved crossings ("
+                             + '; '.join(failed) + "). This is a barrier-alignment check, "
+                             "not a polygon-validity check; no cuts or merges were attempted "
+                             "for strict barriers. Inspect barrier_diagnostics/barrier_report().")
 
     def generate(self):
         """
@@ -1339,6 +1543,7 @@ class VoronoiTessellator:
         # columns for the geometric centroid of the final cell.
         self.final_grid['centroid_x'] = self.final_grid.geometry.centroid.x
         self.final_grid['centroid_y'] = self.final_grid.geometry.centroid.y
+        self._check_barriers()
         
         logger.info(f"Final Voronoi Grid Generated: {len(self.final_grid)} cells.")
         return self.final_grid

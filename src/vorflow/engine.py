@@ -891,6 +891,7 @@ class MeshGenerator:
         self.node_edges = None
         self.buffer_footprints = None
         self.diagnostics = {}
+        self.source_report = None
 
     def _validate_background_lc(self):
         """Fail before any Gmsh work if background_lc is missing or not positive."""
@@ -1473,6 +1474,7 @@ class MeshGenerator:
         corridors = buffer.protected_corridors(polygons_gdf, lines_gdf, self.background_lc)
         barrier_zone = self._build_barrier_zone(corridors)
         plans = buffer.plan_quad_buffers(polygons_gdf, lines_gdf, self.background_lc, domain)
+        self._buffer_plans = plans
         crossings = buffer.find_all_crossings(plans)
         straddle_plan = plan_barrier_crossings(
             lines_gdf, self.background_lc, domain, barrier_zone,
@@ -2433,6 +2435,7 @@ class MeshGenerator:
         (annuli) and any strip that was trimmed or split are meshed
         recombine-only.
         """
+        self._buffer_surface_modes = {}
         structured_surfaces = final_map.get('structured_buffer_surfs', {})
         if not structured_surfaces:
             return
@@ -2495,6 +2498,9 @@ class MeshGenerator:
                     )
                 if not structured:
                     self._set_default_buffer_curve_divisions(surf_tag, lc)
+                self._buffer_surface_modes[(feat_id, surf_tag)] = (
+                    'transfinite' if structured else 'recombine'
+                )
                 try:
                     gmsh.model.mesh.setRecombine(2, int(surf_tag))
                     gmsh.model.mesh.setAlgorithm(2, int(surf_tag), 8)
@@ -2848,6 +2854,9 @@ class MeshGenerator:
         self.node_sizes = None
         self.node_edges = None
         self.buffer_footprints = None
+        self.source_report = None
+        self._buffer_plans = {}
+        self._buffer_surface_modes = {}
         self._initialize_gmsh()
         try:
             logger.info("Transferring Geometry to Gmsh...")
@@ -2868,6 +2877,7 @@ class MeshGenerator:
             meshed_surface_tags = self._meshed_surface_tags(gmsh_map, clean_polys)
             self.triangular_quality = self._collect_triangular_quality(meshed_surface_tags)
             self._element_data = self._capture_element_data(meshed_surface_tags)
+            self.source_report = self._source_buffer_report(gmsh_map, clean_polys, clean_lines)
 
             if output_file:
                 gmsh.write(output_file)
@@ -2894,6 +2904,65 @@ class MeshGenerator:
             logger.error(f"Mesh Generation Failed: {e}")
             self._finalize_gmsh()
             raise
+
+    def _source_buffer_report(self, gmsh_map, polygons, lines):
+        """Measure requested buffers against actual Gmsh elements before finalizing.
+
+        Recombination is a request: count the resulting quads and triangles instead
+        of inferring successful application from the input flags or final polygons.
+        """
+        records = []
+        surfaces = gmsh_map.get('structured_buffer_surfs', {})
+        for kind, frame in (('line', lines), ('poly', polygons)):
+            for idx, row in frame.iterrows():
+                if not (is_embedded(row) and row_bool(row, 'quad_buffer', False)):
+                    continue
+                key = (kind, int(idx))
+                plan = self._buffer_plans.get(key)
+                tags = [int(dt[1]) for dt in surfaces.get(key, []) if int(dt[0]) == 2]
+                data = self._capture_element_data(tags) if tags else None
+                quads, triangles, all_polys = [], [], []
+                if data is not None:
+                    lookup = pd.Series(np.arange(len(data['node_tags'])), index=data['node_tags'])
+                    for block in data['blocks']:
+                        connectivity = block['connectivity']
+                        positions = lookup.loc[connectivity.ravel()].to_numpy().reshape(connectivity.shape)
+                        geoms = shapely.polygons(data['node_xy'][positions])
+                        all_polys.extend(geoms)
+                        if connectivity.shape[1] == 4:
+                            quads.extend(geoms)
+                        elif connectivity.shape[1] == 3:
+                            triangles.extend(geoms)
+                actual = shapely.union_all(all_polys)
+                requested = plan.footprint if plan is not None else shapely.GeometryCollection()
+                modes = [self._buffer_surface_modes.get((key, tag), 'unknown') for tag in tags]
+                target = row.geometry.boundary if kind == 'poly' else row.geometry
+                # Tolerance only masks floating-point cracks, not missing sides.
+                xy = shapely.get_coordinates(target)
+                tol = 32 * np.finfo(float).eps * max(1., float(np.abs(xy).max()))
+                missing_length = target.difference(actual.buffer(tol)).length
+                expected_area = requested.area
+                missing_area = requested.difference(actual).area
+                actual_area = actual.area
+                records.append(dict(
+                    kind=kind, feature_index=int(idx),
+                    feature_id=row.get('line_id' if kind == 'line' else 'zone_id', idx),
+                    requested_layout='quad', requested_area=expected_area,
+                    actual_area=actual_area, missing_area=missing_area,
+                    target_length=target.length, target_outside_buffer_length=missing_length,
+                    transfinite_surfaces=modes.count('transfinite'),
+                    recombine_surfaces=modes.count('recombine'), triangles=len(triangles), quads=len(quads),
+                    quad_area_fraction=sum(p.area for p in quads) / actual_area if actual_area else 0.,
+                    complete=bool(actual_area > 0 and missing_area <= max(1., expected_area) * 1e-9
+                                  and missing_length <= max(1., target.length) * 1e-9),
+                    geometry=actual,
+                ))
+        return gpd.GeoDataFrame(records, columns=[
+            'kind', 'feature_index', 'feature_id', 'requested_layout', 'requested_area',
+            'actual_area', 'missing_area', 'target_length', 'target_outside_buffer_length',
+            'transfinite_surfaces', 'recombine_surfaces', 'triangles', 'quads',
+            'quad_area_fraction', 'complete', 'geometry',
+        ], geometry='geometry', crs=lines.crs if lines.crs is not None else polygons.crs)
 
     def _check_hex_rings(self, gmsh_map, points_gdf):
         """Warn for each hex_ring point whose ring the mesher split; record the outcome in diagnostics.

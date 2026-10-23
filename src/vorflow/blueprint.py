@@ -12,6 +12,7 @@ from shapely.prepared import prep
 from shapely.validation import make_valid
 
 from . import _junctions
+from ._barriers import MERGE_POLICIES, POLICIES
 from ._features import line_parts as _line_parts
 from ._features import positive_number, row_bool
 from ._plot import features_frame, get_ax, plot_features
@@ -598,7 +599,8 @@ class ConceptualMesh:
     def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False,
                   dist_min=None, dist_max=None, straddle_width=None, fields=None, embed=True, densify=True,
                   simplify_tolerance=None, quad_buffer=False, quad_buffer_thickness=1, z_order=0,
-                  growth_factor=None, label=None, color=None):
+                  growth_factor=None, label=None, color=None, barrier_policy='auto',
+                  barrier_merge='legacy', barrier_mirrors=None):
         """
         Adds a line feature, such as a river, fault, or other linear boundary.
 
@@ -608,10 +610,39 @@ class ConceptualMesh:
             resolution (float): Target mesh size along the line.
             snap_to_polygons (bool): If True, the line's endpoints will be snapped to
                 nearby polygon boundaries to ensure connectivity.
-            is_barrier (bool): If True, the line is treated as a flow barrier. The mesh
-                will be constructed to prevent cell faces from crossing it.
-            straddle_width (float, optional): If set, forces Voronoi cell edges to align
-                perfectly with the line by creating a "virtual straddle" of mesh nodes.
+            is_barrier (bool): Request barrier-oriented meshing. This controls
+                geometry only; it does not assign hydraulic resistance.
+                Residual crossings depend on ``barrier_policy``.
+            barrier_policy (str): ``"auto"`` (default) retains historical
+                mirror/cut enforcement on all barriers, including quad buffers.
+                ``"preserve"`` makes no barrier cuts; mirrors are off
+                unless explicitly enabled. Unresolved crossings are reported. ``"strict"``
+                also preserves the layout, but raises if the final barrier
+                enters a cell interior. ``"cut"`` opts into fallback cuts and
+                defaults to mirrors, including on quad buffers. Fragment merging is controlled
+                independently by ``barrier_merge``. Cuts
+                can create nonorthogonal or bent connections. Domain clipping
+                is independent. Ignored when ``is_barrier=False``.
+            barrier_merge (str): Only used when this line is cut. ``"none"``
+                retains every cut fragment as a separate cell. ``"checked"``
+                merges small fragments only if the candidate union
+                is convex to roundoff and every affected shared face is
+                contiguous and straight, with finite positive centre-to-face
+                distances on opposite sides. Failed proposals leave the
+                fragment available as a separate cell. ``"legacy"`` restores
+                the historical longest-shared-boundary rule without these guards
+                and is the compatibility default for add_line.
+                ``"restore"`` instead undoes the whole parent cut, including
+                dependent fragment absorption, if fragments cannot be safely
+                merged or the retained cut cell fails geometry/quality checks.
+                Existing cut defects and small retained cells still require
+                inspection; these checks do not guarantee flow accuracy.
+            barrier_mirrors (bool, optional): Add reflected generators independently
+                of cutting. None retains the historical policy-dependent behavior:
+                mirrors for cut barriers only. False disables barrier mirrors.
+            straddle_width (float, optional): Distance between paired mesh nodes
+                across the line. Their bisector follows straight portions; bends,
+                competing nodes and feature intersections can leave alignment gaps.
             fields (list, optional): List of MeshField objects.
             embed (bool): If True, the line is embedded in the mesh. If False, it is used only for fields.
             densify (float or bool, optional): Controls line densification:
@@ -624,8 +655,10 @@ class ConceptualMesh:
                 Raises ValueError if negative. Boolean values are not supported.
             quad_buffer (bool): If True, creates an opt-in structured quad buffer
                 strip around the line instead of the lightweight straddle points.
-                The strip is meshed as a 4-corner transfinite surface (structured
-                quad rows): with ``quad_buffer_thickness=1`` no nodes fall on
+                Open strips attempt 4-corner transfinite meshing. Closed annuli
+                and unsuitable fragmented strips use recombination instead;
+                perfectly paired rows are not guaranteed. With
+                ``quad_buffer_thickness=1`` no nodes are requested on
                 the line, so the Voronoi faces align with it (sharp barrier);
                 with ``2`` a node row lands on it, giving a row of ~square
                 Voronoi cells centered on the line. (For the triangular
@@ -636,6 +669,11 @@ class ConceptualMesh:
                 then finer resolution, wider strip, lines over polygons,
                 insertion order). Strips crossing a barrier/straddle corridor
                 are still trimmed there. Independent of ``is_barrier``.
+                Alignment is not guaranteed around bends, trimmed caps or
+                intersections. Inspect the final barrier report. With
+                ``is_barrier=True``, ``barrier_policy="auto"`` retains historical
+                mirror/cut enforcement; request ``"preserve"`` explicitly to
+                keep the strip's generator layout.
             quad_buffer_thickness (int): Strip width in local cell widths
                 (multiples of ``resolution``, like gmshflow's ``cs_thick``).
                 Supported values are 1 and 2.
@@ -678,6 +716,13 @@ class ConceptualMesh:
         if quad_buffer and not embed:
             raise ValueError("quad_buffer=True requires embed=True: a quad buffer is meshed geometry.")
 
+        if not isinstance(barrier_policy, str) or barrier_policy not in POLICIES:
+            raise ValueError("barrier_policy must be 'auto', 'preserve', 'strict' or 'cut'.")
+        if not isinstance(barrier_merge, str) or barrier_merge not in MERGE_POLICIES:
+            raise ValueError("barrier_merge must be 'none', 'checked', 'restore' or 'legacy'.")
+        if barrier_mirrors is not None and not isinstance(barrier_mirrors, (bool, np.bool_)):
+            raise ValueError('barrier_mirrors must be a boolean or None.')
+
         growth_factor = _validate_growth_factor(growth_factor)
 
         if fields is None:
@@ -689,6 +734,9 @@ class ConceptualMesh:
             'lc': resolution,
             'snap_to_polygons': snap_to_polygons,
             'is_barrier': is_barrier,
+            'barrier_policy': barrier_policy,
+            'barrier_merge': barrier_merge,
+            'barrier_mirrors': barrier_mirrors,
             'dist_min': dist_min,
             'dist_max': dist_max,
             'straddle_width': straddle_width,
@@ -1307,6 +1355,9 @@ class ConceptualMesh:
                     'lc',
                     'snap_to_polygons',
                     'is_barrier',
+                    'barrier_policy',
+                    'barrier_merge',
+                    'barrier_mirrors',
                     'dist_min',
                     'dist_max',
                     'straddle_width',

@@ -485,14 +485,15 @@ def test_line_crossing_a_barrier_ends_on_its_straddle_pair(angle, offset):
 
 
 @pytest.mark.parametrize("amplitude, wavelength, lc", [(8, 8, 2), (15, 5, 2), (8, 8, 5)])
-def test_curved_barrier_leaves_no_sliver_cells(amplitude, wavelength, lc):
+def test_legacy_curved_barrier_merges_away_sliver_cells(amplitude, wavelength, lc):
     # Straddle pairs' Voronoi faces are chords of a curved barrier, which
     # bulges across them by the sagitta. The post-hoc split made every bulge
     # a cell (80 on the 8/8/2 model, compactness < 0.3, areas down to 1e-15),
     # curvature tighter than lc put barrier mirrors beside straddle points
     # and outside the domain (15/5/2), and split() dropped pieces where the
     # barrier runs along a face to roundoff, leaving holes in the grid
-    # (8/8/5). Bulges now join the cell on their side of the barrier.
+    # (8/8/5). Legacy mode retains this behaviour. Checked mode can retain
+    # fragments when that union would damage geometry or centre distances.
     from vorflow import VoronoiTessellator
     from vorflow.utils import build_connectivity
 
@@ -501,7 +502,7 @@ def test_curved_barrier_leaves_no_sliver_cells(amplitude, wavelength, lc):
     cm.add_polygon(domain, zone_id=1)
     ys = np.linspace(0, 100, 60)
     curve = LineString(np.column_stack([50 + amplitude * np.sin(ys / wavelength), ys]))
-    cm.add_line(curve, line_id="barrier", resolution=lc, is_barrier=True)
+    cm.add_line(curve, line_id="barrier", resolution=lc, is_barrier=True, barrier_merge='legacy')
     polys, lines, points = cm.generate()
     mg = MeshGenerator(background_lc=10.0, verbosity=0)
     assert mg.generate(polys, lines, points)

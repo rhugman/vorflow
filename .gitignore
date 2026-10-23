@@ -218,6 +218,7 @@ __pycache__
 
 # Internal benchmarks / scratch experiments (not tracked)
 benchmarks/
+.bin/
 
 # Local conda environment in repo root
 .conda/

@@ -81,6 +81,9 @@ def test_release_script_imports_are_declared():
         Requirement(r).name
         for r in project["dependencies"] + project["optional-dependencies"]["dev"]
     }
+    local_modules = {script.stem for script in (ROOT / "scripts").glob("*.py")}
+    local_modules.update(package.name for package in (ROOT / "src").iterdir()
+                         if (package / "__init__.py").is_file())
     for script in (ROOT / "scripts").glob("*.py"):
         tree = ast.parse(script.read_text(encoding="utf-8"))
         # An import in a try body with an ImportError handler is optional; its
@@ -107,7 +110,7 @@ def test_release_script_imports_are_declared():
                 continue
             for module in modules:
                 top = module.split(".")[0]
-                if top in sys.stdlib_module_names or top == "__future__":
+                if top in sys.stdlib_module_names or top == "__future__" or top in local_modules:
                     continue
                 assert top in declared, f"{script.name} imports undeclared {top}"
 
