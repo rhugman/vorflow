@@ -15,6 +15,7 @@ from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 from shapely.validation import make_valid
 
+DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
 # A hex_ring point's ring seeds sit at 1 x lc; every other node-bearing feature
 # (barrier sites included) must stay at least HEX_RING_CLEARANCE x lc away, so
 # at least one cell width separates the ring from foreign nodes (closer ones

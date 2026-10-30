@@ -7,7 +7,9 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 import shapely
-from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon
+from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon, Point
+from ._features import DEFAULT_CONNECTIVITY_TOLERANCE
+from ._log import warn_user
 
 from ._convex import CONCAVE_TOLERANCE, centroid_fan_fraction
 
@@ -865,6 +867,163 @@ def _insert_hanging_vertices(cell_vertices, vertex_xy, tolerance):
         pos = edge_pos[e] + 1
         ring[pos:pos] = inserted
     return out
+
+
+def cells_on(
+    gdf: gpd.GeoDataFrame,
+    geometry: shapely.Point | shapely.LineString | shapely.MultiLineString | gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Return the grid cells that a point or line lies on.
+
+    For a line that runs along cell faces, such as a barrier, which side's
+    cells are returned depends on roundoff; use :func:`faces_on` instead.
+
+    Args:
+        gdf (GeoDataFrame): Grid of single-part polygons without holes, with
+            ``x`` and ``y`` columns (e.g. ``VoronoiTessellator.grid``).
+        geometry (Point | LineString | MultiLineString | GeoDataFrame): The
+            geometry to find the cells of, or a GeoDataFrame of such
+            geometries (e.g. ``ConceptualMesh.features()``). Optional
+            ``feature_type`` and ``feature_id`` columns default to the geometry
+            type and the index.
+
+    Returns:
+        cells (GeoDataFrame): The cells with ``cell_id`` (the cell's row
+            position in ``gdf``, which is the DISV cell number, not its
+            ``node_id``), ``cell_area`` and ``line_length``, the length of the
+            line inside the cell. Cells the line only touches are left out.
+            For a Point, the single cell whose generator is nearest, with
+            ``line_length`` 0. For a GeoDataFrame, the cells of every feature,
+            with its ``feature_type`` and ``feature_id``; polygon rows and
+            features outside the grid are skipped with a warning.
+
+    Raises:
+        ValueError: If ``geometry`` is not a Point, LineString,
+            MultiLineString or GeoDataFrame.
+        ValueError: If ``geometry`` is outside the grid.
+    """
+    if isinstance(geometry, gpd.GeoDataFrame):
+        return _cells_on_features(gdf, geometry)
+
+    if not isinstance(geometry, (Point, LineString, MultiLineString)):
+        raise ValueError("geometry must be a Point, LineString, or MultiLineString.")
+
+    mask = gdf.geometry.intersects(geometry).to_numpy().copy()
+    if not isinstance(geometry, Point):
+        # Drop cells the line only touches at a vertex or along part of their boundary.
+        inside = shapely.intersection(gdf.geometry.to_numpy()[mask], geometry)
+        rows = np.flatnonzero(mask)
+        mask[rows[shapely.length(inside) <= 1e-9 * geometry.length]] = False
+    cells = gdf.iloc[mask].copy()
+    if cells.empty:
+        raise ValueError("the geometry is outside the grid")
+    if isinstance(geometry, Point):
+        # if more than one point find the nearest cell generator to point
+        if len(cells) > 1:
+            rows = np.flatnonzero(mask)
+            d = shapely.distance(shapely.points(cells["x"], cells["y"]), geometry)
+            i = int(np.argmin(d))
+            cells = cells.iloc[[i]].copy()
+            cells["cell_id"] = rows[i]
+        else:
+            cells = cells.iloc[[0]].copy()
+            cells["cell_id"] = np.flatnonzero(mask)[0]
+        cells["line_length"] = 0.0
+        cells["cell_area"] = cells.geometry.area
+    else:
+        cells["cell_id"] = np.flatnonzero(mask)
+        cells["cell_area"] = cells.geometry.area
+        cells["line_length"] = cells.geometry.intersection(geometry).length
+
+    # Reset the index
+    cells.reset_index(drop=True, inplace=True)
+
+    return cells
+
+
+def _cells_on_features(gdf, features):
+    """``cells_on`` for every row of ``features``, skipping polygons and features outside the grid."""
+    features = features.copy()
+    if "feature_type" not in features.columns:
+        features["feature_type"] = features.geometry.geom_type
+    if "feature_id" not in features.columns:
+        features["feature_id"] = features.index
+    res = []
+    for _, row in features.iterrows():
+        if not isinstance(row.geometry, (Point, LineString, MultiLineString)):
+            warn_user(f"cells_on: {row.geometry.geom_type} feature {row['feature_id']!r} is not supported and is skipped.")
+            continue
+        try:
+            cells = cells_on(gdf, row.geometry)
+        except ValueError:
+            warn_user(f"cells_on: feature {row['feature_id']!r} is outside the grid and is skipped.")
+            continue
+        cells["feature_type"] = row["feature_type"]
+        cells["feature_id"] = row["feature_id"]
+        res.append(cells)
+    if not res:
+        columns = [*gdf.columns, "cell_id", "line_length", "cell_area", "feature_type", "feature_id"]
+        return gpd.GeoDataFrame(columns=columns, geometry=gdf.geometry.name, crs=gdf.crs)
+    return gpd.GeoDataFrame(pd.concat(res, ignore_index=True), crs=gdf.crs)
+
+
+def faces_on(gdf, geometry, tolerance=None, predicate="within"):
+    """Return rows from a connectivity GeoDataFrame whose faces are near a line.
+
+    Pass the result of :func:`build_connectivity` as ``gdf``. ``tolerance``
+    buffers the line for selecting candidate shared edges; ``face_length`` is
+    the length of each full shared edge.
+
+    Args:
+        gdf (GeoDataFrame): A connectivity GeoDataFrame that must contain the columns
+            ``cell_id_1``, ``cell_id_2``, and ``shared_edge``.
+        geometry (LineString | MultiLineString): The line geometry to buffer and evaluate
+            against the shared edges.
+        tolerance (float, optional): The distance to buffer the line geometry. Must be
+            greater than zero. If None, defaults to ``DEFAULT_CONNECTIVITY_TOLERANCE``.
+        predicate (str): The spatial predicate used to filter the edges.
+            Must be either ``'intersects'`` or ``'within'``.
+
+    Returns:
+        faces (GeoDataFrame): A copy of the filtered connectivity GeoDataFrame containing
+            the matching rows, with an additional ``face_length`` column calculated
+            from the ``shared_edge`` geometry.
+
+    Raises:
+        ValueError: If ``tolerance`` is not greater than zero.
+        ValueError: If ``geometry`` is not a LineString or MultiLineString.
+        ValueError: If ``predicate`` is not 'intersects' or 'within'.
+        ValueError: If ``gdf`` is missing any of the required connectivity columns.
+    """
+
+    if tolerance is None:
+        tolerance = DEFAULT_CONNECTIVITY_TOLERANCE
+    if not tolerance > 0:
+        raise ValueError("tolerance must be greater than zero.")
+    if not isinstance(geometry, (LineString, MultiLineString)):
+        raise ValueError("geometry must be a LineString or MultiLineString.")
+    if predicate not in ["intersects", "within"]:
+        raise ValueError("predicate must be either intersects or within.")
+
+    required = {"cell_id_1", "cell_id_2", "shared_edge"}
+    missing = required.difference(gdf.columns)
+    if missing:
+        raise ValueError(
+            f"faces_on requires a connectivity GeoDataFrame with columns: {sorted(required)}; "
+            f"missing {sorted(missing)}."
+        )
+
+    if predicate == "intersects":
+        mask = gdf["shared_edge"].intersects(geometry.buffer(tolerance))
+    elif predicate == "within":
+        mask = gdf["shared_edge"].within(geometry.buffer(tolerance))
+    faces = gdf.loc[mask].copy()
+    faces["face_length"] = faces["shared_edge"].length
+
+    # Reset the index
+    faces.reset_index(drop=True, inplace=True)
+
+    return faces
 
 
 def grid_to_mfusg_disu(gdf: gpd.GeoDataFrame, top, botm, nlay: int = 1, gsf_path=None) -> dict:

@@ -9,6 +9,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `ConceptualMesh.features()` returns the cleaned lines, points and polygons
+  as one GeoDataFrame with `feature_type`, `feature_id` and `embed`.
+- `vorflow.utils.cells_on(grid, geometry)` returns the cells a point or line
+  lies on, with `cell_id` (the DISV cell number), `cell_area` and the
+  `line_length` inside each cell. It also takes a GeoDataFrame such as
+  `ConceptualMesh.features()`. `vorflow.utils.faces_on(connectivity, line)`
+  returns the shared faces along a line, e.g. a barrier, with `face_length`,
+  for building MF6 inputs such as HFB.
 - `ConceptualMesh.check(background_lc=None)` reports input defects that tend
   to produce bad Voronoi cells, before meshing and without Gmsh: short
   segments, close vertices (including a line crossing a polygon edge beside a

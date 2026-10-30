@@ -18,7 +18,7 @@ from shapely.validation import make_valid
 from . import _checks, _junctions
 from ._log import verbosity_scope, warn_user
 from ._features import line_parts as _line_parts
-from ._features import HEX_RING_CLEARANCE, is_face_line, positive_number, row_bool
+from ._features import DEFAULT_CONNECTIVITY_TOLERANCE, HEX_RING_CLEARANCE, is_face_line, positive_number, row_bool
 from ._plot import features_frame, get_ax, plot_features
 from ._barrier import lines as _barrier_lines
 from ._barrier import pipeline as _barrier_pipeline
@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 # Constants for geometry simplification and reporting
 SIGNIFICANT_REDUCTION_PCT = 1.0
-DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
 # Where embedded lines meet, ends that miss another line by less than this
 # fraction of their vertex spacing are snapped onto it, shorter overshoots are
 # trimmed, and line vertices closer than it to the junction are dropped (#31).
@@ -1811,3 +1810,43 @@ class ConceptualMesh:
                 return self._densify_geometry(row['geometry'], res) if res is not None else row['geometry']
 
             self.clean_lines['geometry'] = self.clean_lines.apply(_line_densify, axis=1)
+
+    def features(self):
+        """
+        Return all cleaned lines, points and polygons as one GeoDataFrame.
+
+        Returns:
+            features (GeoDataFrame): Returns a GeoDataFrame of all cleaned features of the ConceptualModel with 
+            the columns ``'geometry'``, ``'embed'``, ``'feature_type'``, and ``'feature_id'``.
+
+        Raises:
+            ValueError: If there are no cleaned features.
+        """
+        lines = gpd.GeoDataFrame()
+        if not self.clean_lines.empty:
+            lines = self.clean_lines[["geometry", "line_id", "embed"]].copy()
+            lines = lines.rename(columns={"line_id": "feature_id"})
+            lines["feature_type"] = "line"
+
+        points = gpd.GeoDataFrame()
+        if not self.clean_points.empty:
+            points = self.clean_points[["geometry", "point_id", "embed"]].copy()
+            points = points.rename(columns={"point_id": "feature_id"})
+            points["feature_type"] = "point"
+
+        polygons = gpd.GeoDataFrame()
+        if not self.clean_polygons.empty:
+            polygons = self.clean_polygons[["geometry", "zone_id", "embed"]].copy()
+            polygons = polygons.rename(columns={"zone_id": "feature_id"})
+            polygons["feature_type"] = "polygon"
+
+        features = gpd.GeoDataFrame(pd.concat([
+            lines,
+            points,
+            polygons
+        ], ignore_index=True))
+
+        if features.empty:
+            raise ValueError("Run ``.generate()`` before exporting features.")
+
+        return features

@@ -680,3 +680,34 @@ def test_hex_ring_kept_inside_field_only_polygon_at_ring_resolution():
         _, _, clean_points = cm.generate()
     well = clean_points[clean_points["point_id"] == "well"].iloc[0]
     assert len(well["ring_seeds"]) == 6
+
+
+def test_raise_error_features_export_before_generate():
+    cm = ConceptualMesh()
+
+    with pytest.raises(ValueError, match=r"Run ``\.generate\(\)`` before exporting features"):
+            cm.features()
+
+
+def test_features_export():
+    cm = ConceptualMesh()
+    square = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
+    cm.add_polygon(square, zone_id=1)
+
+    line = LineString([(-0.5, 1.0), (0.5, 1.0)])
+    point = Point(-0.0005, 0.0)
+
+    cm.add_line(line, line_id="river", resolution=0.1)
+    cm.add_point(point, point_id="well", resolution=0.1)
+    cm.add_point(point, point_id="well-false", resolution=0.1, embed=False)
+
+    cm.generate()
+
+    feat = cm.features()
+
+    assert len(feat) == 4
+    assert {'feature_type', 'feature_id'}.issubset(feat.columns)
+    assert {'line', 'polygon', 'point'}.issubset(feat['feature_type'])
+    assert {1, 'river', 'well'}.issubset(feat['feature_id'])
+    assert not feat[feat['feature_id']=="well-false"]["embed"].values
+    assert sum(feat["embed"]) == 3
