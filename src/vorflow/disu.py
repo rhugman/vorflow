@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import shapely
@@ -115,6 +116,29 @@ class DisuGrid:
         self.nodemap = None
         self.cellmap = None
         self.links = None
+
+    @classmethod
+    def from_disv(cls, vertices, cell2d, top, botm, idomain=None, **options):
+        """Build from MODFLOW 6 DISV arrays, e.g. an existing FloPy or LoopFlopy model.
+
+        ``vertices`` is ``[[iv, x, y], ...]`` and ``cell2d`` is
+        ``[[icell2d, xc, yc, ncvert, iv1, ...], ...]`` as for
+        ``flopy.mf6.ModflowGwfdisv``; ``xc``/``yc`` are kept as the cell centres.
+        The other arguments are those of :class:`DisuGrid`.
+        """
+        xy = {int(row[0]): (float(row[1]), float(row[2])) for row in vertices}
+        polygons, xc, yc, ids = [], [], [], []
+        for row in cell2d:
+            ncvert = int(row[3])
+            ring = [xy[int(iv)] for iv in row[4:4 + ncvert]]
+            if len(ring) > 1 and ring[0] == ring[-1]:
+                ring = ring[:-1]
+            polygons.append(shapely.Polygon(ring))
+            ids.append(int(row[0]))
+            xc.append(float(row[1]))
+            yc.append(float(row[2]))
+        grid = gpd.GeoDataFrame({"node_id": ids, "x": xc, "y": yc}, geometry=polygons)
+        return cls(grid, top, botm, idomain, **options)
 
     @property
     def nlay(self):

@@ -1,10 +1,11 @@
-"""Tracking for DisuGrid: values between nodes and layers, point lookup and the cell map file."""
+"""Tracking for DisuGrid: values between nodes and layers, point lookup, the cell map file and DISV input."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from vorflow import disu
+from vorflow.utils import grid_to_disv
 
 from test_disu_full import _two_columns
 from test_disu_grid import _grid
@@ -32,6 +33,21 @@ def test_to_nodes_to_layers_round_trip():
         d.to_nodes([1.0, 2.0])
     with pytest.raises(ValueError, match="one per node"):
         d.to_layers(np.zeros(3))
+
+
+def test_from_disv_matches_building_from_the_grid():
+    grid = _grid(nx=4, ny=3, widths=[1, 2, 1.5, 3])
+    rng = np.random.default_rng(5)
+    botm = np.array([6.0, 3.0, 0.0])[:, None] + rng.uniform(-1, 1, (3, len(grid)))
+    idomain = np.ones(botm.shape, dtype=int)
+    idomain[1, 4] = -1
+    planar = grid_to_disv(grid)
+    direct = disu.DisuGrid(grid, 10.0, botm, idomain).build().get_gridprops_mf6_disu()
+    standalone = disu.DisuGrid.from_disv(planar["vertices"], planar["cell2d"], 10.0, botm, idomain)
+    props = standalone.build().get_gridprops_mf6_disu()
+    for key in ("iac", "ja", "ihc", "cl12", "hwva", "angldegx", "top", "bot", "area"):
+        np.testing.assert_allclose(props[key], direct[key], err_msg=key)
+    assert list(standalone.cellmap.node_id[:4]) == [0, 1, 2, 3]
 
 
 def test_locate_and_column_follow_the_collapsed_cells():
