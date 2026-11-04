@@ -20,6 +20,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and inexact. `connectivity="layered"` gives the DISV connections.
   - Pass-through cells (idomain -1, or no thicker than `min_thickness`) are
     removed without leaving gaps (`collapse`); idomain 0 stays no-flow.
+  - `to_nodes`, `to_layers`, `locate`, `column` and `save_cellmap` track
+    cells; `idomain_layers`, `layer_view` and `vertex_grid` give per-layer
+    status maps and 2D views for FloPy plots; `from_disv()` reads existing
+    DISV models.
   - `nodemap` and `cellmap` map nodes to layers and plan cells; `report()`
     gives the offset ratio from the paper and the reminder that MF6 XT3D
     needs NPF `angle2`/`angle3` to account for vertical offsets.

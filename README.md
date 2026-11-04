@@ -403,8 +403,8 @@ from vorflow import disu
 d = disu.DisuGrid(grid, top, botm, idomain).build()   # FloPy shapes: (ncpl,), (nlay, ncpl)
 print(d.report())
 flopy.mf6.ModflowGwfdisu(gwf, **d.get_gridprops_mf6_disu())
-k_nodes = k_layers[d.nodemap >= 0]                     # (nlay, ncpl) values in node order
-flopy.mf6.ModflowGwfnpf(gwf, k=k_nodes, xt3doptions=True, angle2=0.0, angle3=0.0)
+flopy.mf6.ModflowGwfnpf(gwf, k=d.to_nodes(k_layers), xt3doptions=True, angle2=0.0, angle3=0.0)
+heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl), NaN where removed
 ```
 
 - **Pinch-outs:** idomain -1 or `min_thickness` marks pass-through cells.
@@ -414,10 +414,20 @@ flopy.mf6.ModflowGwfnpf(gwf, k=k_nodes, xt3doptions=True, angle2=0.0, angle3=0.0
 - **XT3D:** use it with offset layers, and give NPF `angle2` and `angle3`
   (zeros are fine). Without them MODFLOW 6 XT3D ignores the vertical
   offsets. `connectivity="layered"` gives the DISV connections instead.
-- **Nodes and cells:** `nodemap` maps `(layer, cell)` to the DISU node (-1
-  where removed) and `cellmap` lists every layer cell with its node, status,
-  centre, top and bottom. FloPy reads the layer number from the IHC
-  diagonal, so `PlotMapView(modelgrid=gwf.modelgrid, layer=k)` works directly.
+- **Tracking:** `nodemap`, `cellmap`, `to_nodes`, `to_layers`,
+  `locate(x, y, z)` and `column(x, y)`. FloPy reads the layer number from the
+  IHC diagonal, so `PlotMapView(modelgrid=gwf.modelgrid, layer=k)` works
+  directly. `idomain_layers` (1 active, -1 pass-through, 0 no-flow),
+  `layer_view` (one 2D map for a layer, also when split into sublayers) and
+  `vertex_grid` (a FloPy grid for those maps) cover the rest; MF6 DISU
+  accepts IDOMAIN 0/1 only.
+- **Layer structure for other tools:** MF6 copies each node's plan polygon
+  to the binary grid file, but not its layer. `save_cellmap(path, parent)`
+  writes it for tools that work layer by layer in 2D, such as pilot points
+  per layer: every layer cell with its node, plan cell, centre, top, bottom
+  and mid-elevation, its `idomain` code, and its `unit`, the original layer.
+- **Existing DISV models** (FloPy, LoopFlopy) go in through
+  `disu.DisuGrid.from_disv(vertices, cell2d, top, botm, idomain)`.
 
 ### Optional file export
 
