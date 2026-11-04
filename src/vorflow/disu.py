@@ -41,11 +41,12 @@ from ._columns import ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES, subdivi
 from ._connect3d import concat_links, layered_links, overlay_links, staggered_links, vertical_links
 from ._disu_export import mf6_gridprops, mfusg_gridprops, mfusg_ksat, write_gsf
 
-__all__ = ["DisuGrid", "DisuOptions", "refill", "splice", "subdivide"]
+__all__ = ["DisuGrid", "DisuOptions", "refill", "splice", "split_contacts", "subdivide"]
 
 CONNECTIVITY = ("full", "layered")
 CL12_MODES = ("plan", "connector")
 REFILL_PRIORITIES = ("resolution", "growth")
+WEDGES = ("upper", "lower")
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,8 @@ class DisuGrid:
             contact is made gap-free: cells that overlap across it share one
             elevation, the area-weighted mean of the bottoms above (exactly
             those bottoms when they agree, e.g. for nested refinement). Tops
-            given here must match the bottoms above them.
+            given here must match the bottoms above them. To keep dipping
+            bottoms there as given, see :func:`split_contacts`.
         botm: Layer bottoms: ``(nlay,)`` or ``(nlay, ncpl)`` for one grid, or a
             list with one value or array per layer.
         idomain: ``None`` (all active), ``(nlay, ncpl)`` or a list per layer:
@@ -525,8 +527,9 @@ class DisuGrid:
         Args:
             path: The CSV file to write.
             parent: The original layer of each layer, as returned by
-                :func:`subdivide`; ``None`` when no layer was split, and
-                ``unit`` is the layer.
+                :func:`subdivide` or :func:`split_contacts` (a wedge layer
+                belongs to the layer above or below it); ``None`` when no
+                layer was split, and ``unit`` is the layer.
         """
         self._require_build()
         unit = np.arange(self.nlay) if parent is None else np.asarray(parent)
@@ -596,8 +599,8 @@ class DisuGrid:
                 lines.append(f"  change of grid: {diag['contact_groups']} contact groups made gap-free")
             if diag["max_contact_shift"] > 0:
                 lines.append(
-                    f"  the contact under a change of grid moved bottoms by up to "
-                    f"{diag['max_contact_shift']:.3g}."
+                    f"  the contact under a change of grid moved bottoms by up to {diag['max_contact_shift']:.3g}; "
+                    "disu.split_contacts keeps them as given."
                 )
             if diag["vertical_offset"] > 0:
                 lines.append(
@@ -903,6 +906,158 @@ class DisuGrid:
             raise RuntimeError("Call build() first.")
 
 
+def split_contacts(grids, top, botm, idomain=None, *, wedge="upper", min_thickness=0.0, layers=None):
+    """Keep the given bottoms at a change of grid by adding a wedge layer under a flat cut.
+
+    :class:`DisuGrid` makes a contact where the plan grid changes gap-free:
+    cells that overlap across it share one elevation. Each cell has one top,
+    so a dipping contact is a staircase on each grid; under a refinement,
+    fine cells straddle the coarse steps, the groups chain together, and the
+    whole contact becomes one flat level that moves the bottoms above it
+    (``report()`` gives the largest move). ``split_contacts`` instead cuts
+    each such group flat and fills the space between the cut and the given
+    contact with one new layer:
+
+    - ``wedge="upper"`` puts the wedge on the grid above (the coarse one when
+      refining at depth), between each upper bottom and the lowest one. It
+      belongs to the layer below. It adds the fewest cells.
+    - ``wedge="lower"`` puts it on the grid below, between the highest
+      contact and the contact at each lower cell, so it follows the contact
+      on the finer grid. It belongs to the layer above. The contact at the
+      lower cells is the ``top`` given for that layer, else the bottom of the
+      cell above each cell's centre.
+
+    A change of grid at depth suits near-vertical features such as a pit or
+    a fault zone. For subhorizontal features (dipping less than about 45
+    degrees), use the same plan grid in every layer instead.
+
+    Args:
+        grids, top, botm, idomain: The layer inputs of :class:`DisuGrid`.
+        wedge: ``"upper"`` or ``"lower"``.
+        min_thickness: Wedge pieces this thin or thinner are not made; the
+            bottom next to them moves to the cut instead, by at most this much.
+        layers: Split only the contacts above these layers; ``None`` for
+            every change of grid.
+
+    Returns ``(grids, top, botm, idomain, parent)``, lists per layer ready for
+    ``DisuGrid(grids, top, botm, idomain)``, and ``parent``, the input layer
+    of each new layer (a wedge's parent is the layer it belongs to). Outside
+    the cut groups the wedge has zero thickness and idomain -1; it takes its
+    idomain from the cell it belongs to. Contacts whose bottoms already agree
+    (nested refinement) are left alone; with nothing to split, the inputs
+    come back unchanged. If the layers came from :func:`subdivide`, its
+    ``parent[split_parent]`` maps the new layers to the original ones.
+    """
+    if wedge not in WEDGES:
+        raise ValueError(f"wedge must be one of {WEDGES}, got {wedge!r}.")
+    if isinstance(min_thickness, bool) or not np.isfinite(min_thickness) or min_thickness < 0:
+        raise ValueError(f"min_thickness must be a finite number >= 0, got {min_thickness!r}.")
+    d = DisuGrid(grids, top, botm, idomain)
+    unchanged = (grids, top, botm, idomain, np.arange(d.nlay))
+    if d.single_grid:
+        return unchanged
+    d._prepare_columns(_coordinate_tolerance(d._grids))
+    tops = [None if t is None else t.copy() for t, _, _ in d._layers]
+    bots = [b.copy() for _, b, _ in d._layers]
+    idos = [i.copy() for _, _, i in d._layers]
+    thin = max(min_thickness, _columns.roundoff(*bots, *[t for t in tops if t is not None]))
+    wedges, changed = {}, False
+    for k in range(1, d.nlay):
+        if layers is None or k in layers:
+            split, layer = _split_contact(d, k, tops, bots, idos, wedge, thin)
+            changed |= split
+            if layer is not None:
+                wedges[k] = layer
+    if not changed:
+        return unchanged
+    out = []
+    for k in range(d.nlay):
+        if wedge == "lower" and k in wedges:
+            out.append(wedges[k])
+        out.append((d._layer_grid[k], tops[k], bots[k], idos[k], k))
+        if wedge == "upper" and k + 1 in wedges:
+            out.append(wedges[k + 1])
+    g, t, b, i, parent = zip(*out)
+    return [d._grids[k] for k in g], list(t), list(b), list(i), np.array(parent)
+
+
+def _split_contact(d, k, tops, bots, idos, wedge, thin):
+    """Cut the contact above layer ``k`` flat, updating ``tops``/``bots`` in place.
+
+    Returns ``(changed, wedge)``, where ``wedge`` is ``(grid, top, botm,
+    idomain, parent)`` of the new layer, or None when no piece is thicker
+    than ``thin``.
+    """
+    g_up, g_lo = d._layer_grid[k - 1], d._layer_grid[k]
+    up_cols, lo_cols = d._col_of[g_up], d._col_of[g_lo]
+    ending, starting = ~np.isin(up_cols, lo_cols), ~np.isin(lo_cols, up_cols)
+    if g_up == g_lo or not ending.any() or not starting.any():
+        return False, None
+    geoms = d._columns.geometry.to_numpy()
+    group_s, group_e, n_groups, (s_idx, e_idx, overlap) = _contact_groups(
+        geoms, lo_cols[starting], up_cols[ending], d._touch_area)
+    bottom = bots[k - 1][ending]
+    _, lowest, highest = _group_bottoms(group_e, bottom, d._area[up_cols[ending]], n_groups)
+    given = None if tops[k] is None else tops[k][starting]
+
+    if wedge == "upper":
+        need = highest > lowest
+        if not need.any():
+            return False, None
+        in_e = need[group_e]
+        cut = np.where(in_e, lowest[group_e], bottom)
+        made = in_e & (bottom - cut > thin)
+        bots[k - 1][ending] = np.where(made, bottom, cut)
+        if given is not None:
+            tops[k][starting] = np.where(need[group_s], lowest[group_s], given)
+        if not made.any():
+            return True, None
+        w_bot = bots[k - 1].copy()
+        w_bot[ending] = cut
+        # Each wedge cell belongs to the lower cell it overlaps most.
+        best = np.zeros(len(bottom), dtype=np.int64)
+        order = np.argsort(overlap, kind="stable")
+        best[e_idx[order]] = s_idx[order]
+        w_ido = np.full(len(up_cols), -1, dtype=np.int64)
+        w_ido[np.flatnonzero(ending)[made]] = idos[k][starting][best[made]]
+        return True, (g_up, None, w_bot, w_ido, k)
+
+    above = d._cell_above(k, lo_cols[starting])
+    contact = given if given is not None else bots[k - 1][above]
+    c_lo = np.full(n_groups, np.inf)
+    c_hi = np.full(n_groups, -np.inf)
+    np.minimum.at(c_lo, group_s, contact)
+    np.maximum.at(c_hi, group_s, contact)
+    cut_level = np.maximum(highest, c_hi)
+    need = np.isfinite(lowest) & (cut_level > np.minimum(lowest, c_lo))
+    if not need.any():
+        return False, None
+    in_s, in_e = need[group_s], need[group_e]
+    cut = np.where(in_s, cut_level[group_s], contact)
+    floor = np.minimum(contact, cut)
+    made = in_s & (cut - floor > thin)
+    bots[k - 1][ending] = np.where(in_e, cut_level[group_e], bottom)
+    upper_top = tops[0] if k == 1 else (bots[k - 2] if d._layer_grid[k - 2] == g_up else None)
+    if upper_top is not None and (bots[k - 1] > upper_top).any():
+        raise ValueError(f"Layer {k - 1} is too thin for a lower wedge under it; use wedge='upper'.")
+    if not made.any():
+        if given is not None:
+            tops[k][starting] = cut
+        return True, None
+    bot_above = np.full(len(d._columns), np.nan)
+    bot_above[up_cols] = bots[k - 1]
+    w_bot = bot_above[lo_cols]
+    w_bot[starting] = np.where(made, floor, cut)
+    w_top = None
+    if given is not None:
+        w_top = w_bot.copy()
+        w_top[starting] = cut
+    tops[k] = None
+    w_ido = np.full(len(lo_cols), -1, dtype=np.int64)
+    w_ido[np.flatnonzero(starting)[made]] = idos[k - 1][above[made]]
+    return True, (g_lo, w_top, w_bot, w_ido, k - 1)
+
+
 def _contact_groups(geoms, starting, ending, touch_area):
     """Join the columns that overlap in plan across a change of grid into groups.
 
@@ -940,6 +1095,12 @@ def _group_bottoms(group, bottom, weight, n_groups):
     agree = joined & (lowest == highest)
     level[agree] = lowest[agree]
     return level, lowest, highest
+
+
+def _coordinate_tolerance(grids):
+    """Coordinate roundoff of the grids, as used for their plan faces."""
+    coords = np.concatenate([shapely.get_coordinates(g.geometry.to_numpy()) for g in grids])
+    return 32 * np.finfo(float).eps * max(1.0, float(np.abs(coords).max()))
 
 
 def splice(base, fine, polygon):
