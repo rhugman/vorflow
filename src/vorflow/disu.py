@@ -26,6 +26,7 @@ implementation with its own pinch-out and sliver handling.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import geopandas as gpd
@@ -40,10 +41,11 @@ from ._columns import ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES
 from ._connect3d import concat_links, layered_links, overlay_links, staggered_links, vertical_links
 from ._disu_export import mf6_gridprops, mfusg_gridprops, mfusg_ksat, write_gsf
 
-__all__ = ["DisuGrid", "DisuOptions", "splice"]
+__all__ = ["DisuGrid", "DisuOptions", "refill", "splice"]
 
 CONNECTIVITY = ("full", "layered")
 CL12_MODES = ("plan", "connector")
+REFILL_PRIORITIES = ("resolution", "growth")
 
 
 @dataclass(frozen=True)
@@ -988,6 +990,206 @@ def splice(base, fine, polygon):
     if "node_id" not in outside:
         outside["node_id"] = outside["source_node_id"]
     return gpd.GeoDataFrame(pd.concat([outside, inside], ignore_index=True), crs=base.crs)
+
+
+def refill(base, polygon, resolution, *, growth_factor=None, fields=None, outline_split=1,
+           priority="resolution"):
+    """Re-mesh the inside of ``polygon`` with finer Voronoi cells that share the outline's vertices.
+
+    The outline must be made of cell faces in ``base``, which vorflow gives
+    when it is added as a barrier line (``add_line(..., is_barrier=True)``).
+    Cells outside stay exactly as in ``base``, so their columns continue
+    through every layer; the new cells inside end at the same outline
+    vertices, so every outline face is shared one to one (no hanging
+    vertices). Use the result for the layers that need the finer cells, as
+    with :func:`splice`.
+
+    Args:
+        base: The vorflow grid to start from.
+        polygon: The area to re-mesh: one polygon without holes.
+        resolution: Target cell size inside.
+        growth_factor: Cell-to-cell growth ratio (> 1) of the default
+            :class:`~vorflow.fields.GeometricGrowthField`, as in
+            ``add_polygon``: cells grow from ``resolution`` in the core to
+            the outline spacing at the outline. Defaults to 1.2. Ignored when
+            ``fields`` is given.
+        fields: List of size fields (``MeshField`` objects), as in
+            ``add_polygon``, applied outwards from a core of ``resolution``
+            cells. The core is inset from the outline by the distance at
+            which the fields reach 99 % of the outline spacing (at most half
+            the polygon's inradius), so each field must give its size with
+            ``python_size`` (the built-in growth fields do).
+        outline_split: Split every outline face into this many faces on the
+            inside, so the cells along the outline start finer (e.g. 2 for
+            half the outline spacing). The base vertices are still shared;
+            the extra ones are hanging vertices on the outside cells' faces,
+            as in a quadtree grid.
+        priority: What gives way when the fields cannot grow from
+            ``resolution`` to the outline spacing within half the inradius.
+            ``"resolution"`` (default) keeps the core at ``resolution`` and
+            warns, since the cells then jump in size at the outline;
+            ``"growth"`` makes the core cells larger, just enough for a
+            smooth grading.
+
+    Returns the spliced grid (base cells outside, new cells inside, with
+    ``splice_source`` and ``source_node_id`` as in :func:`splice`). Its
+    ``attrs["refill"]`` holds the number of new cells, the outline spacing,
+    the core cell size, the size the fields reach at the outline and the
+    largest area ratio between neighbouring new cells.
+    """
+    from . import _refill
+    from .blueprint import _validate_growth_factor
+    from .fields import DEFAULT_GROWTH_FACTOR, GeometricGrowthField, MeshField
+
+    if not np.isfinite(resolution) or resolution <= 0:
+        raise ValueError(f"resolution must be a positive number, got {resolution!r}.")
+    growth_factor = _validate_growth_factor(growth_factor)
+    if fields is None:
+        fields = [GeometricGrowthField(growth_factor or DEFAULT_GROWTH_FACTOR)]
+    fields = list(fields)
+    if not fields or not all(isinstance(f, MeshField) for f in fields):
+        raise ValueError("fields must be a non-empty list of MeshField objects.")
+    if isinstance(outline_split, bool) or int(outline_split) != outline_split or outline_split < 1:
+        raise ValueError(f"outline_split must be a positive integer, got {outline_split!r}.")
+    if priority not in REFILL_PRIORITIES:
+        raise ValueError(f"priority must be one of {REFILL_PRIORITIES}, got {priority!r}.")
+    polygon = shapely.make_valid(polygon)
+    if polygon.geom_type != "Polygon" or len(polygon.interiors):
+        raise ValueError("refill takes one polygon without holes; call it once per area.")
+    ring = polygon.exterior
+    geoms = base.geometry.to_numpy()
+    area = shapely.area(geoms)
+    inside = shapely.area(shapely.intersection(geoms, polygon))
+    crossing = (inside > 1e-9 * area) & (area - inside > 1e-9 * area)
+    if crossing.any():
+        raise ValueError(
+            f"{int(crossing.sum())} base cells cross the refill outline; add the outline as a barrier "
+            "line (is_barrier=True) so it becomes cell faces."
+        )
+    tolerance = 1e-7 * ring.length
+    touching = geoms[shapely.dwithin(geoms, ring, tolerance)]
+    base_nodes = _refill.outline_nodes(touching, ring, tolerance)
+    nodes = _refill.subdivide_outline(base_nodes, int(outline_split))
+    sites_in, sites_out, centres, radii = _refill.mirrored_sites(nodes, polygon)
+    segment = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=1)
+    spacing = float(np.median(segment))
+    core_size, inset, size_at_outline = _refill_core(polygon, spacing, float(resolution), fields, priority)
+    candidates = _refill_mesh_nodes(polygon, spacing, core_size, inset, fields)
+    fill = _refill.fill_nodes(candidates, centres, radii, np.vstack([sites_in, sites_out]),
+                              min(float(resolution), spacing))
+    generators = np.vstack([sites_in, fill, sites_out])
+    n = len(nodes)
+    own_site = [(i, (i + 1) % n) for i in range(n)]
+    own = own_site + [(-1, -1)] * len(fill) + own_site
+    _refill.check_circles(generators, centres, radii, own)
+    keep = np.arange(n + len(fill))
+    cells = _refill.voronoi_cells(generators, polygon, keep, nodes, tolerance)
+    new = gpd.GeoDataFrame({"x": generators[keep, 0], "y": generators[keep, 1]}, geometry=cells, crs=base.crs)
+    new_nodes = _refill.outline_nodes(cells, ring, tolerance)
+    shared = _shared_points(base_nodes, new_nodes, tolerance)
+    if shared < len(base_nodes):
+        raise ValueError(
+            f"refill: only {shared} of the {len(base_nodes)} outline vertices are shared; please report this."
+        )
+    result = splice(base, new, polygon)
+    result.attrs["refill"] = {
+        "cells": len(new), "outline_vertices": len(base_nodes), "outline_spacing": spacing,
+        "core_size": core_size, "size_at_outline": size_at_outline,
+        "max_neighbour_area_ratio": _max_neighbour_ratio(cells),
+    }
+    return result
+
+
+def _shared_points(a, b, tolerance):
+    """How many points of ``a`` have a point of ``b`` within ``tolerance``."""
+    from scipy.spatial import cKDTree
+
+    distance, _ = cKDTree(b).query(a)
+    return int((distance <= tolerance).sum())
+
+
+def _field_size(fields, distance, spacing, core_size):
+    """Size the fields (their minimum) ask for at ``distance`` from a core of ``core_size`` cells."""
+    sizes = [f.python_size(np.asarray(distance), spacing, core_size) for f in fields]
+    if any(s is None for s in sizes):
+        raise ValueError("refill needs fields that give their size with python_size().")
+    return float(np.min(sizes))
+
+
+def _refill_core(polygon, spacing, resolution, fields, priority):
+    """Core cell size, its inset from the outline, and the size the fields reach at the outline.
+
+    The inset is where the fields reach 99 % of ``spacing``, at most half the
+    polygon's inradius. If they cannot reach it there, ``"growth"`` raises
+    the core size by bisection until they do; ``"resolution"`` keeps it and
+    warns.
+    """
+    if resolution >= spacing:
+        return resolution, 0.0, spacing
+    cap = 0.5 * shapely.length(shapely.maximum_inscribed_circle(polygon))
+    target = 0.99 * spacing
+    core_size = resolution
+    reached = _field_size(fields, cap, spacing, resolution)
+    if reached < target:
+        if priority == "growth" and _field_size(fields, cap, spacing, spacing) >= target:
+            lo, hi = resolution, spacing
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                lo, hi = (mid, hi) if _field_size(fields, cap, spacing, mid) < target else (lo, mid)
+            core_size = hi
+        else:
+            warnings.warn(
+                f"refill: growing from {resolution:.3g}, the fields reach only {reached:.3g} at the outline, "
+                f"whose spacing is {spacing:.3g}, so cells jump in size there. Use priority='growth' for "
+                "larger core cells, a larger growth_factor, or outline_split for a finer outline.",
+                UserWarning, stacklevel=3,
+            )
+    inset = _refill_inset(fields, spacing, core_size, cap)
+    return core_size, inset, min(_field_size(fields, inset, spacing, core_size), spacing)
+
+
+def _refill_inset(fields, spacing, core_size, cap):
+    """Smallest distance at which ``fields`` reach 99 % of ``spacing``, at most ``cap``."""
+    target = 0.99 * spacing
+    if _field_size(fields, cap, spacing, core_size) < target:
+        return cap
+    lo, hi = 0.0, cap
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if _field_size(fields, mid, spacing, core_size) < target else (lo, mid)
+    return hi
+
+
+def _refill_mesh_nodes(polygon, spacing, core_size, inset, fields):
+    """Gmsh nodes filling ``polygon``: ``spacing`` at the outline, graded by ``fields`` to ``core_size`` inside."""
+    from ._log import verbosity_scope
+    from .blueprint import ConceptualMesh
+    from .engine import MeshGenerator
+
+    with verbosity_scope(0):
+        cm = ConceptualMesh()
+        cm.add_polygon(polygon, zone_id=1, resolution=max(spacing, core_size))
+        if core_size < spacing:
+            core = polygon.buffer(-inset, join_style="mitre")
+            if not core.is_empty:
+                cm.add_polygon(core, zone_id=2, resolution=core_size, embed=False, fields=fields)
+        mg = MeshGenerator(background_lc=max(spacing, core_size), conceptual_mesh=cm, verbosity=0)
+        mg.generate()
+    return np.asarray(mg.nodes, dtype=float)[:, :2]
+
+
+def _max_neighbour_ratio(cells):
+    """Largest area ratio between two cells that share a face."""
+    cells = np.asarray(cells)
+    area = shapely.area(cells)
+    i, j = shapely.STRtree(cells).query(cells, predicate="touches")
+    pair = i < j
+    i, j = i[pair], j[pair]
+    shared = shapely.length(shapely.intersection(cells[i], cells[j]))
+    i, j = i[shared > 0], j[shared > 0]
+    if not len(i):
+        return 1.0
+    return float((np.maximum(area[i], area[j]) / np.minimum(area[i], area[j])).max())
 
 
 def _layer_inputs(grids, top, botm, idomain):
