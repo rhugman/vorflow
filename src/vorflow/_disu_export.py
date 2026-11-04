@@ -110,6 +110,22 @@ def mfusg_gridprops(nodes, nlay, top, bot, area, layer, links):
     }
 
 
+def mfusg_ksat(nodes, links, k, k33):
+    """Per-entry K for MODFLOW-USG ``ikcflag=1``, in the ``ja`` order of ``mfusg_gridprops``.
+
+    Each link gets the distance-weighted harmonic mean of its two nodes' K
+    (``k33`` for vertical links); each diagonal entry its node's ``k``.
+    """
+    vertical = links["ihc"] == 0
+    k_n = np.where(vertical, k33[links["n"]], k[links["n"]])
+    k_m = np.where(vertical, k33[links["m"]], k[links["m"]])
+    ksat = (links["cl_n"] + links["cl_m"]) / (links["cl_n"] / k_n + links["cl_m"] / k_m)
+    # Same row order as the DISU arrays: carry ksat through _csr in place of fahl.
+    entries, _ = _csr(nodes, {**links, "fahl": ksat}, np.zeros(nodes, dtype=np.int64))
+    is_diagonal = entries["row"] == entries["col"]
+    return np.where(is_diagonal, k[entries["row"]], entries["fahl"])
+
+
 def write_gsf(filepath, planar, icpl, top, bot, layer, nlay):
     """Original 3D GSF: one top and one bottom vertex ring per node, all IDs one-based."""
     xy = np.asarray(planar["vertices"])[:, 1:]

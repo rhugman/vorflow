@@ -36,7 +36,7 @@ import shapely
 from . import _columns
 from ._columns import ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES
 from ._connect3d import concat_links, layered_links, staggered_links, vertical_links
-from ._disu_export import mf6_gridprops, mfusg_gridprops, write_gsf
+from ._disu_export import mf6_gridprops, mfusg_gridprops, mfusg_ksat, write_gsf
 
 __all__ = ["DisuGrid", "DisuOptions"]
 
@@ -225,6 +225,13 @@ class DisuGrid:
         the face width times its (merged) overlap height. MODFLOW-USG has no
         XT3D; offset layers rely on the two-point formulation.
 
+        As with Gridgen, MODFLOW-USG divides a horizontal ``fahl`` by the mean
+        thickness of the two cells and uses the harmonic mean of K times
+        thickness, which is exact only when both cells are equally thick. For
+        staggered connections between cells of unequal thickness (wedges,
+        sublayers, pinch-outs), use ``MfUsgLpf(ikcflag=1, ksat=...)`` with
+        :meth:`get_mfusg_ksat`.
+
         MODFLOW-USG needs at least one node in every layer, so a layer with no
         active cell (for example one pinched out everywhere) raises ValueError.
         """
@@ -233,6 +240,42 @@ class DisuGrid:
             self.nodes, self.nlay, self._node_top, self._node_bot, self._area[self._node_cell],
             self._node_layer, self.links,
         )
+
+    def get_mfusg_ksat(self, k, k33=None):
+        """Hydraulic conductivity per connection, for ``flopy.mfusg.MfUsgLpf(ikcflag=1, ksat=...)``.
+
+        With ``ikcflag=1`` MODFLOW-USG computes every conductance as
+        ``fahl * ksat / (cl1 + cl2)``, so the conductance follows the shared
+        face area also between cells of unequal thickness. ``ksat`` is the
+        distance-weighted harmonic mean of the two cells' K (``k33`` for
+        vertical connections), which gives MODFLOW 6's conductance.
+
+        Use it with confined layers (``laytyp=0``) or convertible layers with
+        upstream weighting (``laytyp=4``); both are exact while the cells are
+        saturated. With a water table inside cells of unequal thickness,
+        ``laytyp=4`` divides the face area by their mean thickness again.
+        MODFLOW-USG and USG-Transport do not allow ``laytyp=1`` with
+        ``ikcflag=1``; USG-Transport only warns and runs on with wrong
+        conductances.
+
+        Parameters
+        ----------
+        k : float or array_like of shape (nodes,)
+            Horizontal hydraulic conductivity per active node.
+        k33 : float or array_like of shape (nodes,), optional
+            Vertical hydraulic conductivity; ``k`` if omitted.
+
+        Returns
+        -------
+        numpy.ndarray
+            One value per entry of the ``ja`` array from
+            :meth:`get_gridprops_mfusg_disu` (the node's own K on the
+            diagonal, which MODFLOW-USG does not read).
+        """
+        self._require_build()
+        k = _node_values(k, self.nodes, "k")
+        k33 = k if k33 is None else _node_values(k33, self.nodes, "k33")
+        return mfusg_ksat(self.nodes, self.links, k, k33)
 
     def write_gsf(self, filepath):
         """Write the grid specification file (GSF) used by MODFLOW-USG post-processors."""
@@ -507,6 +550,17 @@ class DisuGrid:
     def _require_build(self):
         if self.nodemap is None:
             raise RuntimeError("Call build() first.")
+
+
+def _node_values(values, nodes, name):
+    """Positive finite values, one per active node (a scalar applies to all)."""
+    try:
+        values = np.broadcast_to(np.asarray(values, dtype=float), (nodes,)).copy()
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a number or have shape ({nodes},).") from error
+    if not (np.isfinite(values).all() and (values > 0).all()):
+        raise ValueError(f"{name} must hold positive finite values.")
+    return values
 
 
 def _offset_ratio(status, top_l, bot_l, faces):

@@ -69,3 +69,34 @@ def test_disu5_side_areas_cover_the_walls_of_a_dipping_aquifer():
     inner = (layer >= 3) & (layer <= 5) & (x > 1) & (x < 10)        # Aquifer cells away from the ends.
     np.testing.assert_allclose(side[inner], 2 * 1.0 * thickness[inner])
     np.testing.assert_allclose(below[inner], 2 * 1.0)             # 1 m2 above and below.
+
+
+@pytest.mark.parametrize("right, overlap", [((9.0, 11.0), 1.0), ((9.0, 10.0), 1.0), ((9.5, 10.0), 0.5),
+                                            ((5.0, 10.0), 5.0)])
+def test_ksat_gives_the_overlap_conductance_with_ikcflag_1(right, overlap):
+    # Cells [0, 10] and `right`, 1 m wide, centres 1 m apart, K = 2. With ikcflag=1, MODFLOW-USG
+    # computes fahl * ksat / (cl1 + cl2); without it, fahl / mean thickness * harmonic(K b) / (cl1 + cl2).
+    bottom, top = right
+    d = disu.DisuGrid(_grid(nx=2, ny=1), [10.0, top], [[0.0, bottom]]).build()
+    props = d.get_gridprops_mfusg_disu()
+    ksat = d.get_mfusg_ksat(2.0)
+    assert ksat.shape == props["ja"].shape
+    i = int(np.flatnonzero(props["ja"] == 1)[0])          # Row 0, entry for node 1.
+    fahl, cl = props["fahl"][i], props["cl12"][i] + props["cl12"][props["iac"][0] + 1]
+    np.testing.assert_allclose(fahl * ksat[i] / cl, 2.0 * overlap)
+    b = np.array([10.0, top - bottom])
+    default = fahl / b.mean() * 2.0 * (2.0 * b[0] * 2.0 * b[1] / (2.0 * b[0] + 2.0 * b[1])) / cl
+    assert default < 2.0 * overlap
+
+
+def test_ksat_is_the_distance_weighted_harmonic_mean():
+    d = disu.DisuGrid(_grid(nx=2, ny=1, widths=[1.0, 3.0]), 10.0, [6.0, 0.0]).build()
+    props = d.get_gridprops_mfusg_disu()
+    k = np.array([1.0, 4.0, 1.0, 4.0])
+    ksat = dict(zip(zip(np.repeat(np.arange(d.nodes), props["iac"]), props["ja"]), d.get_mfusg_ksat(k, k33=k / 10)))
+    a, b, below = d.nodemap[0, 0], d.nodemap[0, 1], d.nodemap[1, 0]
+    assert ksat[a, a] == 1.0 and ksat[b, b] == 4.0
+    np.testing.assert_allclose(ksat[a, b], 2.0 / (0.5 / 1.0 + 1.5 / 4.0))   # cl 0.5 and 1.5
+    np.testing.assert_allclose(ksat[a, below], 0.1)                          # vertical: k33
+    with pytest.raises(ValueError, match="k must hold positive"):
+        d.get_mfusg_ksat([1.0, -1.0, 1.0, 1.0])
