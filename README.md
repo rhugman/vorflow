@@ -392,7 +392,7 @@ install it outside the notebook with `get-modflow /path/to/bin --subset mfusg`.
 ### Fully unstructured DISU (full connectivity)
 
 `vorflow.disu` turns a vorflow grid and FloPy-style layer arrays into a fully
-unstructured DISU grid for MODFLOW 6. Layers can follow dipping or undulating
+unstructured DISU grid for MODFLOW 6 or MODFLOW-USG. Layers can follow dipping or undulating
 surfaces: cells whose shared faces overlap vertically are connected even when
 they are in different layers ("full connectivity", Provost et al. 2025).
 
@@ -414,6 +414,10 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
 - **XT3D:** use it with offset layers, and give NPF `angle2` and `angle3`
   (zeros are fine). Without them MODFLOW 6 XT3D ignores the vertical
   offsets. `connectivity="layered"` gives the DISV connections instead.
+- **MODFLOW-USG:** `get_gridprops_mfusg_disu()` for `flopy.mfusg.MfUsgDisU`
+  and `write_gsf()`. USG has no XT3D but still gains from the extra
+  connections. Between cells of unequal thickness its default conductance is
+  too small; `MfUsgLpf(ikcflag=1, ksat=d.get_mfusg_ksat(k))` makes it exact.
 - **Tracking:** `nodemap`, `cellmap`, `to_nodes`, `to_layers`,
   `locate(x, y, z)` and `column(x, y)`. FloPy reads the layer number from the
   IHC diagonal, so `PlotMapView(modelgrid=gwf.modelgrid, layer=k)` works
