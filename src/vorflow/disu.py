@@ -30,9 +30,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import shapely
 
 from . import _columns
-from ._columns import ACTIVE, STATUS_NAMES
+from ._columns import ACTIVE, PASSTHROUGH, STATUS_NAMES
 from ._connect3d import concat_links, layered_links, staggered_links, vertical_links
 from ._disu_export import mf6_gridprops
 
@@ -191,6 +192,63 @@ class DisuGrid:
             self._node_layer, self.links, self._planar, self._node_cell,
         )
 
+    def to_nodes(self, values):
+        """Pick the values of the active cells, in DISU node order.
+
+        ``values`` is shaped like ``botm``: ``(nlay, ncpl)``, or a list with one
+        array (or scalar) per layer.
+        """
+        self._require_build()
+        return np.stack(self._per_layer(values, "values"))[self.nodemap >= 0]
+
+    def to_layers(self, values, fill=np.nan):
+        """Spread per-node values back to ``(nlay, ncpl)``, with ``fill`` for removed cells."""
+        self._require_build()
+        values = np.asarray(values).ravel()
+        if values.shape != (self.nodes,):
+            raise ValueError(f"values must have {self.nodes} entries, one per node.")
+        layers = np.full(self.nodemap.shape, fill, dtype=np.result_type(values, np.asarray(fill)))
+        layers[self.nodemap >= 0] = values
+        return layers
+
+    @property
+    def idomain_layers(self):
+        """Each layer's cells in MODFLOW 6 idomain codes: 1 active, -1 pass-through, 0 no-flow.
+
+        Shaped like ``nodemap``, so it plots like a DISV idomain. MODFLOW 6
+        DISU itself only accepts 0 and 1; this map is for tracking and plotting.
+        """
+        self._require_build()
+        codes = np.zeros(len(STATUS_NAMES), dtype=np.int64)
+        codes[ACTIVE], codes[PASSTHROUGH] = 1, -1
+        return codes[self.status]
+
+    def column(self, x, y):
+        """Active DISU nodes at plan point ``(x, y)``, from the top down."""
+        self._require_build()
+        cell = self._cells_at(np.atleast_1d(float(x)), np.atleast_1d(float(y)))[0]
+        if cell < 0:
+            return np.zeros(0, dtype=np.int64)
+        nodes = self.nodemap[:, cell]
+        return nodes[nodes >= 0]
+
+    def locate(self, x, y, z):
+        """DISU node containing each point ``(x, y, z)``, or -1 outside every active cell.
+
+        Uses the cell elevations after pass-through gaps are closed, so a
+        point in a collapsed pass-through cell maps to the active cell that
+        took its interval. Accepts scalars or arrays.
+        """
+        self._require_build()
+        x, y, z = (np.atleast_1d(np.asarray(v, dtype=float)) for v in (x, y, z))
+        cell = self._cells_at(x, y)
+        node = np.where(cell >= 0, self.nodemap[:, np.maximum(cell, 0)], -1)    # (nlay, npoints)
+        safe = np.maximum(node, 0)
+        hit = (node >= 0) & (self._node_bot[safe] <= z) & (z <= self._node_top[safe])
+        # From the top down: on a shared top and bottom the upper cell wins.
+        found = np.where(hit.any(axis=0), node[np.argmax(hit, axis=0), np.arange(len(x))], -1)
+        return found if found.size > 1 else int(found[0])
+
     def report(self):
         """Plain-text summary of the grid and its connections."""
         self._require_build()
@@ -236,6 +294,28 @@ class DisuGrid:
                 "without them MODFLOW 6 XT3D ignores the vertical offsets."
             )
         return "\n".join(lines)
+
+    def _per_layer(self, values, name):
+        """Split values shaped like ``botm`` into one ``(ncpl,)`` array per layer."""
+        if isinstance(values, (list, tuple)):
+            if len(values) != self.nlay:
+                raise ValueError(f"{name} needs one entry per layer ({self.nlay}).")
+            parts = values
+        else:
+            values = np.asarray(values)
+            if values.ndim != 2 or values.shape[0] != self.nlay:
+                raise ValueError(f"{name} must be shaped like botm.")
+            parts = list(values)
+        return [np.broadcast_to(np.asarray(part), (len(self._grid),)) for part in parts]
+
+    def _cells_at(self, x, y):
+        """The plan cell containing each point (-1 outside); the first cell wins on shared edges."""
+        if not hasattr(self, "_tree"):
+            self._tree = shapely.STRtree(self._grid.geometry.to_numpy())
+        found = np.full(len(x), -1, dtype=np.int64)
+        point, hit = self._tree.query(shapely.points(np.column_stack([x, y])), predicate="intersects")
+        found[point[::-1]] = hit[::-1]
+        return found
 
     def _cellmap(self, top_l, bot_l):
         grid = self._grid
