@@ -38,7 +38,7 @@ from ._columns import ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES
 from ._connect3d import concat_links, layered_links, staggered_links, vertical_links
 from ._disu_export import mf6_gridprops, mfusg_gridprops, mfusg_ksat, write_gsf
 
-__all__ = ["DisuGrid", "DisuOptions"]
+__all__ = ["DisuGrid", "DisuOptions", "splice"]
 
 CONNECTIVITY = ("full", "layered")
 CL12_MODES = ("plan", "connector")
@@ -550,6 +550,56 @@ class DisuGrid:
     def _require_build(self):
         if self.nodemap is None:
             raise RuntimeError("Call build() first.")
+
+
+def splice(base, fine, polygon):
+    """A plan grid with ``base`` cells outside ``polygon`` and ``fine`` cells inside it.
+
+    Both grids must have the polygon outline as cell faces, which vorflow
+    gives when the outline is added as a barrier line
+    (``add_line(..., is_barrier=True)``) in the blueprint of both. No cell may
+    cross the outline. The nodes along the outline need not match: the
+    connections there come from the shared face segments (hanging nodes).
+
+    The base cells are kept unchanged, so in :class:`DisuGrid` they continue
+    the base grid's columns. Fine cells get new ``node_id`` values after the
+    base ones; ``splice_source`` and ``source_node_id`` record their origin.
+    """
+    for name, grid in (("base", base), ("fine", fine)):
+        missing = {"geometry", "x", "y"}.difference(grid.columns)
+        if missing:
+            raise ValueError(f"{name} grid missing required columns: {sorted(missing)}.")
+    polygon = shapely.make_valid(polygon)
+    parts = []
+    for name, grid, keep_inside in (("base", base, False), ("fine", fine, True)):
+        geoms = grid.geometry.to_numpy()
+        area = shapely.area(geoms)
+        inside = shapely.area(shapely.intersection(geoms, polygon))
+        tolerance = 1e-9 * area
+        crossing = (inside > tolerance) & (area - inside > tolerance)
+        if crossing.any():
+            raise ValueError(
+                f"{int(crossing.sum())} {name} cells cross the splice outline; add the outline as a "
+                "barrier line (is_barrier=True) so it becomes cell faces."
+            )
+        selected = grid[(inside > tolerance) == keep_inside].copy()
+        selected["splice_source"] = name
+        selected["source_node_id"] = (selected["node_id"].to_numpy() if "node_id" in selected
+                                      else np.flatnonzero((inside > tolerance) == keep_inside))
+        parts.append(selected)
+    outside, inside = parts
+    inside_area, polygon_area = inside.geometry.area.sum(), polygon.intersection(
+        shapely.union_all(base.geometry.to_numpy())).area
+    if abs(inside_area - polygon_area) > 1e-9 * max(polygon_area, 1.0):
+        raise ValueError(
+            f"Fine cells cover {inside_area:.6g} of the {polygon_area:.6g} splice area; the fine grid "
+            "must cover the whole area inside the outline."
+        )
+    start = int(outside["node_id"].max()) + 1 if "node_id" in outside and len(outside) else 0
+    inside["node_id"] = np.arange(start, start + len(inside))
+    if "node_id" not in outside:
+        outside["node_id"] = outside["source_node_id"]
+    return gpd.GeoDataFrame(pd.concat([outside, inside], ignore_index=True), crs=base.crs)
 
 
 def _node_values(values, nodes, name):
