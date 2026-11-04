@@ -418,6 +418,19 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
   and `write_gsf()`. USG has no XT3D but still gains from the extra
   connections. Between cells of unequal thickness its default conductance is
   too small; `MfUsgLpf(ikcflag=1, ksat=d.get_mfusg_ksat(k))` makes it exact.
+- **Finer cells at depth:** pass one grid per layer, e.g.
+  `DisuGrid([base, base, pit, pit], top, [b0, b1, b2, b3])` with
+  `pit = disu.splice(base, fine, polygon)`: base cells outside the polygon,
+  fine cells inside. The outline must be cell faces in both grids
+  (`add_line(outline, is_barrier=True)`); its vertices need not match. The
+  contact where the grid changes is made gap-free. A change of grid at depth
+  suits near-vertical features; for subhorizontal ones use the same grid in
+  every layer. The cells on either side of a spliced outline are not mirror
+  images of each other, so faces there can be far from orthogonal
+  (`report()` gives the largest error).
+- **Dipping contacts at a change of grid:** where fine cells straddle coarse
+  ones, the gap-free contact under a refinement is one flat level, which
+  moves the bottoms above it; `report()` says by how much.
 - **Tracking:** `nodemap`, `cellmap`, `to_nodes`, `to_layers`,
   `locate(x, y, z)` and `column(x, y)`. FloPy reads the layer number from the
   IHC diagonal, so `PlotMapView(modelgrid=gwf.modelgrid, layer=k)` works

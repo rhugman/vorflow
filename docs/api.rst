@@ -65,6 +65,7 @@ vorflow grids and FloPy-style layer arrays; import it as
    :nosignatures:
 
    DisuGrid
+   splice
 
 Grid quality and utilities
 --------------------------

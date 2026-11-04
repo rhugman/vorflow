@@ -30,13 +30,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and inexact. `connectivity="layered"` gives the DISV connections.
   - Pass-through cells (idomain -1, or no thicker than `min_thickness`) are
     removed without leaving gaps (`collapse`); idomain 0 stays no-flow.
+  - Layers can use different plan grids, joined by their plan overlaps
+    (`splice(base, fine, polygon)` joins grids made separately). Contacts
+    where the grid changes are gap-free: cells that overlap across them
+    share one elevation (the area-weighted mean of the bottoms above).
   - `to_nodes`, `to_layers`, `locate`, `column` and `save_cellmap` track
     cells; `idomain_layers`, `layer_view` and `vertex_grid` give per-layer
     status maps and 2D views for FloPy plots; `from_disv()` reads existing
     DISV models.
   - `nodemap` and `cellmap` map nodes to layers and plan cells; `report()`
-    gives the offset ratio from the paper and the reminder that MF6 XT3D
-    needs NPF `angle2`/`angle3` to account for vertical offsets.
+    gives the offset ratio from the paper, how far a contact at a change of
+    grid moved the bottoms above it, and the reminder that MF6 XT3D needs
+    NPF `angle2`/`angle3` to account for vertical offsets.
 - `ConceptualMesh.check(background_lc=None)` reports input defects that tend
   to produce bad Voronoi cells, before meshing and without Gmsh: short
   segments, close vertices (including a line crossing a polygon edge beside a
