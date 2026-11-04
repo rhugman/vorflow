@@ -126,11 +126,13 @@ def _straight_face(shared, centres, pair, tolerance):
         raise ValueError(f"Centres must lie on opposite sides of the shared face for cells {pair}.")
     delta = centres[1] - centres[0]
     angle = np.degrees(np.arccos(np.clip(abs(delta @ normal) / np.linalg.norm(delta), 0, 1)))
+    outward = normal if signed[1] > 0 else -normal  # From cell_1 towards cell_2.
     return {
         "cell_id_1": pair[0], "cell_id_2": pair[1],
         "shared_length": sum(part.length for part in parts),
         "distance_1": abs(signed[0]), "distance_2": abs(signed[1]),
         "ortho_error": float(angle),
+        "normal_x": float(outward[0]), "normal_y": float(outward[1]),
     }
 
 
@@ -155,8 +157,8 @@ def _planar_faces(gdf):
 
     Returns ``(planar, area, faces, tolerance)``. ``faces`` has one row per
     pair of cells sharing a straight face of positive length, with the face
-    length, each centre's perpendicular distance to it and the orthogonality
-    error.
+    length, each centre's perpendicular distance to it, the orthogonality
+    error and the unit normal pointing from ``cell_id_1`` to ``cell_id_2``.
     """
     # Local import avoids a cycle with the thin public wrappers in utils.
     from .utils import grid_to_disv
@@ -211,6 +213,7 @@ def _planar_faces(gdf):
             records.append(record)
     faces = pd.DataFrame(records, columns=[
         "cell_id_1", "cell_id_2", "shared_length", "distance_1", "distance_2", "ortho_error",
+        "normal_x", "normal_y",
     ])
     if len(faces):
         logger.info("Grid export: %s horizontal faces; maximum orthogonality error %.6g degrees",
