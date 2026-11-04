@@ -6,10 +6,22 @@ unpack :meth:`DisuGrid.get_gridprops_mf6_disu` into ``flopy.mf6.ModflowGwfdisu``
 as with ``flopy.utils.gridgen.Gridgen``. vorflow reads no rasters and writes
 no model files.
 
+Full connectivity (vertically staggered horizontal connections between cells
+in different layers) follows the algorithm of C. D. Langevin's USGS
+``disv2disu.py``, published with
+
+    Provost, A.M., Bardot, K., Langevin, C.D. and McCallum, J.L. (2025).
+    Accurate simulation of flow through dipping aquifers with MODFLOW 6 using
+    enhanced cell connectivity. Groundwater 63(3), 399-408.
+    https://doi.org/10.1111/gwat.13459 (code: https://doi.org/10.5066/P13BNARA)
+
+and motivated by Bardot, K., Lesueur, M., Siade, A.J. and McCallum, J.L.
+(2023), Revisiting MODFLOW's capability to model flow through sedimentary
+structures, Groundwater 61, 663-673 (https://doi.org/10.1111/gwat.13273).
 Vertical pass-through of pinched cells follows LoopFlopy
 (https://github.com/kerrybardot/loopflopy; Bardot et al. 2025, Environmental
 Modelling & Software 192, 106557). This module is an independent, vectorised
-implementation with its own pinch-out handling.
+implementation with its own pinch-out and sliver handling.
 """
 
 from __future__ import annotations
@@ -21,12 +33,13 @@ import pandas as pd
 
 from . import _columns
 from ._columns import ACTIVE, STATUS_NAMES
-from ._connect3d import concat_links, layered_links, vertical_links
+from ._connect3d import concat_links, layered_links, staggered_links, vertical_links
 from ._disu_export import mf6_gridprops
 
 __all__ = ["DisuGrid", "DisuOptions"]
 
-CONNECTIVITY = ("layered",)
+CONNECTIVITY = ("full", "layered")
+CL12_MODES = ("plan", "connector")
 
 
 @dataclass(frozen=True)
@@ -35,16 +48,21 @@ class DisuOptions:
 
     min_thickness: float = 0.0
     collapse: str | None = "split"
-    connectivity: str = "layered"
+    connectivity: str = "full"
+    sliver_abs_tol: float = 0.0
+    cl12: str = "plan"
 
     def __post_init__(self):
-        value = self.min_thickness
-        if isinstance(value, bool) or not np.isfinite(value) or value < 0:
-            raise ValueError(f"min_thickness must be a finite number >= 0, got {value!r}.")
+        for name in ("min_thickness", "sliver_abs_tol"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite number >= 0, got {value!r}.")
         if self.collapse not in _columns.COLLAPSE_MODES:
             raise ValueError(f"collapse must be one of {_columns.COLLAPSE_MODES}, got {self.collapse!r}.")
         if self.connectivity not in CONNECTIVITY:
             raise ValueError(f"connectivity must be one of {CONNECTIVITY}, got {self.connectivity!r}.")
+        if self.cl12 not in CL12_MODES:
+            raise ValueError(f"cl12 must be one of {CL12_MODES}, got {self.cl12!r}.")
 
 
 class DisuGrid:
@@ -63,8 +81,17 @@ class DisuGrid:
             below, ``"up"``/``"down"`` gives it to one side, and ``None`` keeps
             the gap, as MODFLOW 6 and LoopFlopy do. With a gap-free column the
             vertical connection lengths are exact and no thickness is lost.
-        connectivity: ``"layered"`` reproduces DISV connectivity (same-layer
-            neighbours only).
+        connectivity: ``"full"`` adds vertically staggered connections between
+            offset neighbours (IHC=2); ``"layered"`` reproduces DISV
+            connectivity (same-layer neighbours only).
+        sliver_abs_tol: Optional merging of small pieces, off by default
+            (0). A piece of a side face thinner than ``sliver_abs_tol`` is
+            given to the pieces above and below it. Merging gives fewer
+            connections but moves face area between cells, so results are no
+            longer exact; the default keeps every piece, and MODFLOW handles
+            tiny ones fine.
+        cl12: ``"plan"`` (perpendicular plan distance to the face, as in the
+            paper; exact for XT3D) or ``"connector"``.
 
     After :meth:`build`, ``nodemap`` is an ``(nlay, ncpl)`` array mapping
     ``(layer, cell)`` to the DISU node (-1 for removed cells), and ``cellmap``
@@ -72,8 +99,11 @@ class DisuGrid:
     """
 
     def __init__(self, grid, top, botm, idomain=None, *, min_thickness=0.0, collapse="split",
-                 connectivity="layered"):
-        self.options = DisuOptions(min_thickness=min_thickness, collapse=collapse, connectivity=connectivity)
+                 connectivity="full", sliver_abs_tol=0.0, cl12="plan"):
+        self.options = DisuOptions(
+            min_thickness=min_thickness, collapse=collapse, connectivity=connectivity,
+            sliver_abs_tol=sliver_abs_tol, cl12=cl12,
+        )
         missing = {"geometry", "x", "y"}.difference(getattr(grid, "columns", ()))
         if missing:
             raise ValueError(f"grid missing required columns: {sorted(missing)}.")
@@ -116,11 +146,20 @@ class DisuGrid:
         self._node_top, self._node_bot = top_l[active], bot_l[active]
         self._node_layer, self._node_cell = np.nonzero(active)
 
-        self.links = concat_links(
-            vertical_links(status, nodemap, top_l, bot_l, self._area),
-            layered_links(status, nodemap, self._faces, top_l, bot_l),
-        )
-        self.diagnostics = {"max_ortho_error": self._connected_ortho_error()}
+        self.diagnostics = {"slivers_merged": 0, "largest_sliver": 0.0}
+        vertical = vertical_links(status, nodemap, top_l, bot_l, self._area)
+        if opts.connectivity == "full":
+            centres = self._grid[["x", "y"]].to_numpy(dtype=float)
+            horizontal, found = staggered_links(
+                status, nodemap, top_l, bot_l, self._faces, centres, sliver_abs_tol=opts.sliver_abs_tol,
+                cl12=opts.cl12,
+            )
+            self.diagnostics.update(found)
+        else:
+            horizontal = layered_links(status, nodemap, self._faces, top_l, bot_l)
+        self.links = concat_links(vertical, horizontal)
+        self.diagnostics.update(_offset_ratio(status, top_l, bot_l, self._faces))
+        self.diagnostics["max_ortho_error"] = self._connected_ortho_error()
         self.nodemap = nodemap
         self.cellmap = self._cellmap(top_l, bot_l)
         return self
@@ -156,7 +195,7 @@ class DisuGrid:
         """Plain-text summary of the grid and its connections."""
         self._require_build()
         counts = {STATUS_NAMES[code]: int((self.status == code).sum()) for code in STATUS_NAMES}
-        ihc = np.bincount(self.links["ihc"], minlength=2)
+        ihc = np.bincount(self.links["ihc"], minlength=3)
         # Thickness each node takes from collapsed pass-through intervals.
         gained = (self._node_top - self._node_bot) - (self.top_l - self.bot_l)[self.status == ACTIVE]
         gained = float(gained.max()) if len(gained) else 0.0
@@ -166,11 +205,36 @@ class DisuGrid:
             f"{counts['noflow']} no-flow",
             f"  thickness given to active cells by pass-through cells: up to {gained:.6g} per cell "
             f"(collapse={self.options.collapse!r})",
-            f"  connections: {len(self.links['n'])} ({ihc[0]} vertical, {ihc[1]} horizontal)",
+            f"  connections: {len(self.links['n'])} ({ihc[0]} vertical, {ihc[1]} horizontal, "
+            f"{ihc[2]} staggered)",
         ]
         if len(self._faces):
             lines.append(f"  max plan orthogonality error: {self.diagnostics['max_ortho_error']:.3g} deg "
                          "(faces that carry a connection)")
+        diag = self.diagnostics
+        if diag["slivers_merged"]:
+            lines.append(
+                f"  merged pieces: {diag['slivers_merged']} on side faces (largest {diag['largest_sliver']:.3g}); "
+                "merged pieces move face area between cells, so results are not exact "
+                "(sliver_abs_tol=0 keeps every piece)."
+            )
+        ratio = diag["max_offset_ratio"]
+        lines.append(f"  max offset ratio (offset / thinner cell, same layer): {ratio:.3g}")
+        if ratio >= 1:
+            joined = ("joined only through other layers" if self.options.connectivity == "full"
+                      else "still joined as same-layer neighbours")
+            lines.append(
+                f"  {diag['disconnected_faces']} same-layer neighbour pairs are offset by a whole cell "
+                f"or more and are {joined}; about {int(np.ceil(ratio)) + 1} sublayers would keep "
+                "each layer connected (Provost et al. 2025)."
+            )
+        if ratio > 0:
+            if self.options.connectivity == "layered":
+                lines.append("  layers are vertically offset: connectivity='full' is recommended.")
+            lines.append(
+                "  for offset layers use XT3D, and give NPF angle2 and angle3 (zeros are fine): "
+                "without them MODFLOW 6 XT3D ignores the vertical offsets."
+            )
         return "\n".join(lines)
 
     def _cellmap(self, top_l, bot_l):
@@ -195,3 +259,20 @@ class DisuGrid:
     def _require_build(self):
         if self.nodemap is None:
             raise RuntimeError("Call build() first.")
+
+
+def _offset_ratio(status, top_l, bot_l, faces):
+    """Largest vertical offset between same-layer neighbours, relative to the thinner cell.
+
+    Provost et al. (2025) show connectivity changes where this ratio reaches 1
+    (same-layer neighbours stop touching), 2 and 3.
+    """
+    i = faces["cell_id_1"].to_numpy(dtype=np.int64)
+    j = faces["cell_id_2"].to_numpy(dtype=np.int64)
+    both = (status[:, i] == ACTIVE) & (status[:, j] == ACTIVE)
+    if not both.any():
+        return {"max_offset_ratio": 0.0, "disconnected_faces": 0}
+    offset = np.maximum(np.abs(top_l[:, i] - top_l[:, j]), np.abs(bot_l[:, i] - bot_l[:, j]))
+    thinner = np.minimum(top_l[:, i] - bot_l[:, i], top_l[:, j] - bot_l[:, j])
+    ratio = np.where(both, offset / np.where(both, thinner, 1.0), 0.0)
+    return {"max_offset_ratio": float(ratio.max()), "disconnected_faces": int((ratio >= 1).sum())}

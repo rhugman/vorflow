@@ -1,7 +1,10 @@
 """DisuGrid on one plan grid: layered connections, pass-through cells and the MF6 DISU arrays.
 
-The MODFLOW runs live outside the test suite, in local benchmarks.
+Also holds the geometry checks shared by the DISU tests. The MODFLOW runs
+live outside the test suite, in local benchmarks.
 """
+
+from collections import defaultdict
 
 import geopandas as gpd
 import numpy as np
@@ -36,6 +39,40 @@ def _entries(props):
             result[n, int(m)] = tuple(values)
     return result
 
+
+
+def assert_cells_close(d):
+    """Each cell's connections add up to its own geometry, as MODFLOW's cell-by-cell balance needs.
+
+    Side faces: the heights of a cell's connections across a plan face add
+    up to its overlap with the active cells of the neighbour column. Top and
+    bottom: the vertical connections cover the whole area or nothing, and
+    (with ``collapse``) the cells they join meet.
+    """
+    top, bot, col = d._node_top, d._node_bot, d._node_cell
+    n, m, ihc = (np.asarray(d.links[key]) for key in ("n", "m", "ihc"))
+    hwva, height = np.asarray(d.links["hwva"]), np.asarray(d.links["height"])
+    scale = max(1.0, float(np.abs(np.r_[top, bot]).max()))
+    vertical = ihc == 0
+    if d.options.collapse is not None:
+        np.testing.assert_allclose(top[m[vertical]], bot[n[vertical]], rtol=0, atol=1e-9 * scale)
+    area = d._area[col]
+    for side in (n, m):
+        covered = np.bincount(side[vertical], weights=hwva[vertical], minlength=d.nodes)
+        hit = covered > 0
+        np.testing.assert_allclose(covered[hit], area[hit], rtol=1e-9)
+    got = defaultdict(float)
+    for a, b, h in zip(n[~vertical], m[~vertical], height[~vertical]):
+        got[a, col[b]] += h
+        got[b, col[a]] += h
+    nodes_of = defaultdict(list)
+    for node, c in enumerate(col):
+        nodes_of[c].append(node)
+    for i, j in zip(d._faces["cell_id_1"], d._faces["cell_id_2"]):
+        for own, other in ((i, j), (j, i)):
+            for a in nodes_of[own]:
+                expected = sum(max(0.0, min(top[a], top[b]) - max(bot[a], bot[b])) for b in nodes_of[other])
+                assert got[a, other] == pytest.approx(expected, rel=1e-9, abs=1e-9 * scale), (a, other)
 
 
 def test_options_are_validated_eagerly():
