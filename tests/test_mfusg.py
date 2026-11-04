@@ -90,6 +90,35 @@ def test_hanging_vertex_and_contiguous_collinear_face_segments(tmp_path):
     assert np.any(np.all(tall_xy == (1, 1), axis=1))
 
 
+@pytest.mark.parametrize("off", [1e-12, -1e-12])
+def test_hanging_vertex_a_roundoff_off_the_coarse_face_keeps_both_faces(off):
+    # Two fine cells meet a coarse one; their shared vertex is a roundoff outside
+    # (off > 0: the boundaries meet only at points) or inside (an overlap) its face.
+    low = Polygon([(990, 0), (1000, 0), (1000 - off, 5), (990, 5)])
+    high = Polygon([(990, 5), (1000 - off, 5), (1000, 10), (990, 10)])
+    grid = _grid([low, high, box(1000, 0, 1010, 10)], [(995, 2.5), (995, 7.5), (1005, 5)])
+    faces = grid_to_mfusg_disu(grid, 10, 0)["connectivity"].set_index(["cell_id_1", "cell_id_2"])
+    assert sorted(faces.index) == [(0, 1), (0, 2), (1, 2)]
+    np.testing.assert_allclose(faces.loc[[(0, 2), (1, 2)], "shared_length"], 5)
+
+
+def test_snapped_face_pieces_are_not_taken_for_a_bent_face():
+    # Cells from a splice outline in a 2 km vorflow grid: the fine cell's face lies on the
+    # coarse face up to roundoff, and snapping both to the tolerance leaves two pieces
+    # 1.6e-11 m off each other's line. The far cell gives the grid its coordinate scale.
+    coarse = Polygon([(564.8615606711103, 397.0164098007835), (555.4749495390829, 385.0811522568362),
+                      (534.5454545454545, 388.18181818181824), (538.1818181818181, 412.7272727272728),
+                      (560.7354386701497, 409.3859956178902)])
+    fine = Polygon([(537.391304347826, 407.3913043478262), (535.6521739130435, 395.6521739130434),
+                    (526.902856345334, 396.9483691082597), (524.0149928011508, 403.681170836403),
+                    (528.3720036963515, 408.7274970369335)])
+    grid = _grid([coarse, fine, box(2090, 0, 2100, 10)],
+                 [(548.6363636363636, 398.6363636363636), (530.6521739130435, 402.39130434782606), (2095, 5)])
+    faces = grid_to_mfusg_disu(grid, 10, 0)["connectivity"]
+    assert len(faces) == 1
+    assert faces.shared_length.iloc[0] == pytest.approx(11.8673, abs=1e-4)
+
+
 def test_nonorthogonality_is_diagnosed_without_replacing_centres(tmp_path):
     grid = _grid(centres=[(.5, .2), (1.5, .8)])
     disu = grid_to_mfusg_disu(grid, 10, 0)

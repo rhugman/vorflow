@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 # outside (absolute 1e-14..1e-7 m), well past coordinate roundoff. A centre
 # that is really outside its cell is off by a sizeable fraction of it.
 CENTRE_OUTSIDE_FRACTION = 1e-6
+# A face recovered from roundoff (boundaries within the tolerance of each other
+# but meeting only at points) counts when longer than this fraction of
+# sqrt(cell area); at a corner contact the recovered piece is about the
+# tolerance long.
+RECOVERED_FACE_FRACTION = 1e-6
 METADATA_KEYS = {"node_id", "cell_map", "connectivity"}
 PACKAGE_KEYS = {
     "nodes", "nlay", "njag", "ivsd", "idsymrd", "nodelay",
@@ -165,11 +170,19 @@ def _prepare_grid(gdf, top, botm, nlay):
     # faces, making GSF footprints disagree with the numerical geometry.
     planar = grid_to_disv(gdf, tolerance=tolerance)
     tree = shapely.STRtree(geoms)
-    left, right = tree.query(geoms, predicate="intersects")
+    # Within the tolerance, not just intersecting: roundoff can leave a hair's gap
+    # between neighbours, e.g. along hanging vertices.
+    left, right = tree.query(geoms, predicate="dwithin", distance=tolerance)
+    boundaries = shapely.boundary(geoms)
+    bands = shapely.buffer(boundaries, tolerance)
+    areas = shapely.area(geoms)
     records = []
     for i, j in sorted(zip(left[left < right], right[left < right])):
         overlap = geoms[i].intersection(geoms[j])
-        if overlap.area > 0:
+        # Faces recovered from roundoff are checked with twice the tolerance:
+        # pieces of one straight face can lie up to it on both sides of it.
+        recovered = overlap.area > 0
+        if recovered:
             # Only forgive slivers contained within BOTH boundary roundoff
             # bands. An area-only cutoff could accept small but deep overlaps.
             for geom in (geoms[i], geoms[j]):
@@ -184,7 +197,17 @@ def _prepare_grid(gdf, top, botm, nlay):
                 raise ValueError(f"Cannot resolve roundoff overlap between cells {i} and {j}.")
         else:
             shared = geoms[i].boundary.intersection(geoms[j].boundary)
-        record = _straight_face(shared, centres[[i, j]], (int(i), int(j)), tolerance)
+        # Roundoff can keep two boundaries from meeting along all of their face,
+        # even snapped: along hanging vertices a hair off the neighbour's straight
+        # face (as on a splice outline) they meet over part of it, only at points,
+        # or not at all. The part of one boundary within the tolerance of the other
+        # is the whole face; at a corner contact it is only about the tolerance long.
+        near = shapely.intersection(boundaries[i], bands[j])
+        lost = sum(p.length for p in _line_parts(near)) - sum(p.length for p in _line_parts(shared))
+        if lost > RECOVERED_FACE_FRACTION * np.sqrt(min(areas[i], areas[j])):
+            shared, recovered = near, True
+        record = _straight_face(shared, centres[[i, j]], (int(i), int(j)),
+                                2 * tolerance if recovered else tolerance)
         if record is not None:
             records.append(record)
     faces = pd.DataFrame(records, columns=[
