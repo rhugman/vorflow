@@ -37,11 +37,11 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
 from . import _columns
-from ._columns import ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES
+from ._columns import ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES, subdivide
 from ._connect3d import concat_links, layered_links, overlay_links, staggered_links, vertical_links
 from ._disu_export import mf6_gridprops, mfusg_gridprops, mfusg_ksat, write_gsf
 
-__all__ = ["DisuGrid", "DisuOptions", "refill", "splice"]
+__all__ = ["DisuGrid", "DisuOptions", "refill", "splice", "subdivide"]
 
 CONNECTIVITY = ("full", "layered")
 CL12_MODES = ("plan", "connector")
@@ -393,8 +393,8 @@ class DisuGrid:
         Args:
             values: One value per DISU node (e.g. ``heads.ravel()``).
             layer: The original layer, as numbered by ``parent``.
-            parent: The original layer of each layer, when layers were split
-                into sublayers; ``None`` when no layer was split.
+            parent: The original layer of each layer, as returned by
+                :func:`subdivide`; ``None`` when no layer was split.
             pick: Which sublayer gives the value in each column: ``"top"``
                 or ``"bottom"`` (the highest or lowest active one),
                 ``"middle"`` (the active cell at the original layer's
@@ -524,8 +524,8 @@ class DisuGrid:
 
         Args:
             path: The CSV file to write.
-            parent: The original layer of each layer, when layers were split
-                into sublayers; ``None`` when no layer was split, and
+            parent: The original layer of each layer, as returned by
+                :func:`subdivide`; ``None`` when no layer was split, and
                 ``unit`` is the layer.
         """
         self._require_build()

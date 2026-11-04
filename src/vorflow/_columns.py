@@ -1,4 +1,4 @@
-"""Cell columns for DISU: layer arrays, pass-through and gap-free collapse.
+"""Cell columns for DISU: layer arrays, pass-through, gap-free collapse, sublayers.
 
 Pure array functions in the flopy layer convention: ``top`` is ``(ncpl,)``,
 ``botm`` and ``idomain`` are ``(nlay, ncpl)``. The upper surface of a layer is
@@ -193,3 +193,74 @@ def nearest_active(status):
         last = np.where(status[layer] == ACTIVE, layer, np.where(status[layer] == PASSTHROUGH, last, -1))
         down[layer] = last
     return up, down
+
+
+def subdivide(top, botm, idomain=None, nsub=None, fractions=None, where=None):
+    """Split layers into sublayers, everywhere or only in some columns.
+
+    Args:
+        top, botm, idomain: flopy-style layer arrays (see :func:`layer_arrays`).
+        nsub: Sublayers per layer, as an int or one int per layer. Mutually
+            exclusive with ``fractions``.
+        fractions: One sequence per layer (or ``None`` to keep that layer
+            whole) of positive thickness fractions, top to bottom.
+        where: Columns to split: ``None`` (all), a ``(ncpl,)`` boolean mask,
+            or one mask (or ``None``) per layer.
+
+    Returns:
+        ``(botm, idomain, parent)``: the new ``(nlay_new, ncpl)`` bottoms and
+        idomain, and ``parent``, the original layer of each new layer.
+
+    Outside ``where``, the parent cell keeps its whole interval in its first
+    sublayer; the other sublayers there have zero thickness and idomain -1, so
+    they pass flow through and are removed from the DISU grid.
+
+    The arrays describe one plan grid used by every layer. For a different
+    grid per layer, subdivide each grid's layers separately or use
+    :func:`split_contacts`.
+    """
+    top_l, bot_l, idomain = layer_arrays(top, botm, idomain)
+    nlay, ncpl = bot_l.shape
+    if (nsub is None) == (fractions is None):
+        raise ValueError("Give exactly one of nsub or fractions.")
+    if fractions is None:
+        counts = np.broadcast_to(np.asarray(nsub), (nlay,))
+        if not np.issubdtype(counts.dtype, np.integer) or (counts < 1).any():
+            raise ValueError("nsub must hold positive integers.")
+        parts = [np.full(int(n), 1.0 / int(n)) for n in counts]
+    else:
+        if len(fractions) != nlay:
+            raise ValueError(f"fractions needs one entry per layer ({nlay}).")
+        parts = []
+        for layer, f in enumerate(fractions):
+            f = np.array([1.0] if f is None else f, dtype=float)
+            if f.ndim != 1 or len(f) < 1 or (f <= 0).any() or not np.isfinite(f).all():
+                raise ValueError(f"fractions for layer {layer} must be positive numbers.")
+            parts.append(f / f.sum())
+    masks = _column_masks(where, nlay, ncpl)
+    new_bot, new_idomain, parent = [], [], []
+    for layer in range(nlay):
+        thickness = top_l[layer] - bot_l[layer]
+        edges = np.cumsum(parts[layer])
+        edges[-1] = 1.0                 # Exact parent bottom despite roundoff.
+        for i, edge in enumerate(edges):
+            split = top_l[layer] - edge * thickness
+            # Unsplit columns: the first slot keeps the whole cell, later slots are empty.
+            new_bot.append(np.where(masks[layer], split, bot_l[layer]))
+            empty = ~masks[layer] & (i > 0) & (idomain[layer] != 0)
+            new_idomain.append(np.where(empty, -1, idomain[layer]))
+            parent.append(layer)
+    return np.array(new_bot), np.array(new_idomain, dtype=np.int64), np.array(parent)
+
+
+def _column_masks(where, nlay, ncpl):
+    if where is None:
+        return [np.ones(ncpl, dtype=bool)] * nlay
+    if isinstance(where, (list, tuple)):
+        if len(where) != nlay:
+            raise ValueError(f"where needs one mask per layer ({nlay}).")
+        return [_column_masks(w, 1, ncpl)[0] for w in where]
+    mask = np.asarray(where)
+    if mask.shape != (ncpl,) or mask.dtype != bool:
+        raise ValueError(f"where must be a boolean mask of shape ({ncpl},).")
+    return [mask] * nlay

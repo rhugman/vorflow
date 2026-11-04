@@ -1,10 +1,11 @@
-"""Column core of the DISU builder: layer arrays, pass-through and collapse."""
+"""Column core of the DISU builder: layer arrays, pass-through, collapse and sublayers."""
 
 import numpy as np
 import pytest
 
 from vorflow._columns import (
-    ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, classify, collapse, layer_arrays, nearest_active, vertical_pairs,
+    ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, classify, collapse, layer_arrays, nearest_active, subdivide,
+    vertical_pairs,
 )
 
 
@@ -133,3 +134,37 @@ def test_nearest_active_looks_through_pass_through_cells_only():
     up, down = nearest_active(status)
     np.testing.assert_array_equal(up[:, 0], [0, 0, 0, -1, -1, 5])
     np.testing.assert_array_equal(down[:, 0], [0, -1, -1, -1, 5, 5])
+
+
+def test_subdivide_uniform_and_fractions():
+    botm, idomain, parent = subdivide(10.0, [[4.0, 6.0], [0.0, 0.0]], nsub=[3, 1])
+    np.testing.assert_allclose(botm[:, 0], [8, 6, 4, 0])
+    np.testing.assert_allclose(botm[:, 1], [26 / 3, 22 / 3, 6, 0])
+    np.testing.assert_array_equal(parent, [0, 0, 0, 1])
+    botm, _, parent = subdivide(10.0, [[0.0]], fractions=[[1, 3]])
+    np.testing.assert_allclose(botm[:, 0], [7.5, 0])
+
+
+def test_subdivide_only_where_requested():
+    where = np.array([True, False])
+    botm, idomain, parent = subdivide(10.0, [[4.0, 4.0]], [[1, 1]], nsub=2, where=where)
+    np.testing.assert_allclose(botm, [[7, 4], [4, 4]])
+    np.testing.assert_array_equal(idomain, [[1, 1], [1, -1]])
+    np.testing.assert_array_equal(parent, [0, 0])
+    # The empty slot outside the area is pass-through, so the parent cell stays whole.
+    top_l, bot_l, idomain = layer_arrays(10.0, botm, idomain)
+    status = classify(top_l, bot_l, idomain)
+    assert status[1, 1] == PASSTHROUGH and (top_l[0, 1], bot_l[0, 1]) == (10, 4)
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({}, "exactly one"),
+    ({"nsub": 2, "fractions": [[1]]}, "exactly one"),
+    ({"nsub": 0}, "positive"),
+    ({"fractions": [[1, -1]]}, "positive"),
+    ({"fractions": [[1], [1]]}, "one entry per layer"),
+    ({"nsub": 2, "where": np.array([1])}, "boolean mask"),
+])
+def test_subdivide_rejects_bad_options(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        subdivide(10.0, [[0.0]], **kwargs)
