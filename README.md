@@ -436,6 +436,12 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
 - **Dipping contacts at a change of grid:** where fine cells straddle coarse
   ones, the gap-free contact under a refinement is one flat level, which
   moves the bottoms above it; `report()` says by how much.
+  `grids, top, botm, idomain, parent = disu.split_contacts(grids, top, botm,
+  idomain)` keeps them as given by adding a wedge layer.
+- **Sublayers:** `disu.subdivide(top, botm, idomain, nsub=..., where=mask)`
+  splits layers everywhere or only in some columns. Its `parent` (and that of
+  `split_contacts`) maps the layers back to the original units for
+  `layer_view` and `save_cellmap`.
 - **Tracking:** `nodemap`, `cellmap`, `to_nodes`, `to_layers`,
   `locate(x, y, z)` and `column(x, y)`. FloPy reads the layer number from the
   IHC diagonal, so `PlotMapView(modelgrid=gwf.modelgrid, layer=k)` works

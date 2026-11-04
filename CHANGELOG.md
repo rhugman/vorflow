@@ -41,6 +41,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     outline finer, and `priority="growth"` enlarges the core cells when the
     grading cannot reach the outline size (the default keeps `resolution`
     and warns).
+  - `split_contacts()` keeps dipping bottoms at a change of grid as given,
+    by adding a wedge layer under a flat cut, on the grid above or below.
+  - `subdivide()` makes sublayers in all or some columns.
   - `to_nodes`, `to_layers`, `locate`, `column` and `save_cellmap` track
     cells; `idomain_layers`, `layer_view` and `vertex_grid` give per-layer
     status maps and 2D views for FloPy plots; `from_disv()` reads existing
