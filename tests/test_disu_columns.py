@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from vorflow._columns import (
-    ACTIVE, NOFLOW, PASSTHROUGH, classify, collapse, layer_arrays, vertical_pairs,
+    ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, classify, collapse, layer_arrays, nearest_active, vertical_pairs,
 )
 
 
@@ -108,3 +108,28 @@ def test_collapse_conserves_column_thickness():
         for cell in np.flatnonzero(has_active):
             layers = np.flatnonzero(active[:, cell])
             np.testing.assert_array_equal(new_bot[layers[:-1], cell], new_top[layers[1:], cell])
+
+
+def test_nan_elevations_are_absent_and_end_a_column():
+    # Layer 1 lacks this column (its grid has no such cell): NaN elevations.
+    top_l = np.array([[10.0], [8.0], [np.nan], [4.0]])
+    bot_l = np.array([[8.0], [6.0], [np.nan], [0.0]])
+    status = classify(top_l, bot_l, np.ones((4, 1), dtype=int))
+    np.testing.assert_array_equal(status[:, 0], [ACTIVE, ACTIVE, ABSENT, ACTIVE])
+    upper, lower, _ = vertical_pairs(status)
+    assert list(zip(upper, lower)) == [(0, 1)]                  # No link across the absent cell.
+
+
+def test_a_pass_through_run_ending_at_an_absent_cell_stops_at_its_face():
+    top_l = np.array([[10.0], [8.0], [np.nan]])
+    bot_l = np.array([[8.0], [6.0], [np.nan]])
+    status = np.array([[ACTIVE], [PASSTHROUGH], [ABSENT]])
+    new_top, new_bot = collapse(top_l, bot_l, status, "split")
+    assert (new_top[0, 0], new_bot[0, 0]) == (10.0, 6.0)        # Takes the run down to the absent cell.
+
+
+def test_nearest_active_looks_through_pass_through_cells_only():
+    status = np.array([[ACTIVE], [PASSTHROUGH], [PASSTHROUGH], [NOFLOW], [PASSTHROUGH], [ACTIVE]])
+    up, down = nearest_active(status)
+    np.testing.assert_array_equal(up[:, 0], [0, 0, 0, -1, -1, 5])
+    np.testing.assert_array_equal(down[:, 0], [0, -1, -1, -1, 5, 5])
