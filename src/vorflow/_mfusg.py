@@ -135,6 +135,29 @@ def _straight_face(shared, centres, pair, tolerance):
 
 
 def _prepare_grid(gdf, top, botm, nlay):
+    planar, area, faces, _ = _planar_faces(gdf)
+    layer_top, bot = _layer_arrays(top, botm, nlay, len(gdf))
+    ncpl = len(gdf)
+    mapping = pd.DataFrame({
+        "model_node": np.arange(nlay * ncpl),
+        "layer": np.repeat(np.arange(nlay), ncpl),
+        "cell_id": np.tile(np.arange(ncpl), nlay),
+        "orig_index": np.tile(gdf.index.to_numpy(), nlay),
+        "node_id": np.tile(planar["node_id"], nlay),
+    })
+    if "zone_id" in gdf:
+        mapping["zone_id"] = np.tile(gdf["zone_id"].to_numpy(), nlay)
+    return _LayeredGrid(planar, layer_top, bot, area, mapping, faces)
+
+
+def _planar_faces(gdf):
+    """Validated plan geometry shared by every layer: DISV rings, cell areas and straight faces.
+
+    Returns ``(planar, area, faces, tolerance)``. ``faces`` has one row per
+    pair of cells sharing a straight face of positive length, with the face
+    length, each centre's perpendicular distance to it and the orthogonality
+    error.
+    """
     # Local import avoids a cycle with the thin public wrappers in utils.
     from .utils import grid_to_disv
 
@@ -159,7 +182,6 @@ def _prepare_grid(gdf, top, botm, nlay):
     outside = ~shapely.dwithin(geoms, shapely.points(centres), centre_tolerance)
     if outside.any():
         raise ValueError(f"Centre of cell {int(np.flatnonzero(outside)[0])} lies outside its polygon.")
-    layer_top, bot = _layer_arrays(top, botm, nlay, len(gdf))
     # Reuse conforming rings, not MF6 solver semantics. Limit insertion to
     # coordinate roundoff: a looser map-scale tolerance can bend very short
     # faces, making GSF footprints disagree with the numerical geometry.
@@ -191,19 +213,9 @@ def _prepare_grid(gdf, top, botm, nlay):
         "cell_id_1", "cell_id_2", "shared_length", "distance_1", "distance_2", "ortho_error",
     ])
     if len(faces):
-        logger.info("MFUSG export: %s horizontal faces; maximum orthogonality error %.6g degrees",
+        logger.info("Grid export: %s horizontal faces; maximum orthogonality error %.6g degrees",
                     len(faces), faces["ortho_error"].max())
-    ncpl = len(gdf)
-    mapping = pd.DataFrame({
-        "model_node": np.arange(nlay * ncpl),
-        "layer": np.repeat(np.arange(nlay), ncpl),
-        "cell_id": np.tile(np.arange(ncpl), nlay),
-        "orig_index": np.tile(gdf.index.to_numpy(), nlay),
-        "node_id": np.tile(planar["node_id"], nlay),
-    })
-    if "zone_id" in gdf:
-        mapping["zone_id"] = np.tile(gdf["zone_id"].to_numpy(), nlay)
-    return _LayeredGrid(planar, layer_top, bot, shapely.area(geoms), mapping, faces)
+    return planar, shapely.area(geoms), faces, tolerance
 
 
 def _disu_arrays(grid):
