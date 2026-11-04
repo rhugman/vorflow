@@ -428,6 +428,11 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
   every layer. The cells on either side of a spliced outline are not mirror
   images of each other, so faces there can be far from orthogonal
   (`report()` gives the largest error).
+  `disu.refill(base, polygon, resolution)` avoids that: it keeps the base
+  cells outside the polygon and fills the inside with finer Voronoi cells
+  that share the outline's vertices, graded by `growth_factor` or `fields`
+  as in `add_polygon`. `outline_split=2` makes the cells along the outline
+  finer.
 - **Dipping contacts at a change of grid:** where fine cells straddle coarse
   ones, the gap-free contact under a refinement is one flat level, which
   moves the bottoms above it; `report()` says by how much.
