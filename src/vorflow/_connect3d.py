@@ -16,7 +16,7 @@ exporters write both directions. Link arrays:
 import numpy as np
 import pandas as pd
 
-from ._columns import ACTIVE, vertical_pairs
+from ._columns import ABSENT, ACTIVE, nearest_active, vertical_pairs
 
 LINK_KEYS = ("n", "m", "ihc", "cl_n", "cl_m", "hwva", "height", "angle", "fahl")
 
@@ -55,6 +55,41 @@ def vertical_links(status, nodemap, top_l, bot_l, area):
         "angle": np.zeros(len(cells)),
         "fahl": area[cells].astype(float),
     }
+
+
+def overlay_links(status, nodemap, top_l, bot_l, overlaps):
+    """IHC=0 links where the plan grid changes between two layers.
+
+    ``overlaps`` lists pairs of plan columns ``col_a``/``col_b`` that overlap
+    in plan with ``area``. Where column ``col_a`` ends above a layer boundary
+    and ``col_b`` starts below it, the nearest active cells on either side
+    (through pass-through cells) are linked with the overlap area.
+    """
+    up, down = nearest_active(status)
+    nlay = status.shape[0]
+    a = overlaps["col_a"].to_numpy(dtype=np.int64)
+    b = overlaps["col_b"].to_numpy(dtype=np.int64)
+    area = overlaps["area"].to_numpy(dtype=float)
+    present = status != ABSENT
+    parts = []
+    for layer in range(nlay - 1):
+        for upper, lower in ((a, b), (b, a)):
+            switch = present[layer, upper] & ~present[layer + 1, upper]
+            switch &= ~present[layer, lower] & present[layer + 1, lower]
+            k_up, k_down = up[layer, upper], down[layer + 1, lower]
+            keep = switch & (k_up >= 0) & (k_down >= 0)
+            if not keep.any():
+                continue
+            ku, kd, cu, cd = k_up[keep], k_down[keep], upper[keep], lower[keep]
+            parts.append({
+                "n": nodemap[ku, cu], "m": nodemap[kd, cd],
+                "ihc": np.zeros(len(cu), dtype=np.int64),
+                "cl_n": (top_l[ku, cu] - bot_l[ku, cu]) / 2,
+                "cl_m": (top_l[kd, cd] - bot_l[kd, cd]) / 2,
+                "hwva": area[keep], "height": np.zeros(len(cu)), "angle": np.zeros(len(cu)),
+                "fahl": area[keep],
+            })
+    return concat_links(*parts)
 
 
 def layered_links(status, nodemap, faces, top_l, bot_l):

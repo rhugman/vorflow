@@ -32,10 +32,12 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import shapely
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 from . import _columns
-from ._columns import ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES
-from ._connect3d import concat_links, layered_links, staggered_links, vertical_links
+from ._columns import ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES
+from ._connect3d import concat_links, layered_links, overlay_links, staggered_links, vertical_links
 from ._disu_export import mf6_gridprops, mfusg_gridprops, mfusg_ksat, write_gsf
 
 __all__ = ["DisuGrid", "DisuOptions", "splice"]
@@ -68,15 +70,24 @@ class DisuOptions:
 
 
 class DisuGrid:
-    """A DISU grid built from a vorflow 2D grid and FloPy-style layer arrays.
+    """A DISU grid built from vorflow 2D grids and FloPy-style layer arrays.
 
     Args:
-        grid: The vorflow grid (GeoDataFrame with ``x``/``y`` generator
-            columns), used by every layer.
-        top: Model top, scalar or one value per cell.
-        botm: Layer bottoms, ``(nlay,)`` or ``(nlay, ncpl)``.
-        idomain: ``None`` (all active) or ``(nlay, ncpl)``: >0 active,
-            0 no-flow (never passed through), -1 pass-through.
+        grids: The vorflow grid (GeoDataFrame with ``x``/``y`` generator
+            columns), or a list with one grid per layer. Layers may use
+            different grids, e.g. a :func:`splice` that is finer inside an area.
+        top: Model top, scalar or one value per cell of the first layer's grid.
+            With several grids it may also be a list with one entry per layer:
+            ``None``, or the tops of that layer's cells. Where a layer's grid
+            has cells that the layer above lacks (a change of grid), the
+            contact is made gap-free: cells that overlap across it share one
+            elevation, the area-weighted mean of the bottoms above (exactly
+            those bottoms when they agree, e.g. for nested refinement). Tops
+            given here must match the bottoms above them.
+        botm: Layer bottoms: ``(nlay,)`` or ``(nlay, ncpl)`` for one grid, or a
+            list with one value or array per layer.
+        idomain: ``None`` (all active), ``(nlay, ncpl)`` or a list per layer:
+            >0 active, 0 no-flow (never passed through), -1 pass-through.
         min_thickness: Cells this thin or thinner are treated as pass-through.
         collapse: What happens to the interval of pass-through cells:
             ``"split"`` (default) shares it between the active cells above and
@@ -88,31 +99,31 @@ class DisuGrid:
             connectivity (same-layer neighbours only).
         sliver_abs_tol: Optional merging of small pieces, off by default
             (0). A piece of a side face thinner than ``sliver_abs_tol`` is
-            given to the pieces above and below it. Merging gives fewer
-            connections but moves face area between cells, so results are no
-            longer exact; the default keeps every piece, and MODFLOW handles
-            tiny ones fine.
+            given to the pieces above and below it; a plan overlap between
+            grids smaller than ``sliver_abs_tol**2`` is added to that cell's
+            largest overlap. Merging gives fewer connections but moves face
+            area between cells, so results are no longer exact; the default
+            keeps every piece, and MODFLOW handles tiny ones fine.
         cl12: ``"plan"`` (perpendicular plan distance to the face, as in the
             paper; exact for XT3D) or ``"connector"``.
 
-    After :meth:`build`, ``nodemap`` is an ``(nlay, ncpl)`` array mapping
-    ``(layer, cell)`` to the DISU node (-1 for removed cells), and ``cellmap``
-    describes every layer cell.
+    After :meth:`build`, ``nodemap`` maps ``(layer, cell)`` to the DISU node
+    (-1 for removed cells): an ``(nlay, ncpl)`` array for one grid, a list of
+    per-layer arrays for several. ``cellmap`` describes every layer cell.
+
+    Cells with identical footprints in different grids (as kept by
+    :func:`splice`) form one column through all their layers, so full
+    connectivity applies across a change of grid. Other cells meet the cells
+    above and below them through their plan overlaps.
     """
 
-    def __init__(self, grid, top, botm, idomain=None, *, min_thickness=0.0, collapse="split",
+    def __init__(self, grids, top, botm, idomain=None, *, min_thickness=0.0, collapse="split",
                  connectivity="full", sliver_abs_tol=0.0, cl12="plan"):
         self.options = DisuOptions(
             min_thickness=min_thickness, collapse=collapse, connectivity=connectivity,
             sliver_abs_tol=sliver_abs_tol, cl12=cl12,
         )
-        missing = {"geometry", "x", "y"}.difference(getattr(grid, "columns", ()))
-        if missing:
-            raise ValueError(f"grid missing required columns: {sorted(missing)}.")
-        if len(grid) == 0:
-            raise ValueError("grid must not be empty.")
-        self._grid = grid
-        self._layers = _columns.layer_arrays(top, botm, idomain, ncpl=len(grid))
+        self._grids, self._layer_grid, self._layers = _layer_inputs(grids, top, botm, idomain)
         self.nodemap = None
         self.cellmap = None
         self.links = None
@@ -142,25 +153,48 @@ class DisuGrid:
 
     @property
     def nlay(self):
-        return self._layers[1].shape[0]
+        return len(self._layer_grid)
+
+    @property
+    def single_grid(self):
+        return len(self._grids) == 1
 
     @property
     def grid(self):
-        """The plan grid used by every layer."""
-        return self._grid
+        """The plan grid when every layer uses the same one."""
+        if not self.single_grid:
+            raise AttributeError("Layers use different grids; see grids_per_layer.")
+        return self._grids[0]
+
+    @property
+    def grids_per_layer(self):
+        return [self._grids[g] for g in self._layer_grid]
 
     @property
     def nodes(self):
         self._require_build()
-        return int((self.nodemap >= 0).sum())
+        return int((self._nodemap >= 0).sum())
 
     def build(self):
         """Classify cells, close pass-through gaps and connect the active cells. Returns ``self``."""
         from ._mfusg import _planar_faces
 
         opts = self.options
-        self._planar, self._area, self._faces, _ = _planar_faces(self._grid)
-        top_l, bot_l, idomain = self._layers
+        planar = [_planar_faces(grid) for grid in self._grids]
+        tolerance = max(p[3] for p in planar)
+        self._prepare_columns(tolerance)
+        columns = self._columns
+        self._faces = _global_faces([p[2] for p in planar], self._col_of)
+        cross = self._cross_faces(tolerance)
+        if len(cross):
+            faces = pd.concat([self._faces, cross.astype(self._faces.dtypes.to_dict())], ignore_index=True)
+            # A column can belong to several grids: one face per column pair, a grid's own face first.
+            key = np.sort(faces[["cell_id_1", "cell_id_2"]].to_numpy(dtype=np.int64), axis=1)
+            self._faces = faces[~pd.DataFrame(key).duplicated().to_numpy()].reset_index(drop=True)
+        from .utils import grid_to_disv
+
+        self._planar = grid_to_disv(columns, tolerance=tolerance)
+        top_l, bot_l, idomain = self._lattice()
         self.top_l, self.bot_l = top_l, bot_l
         status = _columns.classify(top_l, bot_l, idomain, opts.min_thickness)
         top_l, bot_l = _columns.collapse(top_l, bot_l, status, opts.collapse)
@@ -168,14 +202,20 @@ class DisuGrid:
         active = status == ACTIVE
         nodemap = np.full(status.shape, -1, dtype=np.int64)
         nodemap[active] = np.arange(int(active.sum()))
-        self.status = status
+        self.status, self._nodemap = status, nodemap
         self._node_top, self._node_bot = top_l[active], bot_l[active]
         self._node_layer, self._node_cell = np.nonzero(active)
 
-        self.diagnostics = {"slivers_merged": 0, "largest_sliver": 0.0}
-        vertical = vertical_links(status, nodemap, top_l, bot_l, self._area)
+        self.diagnostics = {"slivers_merged": 0, "largest_sliver": 0.0, "plan_slivers_merged": 0,
+                            "chained_links": 0, "largest_skipped_run": 0.0, **self._contact}
+        overlaps = self._overlaps()
+        vertical = concat_links(
+            vertical_links(status, nodemap, top_l, bot_l, self._area),
+            overlay_links(status, nodemap, top_l, bot_l, overlaps),
+            self._chained_links(status, nodemap, top_l, bot_l),
+        )
         if opts.connectivity == "full":
-            centres = self._grid[["x", "y"]].to_numpy(dtype=float)
+            centres = columns[["x", "y"]].to_numpy(dtype=float)
             horizontal, found = staggered_links(
                 status, nodemap, top_l, bot_l, self._faces, centres, sliver_abs_tol=opts.sliver_abs_tol,
                 cl12=opts.cl12,
@@ -185,13 +225,28 @@ class DisuGrid:
             horizontal = layered_links(status, nodemap, self._faces, top_l, bot_l)
         self.links = concat_links(vertical, horizontal)
         self.diagnostics.update(_offset_ratio(status, top_l, bot_l, self._faces))
+        self.diagnostics["vertical_offset"] = _vertical_offset(self.links, self._node_top, self._node_bot)
         self.diagnostics["max_ortho_error"] = self._connected_ortho_error()
-        self.nodemap = nodemap
+        self.nodemap = self._public(nodemap)
         self.cellmap = self._cellmap(top_l, bot_l)
         return self
 
+    def _prepare_columns(self, tolerance):
+        """Global plan columns, their areas, and the area below which two cells only touch."""
+        self._col_of, self._columns = _plan_columns(self._grids)
+        geoms = self._columns.geometry.to_numpy()
+        self._area = shapely.area(geoms)
+        # One threshold decides whether two cells of different grids overlap
+        # (vertical link) or only touch (face), so no pair gets both.
+        self._touch_area = tolerance * shapely.length(geoms)
+
     def _connected_ortho_error(self):
-        """Largest plan orthogonality error over the faces that carry a horizontal connection."""
+        """Largest plan orthogonality error over the faces that carry a horizontal connection.
+
+        Faces between columns of different grids that never share an
+        elevation (a coarse cell above a change of grid next to a fine cell
+        below it) carry no connection, so they are left out.
+        """
         side = np.asarray(self.links["ihc"]) != 0
         if not side.any() or not len(self._faces):
             return 0.0
@@ -208,14 +263,22 @@ class DisuGrid:
 
         The one-based layer number is written on the IHC diagonal, which
         MODFLOW 6 does not read. IDOMAIN cannot carry tags: MODFLOW 6 DISU
-        accepts only 0 and 1 there, so use :attr:`cellmap` to map nodes to
-        layers, cells and zones.
+        accepts only 0 and 1 there, so use :attr:`cellmap` (or
+        :meth:`save_cellmap`) to map nodes to layers, cells and zones.
+
+        Contacts at a change of grid are gap-free, so cells above and below
+        meet exactly. If any vertical connection still overlaps in elevation,
+        ``vertical_offset_tolerance`` is set to the largest overlap so MODFLOW 6
+        accepts it.
         """
         self._require_build()
-        return mf6_gridprops(
+        props = mf6_gridprops(
             self.nodes, self._node_top, self._node_bot, self._area[self._node_cell],
             self._node_layer, self.links, self._planar, self._node_cell,
         )
+        if self.diagnostics["vertical_offset"] > 0:
+            props["vertical_offset_tolerance"] = self.diagnostics["vertical_offset"] * (1 + 1e-9)
+        return props
 
     def get_gridprops_mfusg_disu(self):
         """Keyword arguments for ``flopy.mfusg.MfUsgDisU`` (MODFLOW-USG; gridgen key names).
@@ -286,33 +349,41 @@ class DisuGrid:
     def to_nodes(self, values):
         """Pick the values of the active cells, in DISU node order.
 
-        ``values`` is shaped like ``botm``: ``(nlay, ncpl)``, or a list with one
-        array (or scalar) per layer.
+        ``values`` is shaped like ``botm``: ``(nlay, ncpl)`` for one grid, or a
+        list with one array (or scalar) per layer.
         """
         self._require_build()
-        return np.stack(self._per_layer(values, "values"))[self.nodemap >= 0]
+        lattice = np.full(self._nodemap.shape, np.nan, dtype=object)
+        for layer, layer_values in enumerate(self._per_layer(values, "values")):
+            lattice[layer, self._col_of[self._layer_grid[layer]]] = layer_values
+        picked = lattice[self._nodemap >= 0]
+        return np.array(picked.tolist())
 
     def to_layers(self, values, fill=np.nan):
-        """Spread per-node values back to ``(nlay, ncpl)``, with ``fill`` for removed cells."""
+        """Spread per-node values back to the layers, with ``fill`` for removed cells.
+
+        Returns ``(nlay, ncpl)`` for one grid, or a list of per-layer arrays.
+        """
         self._require_build()
         values = np.asarray(values).ravel()
         if values.shape != (self.nodes,):
             raise ValueError(f"values must have {self.nodes} entries, one per node.")
-        layers = np.full(self.nodemap.shape, fill, dtype=np.result_type(values, np.asarray(fill)))
-        layers[self.nodemap >= 0] = values
-        return layers
+        lattice = np.full(self._nodemap.shape, fill, dtype=np.result_type(values, np.asarray(fill)))
+        lattice[self._nodemap >= 0] = values
+        return self._public(lattice)
 
     @property
     def idomain_layers(self):
         """Each layer's cells in MODFLOW 6 idomain codes: 1 active, -1 pass-through, 0 no-flow.
 
-        Shaped like ``nodemap``, so it plots like a DISV idomain. MODFLOW 6
-        DISU itself only accepts 0 and 1; this map is for tracking and plotting.
+        Shaped like ``nodemap`` (``(nlay, ncpl)`` for one grid, a list per
+        layer otherwise), so it plots like a DISV idomain. MODFLOW 6 DISU
+        itself only accepts 0 and 1; this map is for tracking and plotting.
         """
         self._require_build()
         codes = np.zeros(len(STATUS_NAMES), dtype=np.int64)
         codes[ACTIVE], codes[PASSTHROUGH] = 1, -1
-        return codes[self.status]
+        return self._public(codes[self.status])
 
     def layer_view(self, values, layer, parent=None, pick="top", fill="nan"):
         """One value per plan cell for an original layer, for 2D maps.
@@ -330,8 +401,8 @@ class DisuGrid:
                 or ``"cover"`` for the active cell that took over its interval
                 (see ``collapse``); no-flow cells always stay NaN.
 
-        Returns a ``(ncpl,)`` array on the plan grid; :meth:`vertex_grid`
-        gives a FloPy grid for it.
+        Returns a ``(ncpl,)`` array on that layer's plan grid
+        (``grids_per_layer``); :meth:`vertex_grid` gives a FloPy grid for it.
         """
         self._require_build()
         if pick not in ("top", "bottom", "middle", "mean"):
@@ -347,15 +418,19 @@ class DisuGrid:
         sub = np.flatnonzero(parent == layer)
         if not len(sub):
             raise ValueError(f"No layer has parent {layer!r}.")
-        node = self.nodemap[sub]
+        grids = {self._layer_grid[k] for k in sub}
+        if len(grids) > 1:
+            raise ValueError(f"The sublayers of layer {layer} use different plan grids.")
+        cols = self._col_of[self._layer_grid[sub[0]]]
+        node = self._nodemap[np.ix_(sub, cols)]
         active = node >= 0
         value = np.where(active, values[np.maximum(node, 0)], np.nan)
-        top, bot = self._top_c[sub], self._bot_c[sub]
-        middle = (self.top_l[sub[0]] + self.bot_l[sub[-1]]) / 2
+        top, bot = self._top_c[np.ix_(sub, cols)], self._bot_c[np.ix_(sub, cols)]
+        middle = (self.top_l[sub[0], cols] + self.bot_l[sub[-1], cols]) / 2
         any_active = active.any(axis=0)
         first = np.argmax(active, axis=0)
         last = len(sub) - 1 - np.argmax(active[::-1], axis=0)
-        ncpl = np.arange(node.shape[1])
+        ncpl = np.arange(len(cols))
         if pick == "top":
             view = value[first, ncpl]
         elif pick == "bottom":
@@ -369,18 +444,18 @@ class DisuGrid:
             view = np.where(hit.any(axis=0), value[np.argmax(hit, axis=0), ncpl], np.nan)
         view = np.where(any_active, view, np.nan)
         if fill == "cover":
-            noflow = (self.status[sub] == NOFLOW).all(axis=0)
+            noflow = (self.status[np.ix_(sub, cols)] == NOFLOW).all(axis=0)
             empty = ~any_active & ~noflow
             if empty.any():
-                view[empty] = self._covering_value(values, np.flatnonzero(empty), middle[empty])
+                view[empty] = self._covering_value(values, cols[empty], middle[empty])
         return view
 
-    def _covering_value(self, values, cells, z):
+    def _covering_value(self, values, cols, z):
         """Value of the active cell in each column whose collapsed interval contains ``z``."""
-        out = np.full(len(cells), np.nan)
+        out = np.full(len(cols), np.nan)
         for k in range(self.nlay):
-            node = self.nodemap[k, cells]
-            hit = (node >= 0) & (self._bot_c[k, cells] <= z) & (z <= self._top_c[k, cells]) & np.isnan(out)
+            node = self._nodemap[k, cols]
+            hit = (node >= 0) & (self._bot_c[k, cols] <= z) & (z <= self._top_c[k, cols]) & np.isnan(out)
             out[hit] = values[node[hit]]
         return out
 
@@ -398,22 +473,22 @@ class DisuGrid:
             raise ImportError("vertex_grid() needs flopy; install it with `pip install flopy`.") from err
         from .utils import grid_to_disv
 
-        planar = grid_to_disv(self._grid)
+        grid = self.grids_per_layer[layer]
+        planar = grid_to_disv(grid)
+        cols = self._col_of[self._layer_grid[layer]]
         idomain = self.idomain_layers[layer]
         return flopy.discretization.VertexGrid(
             vertices=planar["vertices"], cell2d=planar["cell2d"], ncpl=planar["ncpl"], nlay=1,
-            top=self.top_l[layer], botm=self.bot_l[layer][None, :],
-            idomain=np.where(idomain == 0, 0, 1)[None, :], crs=self._grid.crs,
+            top=self.top_l[layer, cols], botm=self.bot_l[layer, cols][None, :],
+            idomain=np.where(idomain == 0, 0, 1)[None, :], crs=grid.crs,
         )
 
     def column(self, x, y):
         """Active DISU nodes at plan point ``(x, y)``, from the top down."""
         self._require_build()
-        cell = self._cells_at(np.atleast_1d(float(x)), np.atleast_1d(float(y)))[0]
-        if cell < 0:
-            return np.zeros(0, dtype=np.int64)
-        nodes = self.nodemap[:, cell]
-        return nodes[nodes >= 0]
+        cols = self._columns_at(np.atleast_1d(float(x)), np.atleast_1d(float(y)))
+        nodes = [self._nodemap[k, cols[g][0]] for k, g in enumerate(self._layer_grid) if cols[g][0] >= 0]
+        return np.array([n for n in nodes if n >= 0], dtype=np.int64)
 
     def locate(self, x, y, z):
         """DISU node containing each point ``(x, y, z)``, or -1 outside every active cell.
@@ -424,12 +499,15 @@ class DisuGrid:
         """
         self._require_build()
         x, y, z = (np.atleast_1d(np.asarray(v, dtype=float)) for v in (x, y, z))
-        cell = self._cells_at(x, y)
-        node = np.where(cell >= 0, self.nodemap[:, np.maximum(cell, 0)], -1)    # (nlay, npoints)
-        safe = np.maximum(node, 0)
-        hit = (node >= 0) & (self._node_bot[safe] <= z) & (z <= self._node_top[safe])
-        # From the top down: on a shared top and bottom the upper cell wins.
-        found = np.where(hit.any(axis=0), node[np.argmax(hit, axis=0), np.arange(len(x))], -1)
+        cols = self._columns_at(x, y)
+        found = np.full(len(x), -1, dtype=np.int64)
+        for k, g in enumerate(self._layer_grid):
+            col = cols[g]
+            node = np.where(col >= 0, self._nodemap[k, np.maximum(col, 0)], -1)
+            hit = (node >= 0) & (found < 0)
+            node_safe = np.maximum(node, 0)
+            hit &= (self._node_bot[node_safe] <= z) & (z <= self._node_top[node_safe])
+            found[hit] = node[hit]
         return found if found.size > 1 else int(found[0])
 
     def save_cellmap(self, path, parent=None):
@@ -452,13 +530,29 @@ class DisuGrid:
         unit = np.arange(self.nlay) if parent is None else np.asarray(parent)
         if unit.shape != (self.nlay,) or not np.issubdtype(unit.dtype, np.integer):
             raise ValueError(f"parent needs one integer per layer ({self.nlay}).")
+        codes = np.zeros(len(STATUS_NAMES), dtype=np.int64)
+        codes[ACTIVE], codes[PASSTHROUGH] = 1, -1
         cells = self.cellmap
         layer = cells["layer"].to_numpy()
         table = cells.assign(z=(cells["top"] + cells["bot"]) / 2,
-                             idomain=self.idomain_layers[layer, cells["icpl"].to_numpy()],
+                             idomain=codes[self.status[layer, cells["column"].to_numpy()]],
                              unit=unit[layer])
         table.to_csv(path, index=False)
         return path
+
+    def _columns_at(self, x, y):
+        """Per grid, the global column containing each plan point (-1 outside)."""
+        if not hasattr(self, "_trees"):
+            geoms = self._columns.geometry.to_numpy()
+            self._trees = [shapely.STRtree(geoms[cols]) for cols in self._col_of]
+        points = shapely.points(np.column_stack([x, y]))
+        out = []
+        for tree, cols in zip(self._trees, self._col_of):
+            found = np.full(len(points), -1, dtype=np.int64)
+            point, hit = tree.query(points, predicate="intersects")
+            found[point[::-1]] = cols[hit[::-1]]     # First hit wins on shared edges.
+            out.append(found)
+        return out
 
     def report(self):
         """Plain-text summary of the grid and its connections."""
@@ -468,8 +562,10 @@ class DisuGrid:
         # Thickness each node takes from collapsed pass-through intervals.
         gained = (self._node_top - self._node_bot) - (self.top_l - self.bot_l)[self.status == ACTIVE]
         gained = float(gained.max()) if len(gained) else 0.0
+        shape = (f"{self.nlay} layers x {self._grids[0].shape[0]} cells" if self.single_grid
+                 else f"{self.nlay} layers on {len(self._grids)} grids")
         lines = [
-            f"DISU grid: {self.nodes} nodes from {self.nlay} layers x {len(self._grid)} cells",
+            f"DISU grid: {self.nodes} nodes from {shape}",
             f"  cells: {counts['active']} active, {counts['passthrough']} pass-through, "
             f"{counts['noflow']} no-flow",
             f"  thickness given to active cells by pass-through cells: up to {gained:.6g} per cell "
@@ -481,12 +577,31 @@ class DisuGrid:
             lines.append(f"  max plan orthogonality error: {self.diagnostics['max_ortho_error']:.3g} deg "
                          "(faces that carry a connection)")
         diag = self.diagnostics
-        if diag["slivers_merged"]:
+        if diag["chained_links"]:
             lines.append(
-                f"  merged pieces: {diag['slivers_merged']} on side faces (largest {diag['largest_sliver']:.3g}); "
-                "merged pieces move face area between cells, so results are not exact "
-                "(sliver_abs_tol=0 keeps every piece)."
+                f"  {diag['chained_links']} vertical connections cross pass-through cells between two changes "
+                f"of grid; their thickness is skipped (largest {diag['largest_skipped_run']:.6g})."
             )
+        merged = diag["slivers_merged"] + diag["plan_slivers_merged"]
+        if merged:
+            lines.append(
+                f"  merged pieces: {diag['slivers_merged']} on side faces (largest {diag['largest_sliver']:.3g}), "
+                f"{diag['plan_slivers_merged']} plan overlaps; merged pieces move face area between cells, "
+                "so results are not exact (sliver_abs_tol=0 keeps every piece)."
+            )
+        if not self.single_grid:
+            if diag["contact_groups"]:
+                lines.append(f"  change of grid: {diag['contact_groups']} contact groups made gap-free")
+            if diag["max_contact_shift"] > 0:
+                lines.append(
+                    f"  the contact under a change of grid moved bottoms by up to "
+                    f"{diag['max_contact_shift']:.3g}."
+                )
+            if diag["vertical_offset"] > 0:
+                lines.append(
+                    f"  cells above and below a change of grid overlap by up to {diag['vertical_offset']:.3g}; "
+                    "MODFLOW 6 vertical_offset_tolerance is set to accept it."
+                )
         ratio = diag["max_offset_ratio"]
         lines.append(f"  max offset ratio (offset / thinner cell, same layer): {ratio:.3g}")
         if ratio >= 1:
@@ -506,42 +621,276 @@ class DisuGrid:
             )
         return "\n".join(lines)
 
+    def _lattice(self):
+        """Elevations and idomain over every plan column, NaN where a layer's grid lacks the column."""
+        ncol = len(self._columns)
+        top_l = np.full((self.nlay, ncol), np.nan)
+        bot_l = np.full((self.nlay, ncol), np.nan)
+        idomain = np.zeros((self.nlay, ncol), dtype=np.int64)
+        self._contact = {"contact_groups": 0, "max_contact_shift": 0.0}
+        for layer, (top, bot, ido) in enumerate(self._layers):
+            cols = self._col_of[self._layer_grid[layer]]
+            bot_l[layer, cols] = bot
+            idomain[layer, cols] = ido
+            if layer == 0:
+                top_l[0, cols] = top
+                continue
+            above = bot_l[layer - 1, cols]
+            new = np.isnan(above)
+            layer_top = above.copy()
+            if new.any():
+                in_layer = np.zeros(ncol, dtype=bool)
+                in_layer[cols] = True
+                ending = np.flatnonzero(~np.isnan(bot_l[layer - 1]) & ~in_layer)
+                given = None if top is None else np.broadcast_to(top, cols.shape)[new]
+                start_top, end_bot = self._contact_levels(layer, ending, cols[new], bot_l[layer - 1], given)
+                bot_l[layer - 1, ending] = end_bot
+                layer_top[new] = start_top
+            top_l[layer, cols] = layer_top
+        with np.errstate(invalid="ignore"):
+            bad = np.argwhere(top_l < bot_l)
+        if len(bad):
+            layer, col = bad[0]
+            raise ValueError(
+                f"Negative thickness in layer {layer} (column {col}): each bottom must lie at or "
+                "below the bottom of the layer above. At a change of grid the contact is the "
+                "area-weighted mean of the bottoms above it; give a flat botm there to choose it."
+            )
+        return top_l, bot_l, idomain
+
+    def _contact_levels(self, layer, ending, starting, bot_above, given=None):
+        """One contact elevation per group of cells that meet across a change of grid.
+
+        ``ending`` columns stop below ``layer - 1`` and ``starting`` columns
+        begin in ``layer``. Cells that overlap in plan are joined into groups;
+        each group's contact is the area-weighted mean of its upper cells'
+        bottoms, so no gap or overlap remains between the two grids. A group
+        with a single upper cell (nested refinement), or whose bottoms already
+        agree, keeps that elevation exactly. Tops given for ``starting`` cells
+        are kept, and must match the bottoms above them.
+
+        Returns ``(top of each starting column, bottom of each ending column)``.
+        """
+        geoms = self._columns.geometry.to_numpy()
+        group_s, group_e, n_groups, _ = _contact_groups(geoms, starting, ending, self._touch_area)
+        bottom = bot_above[ending]
+        level, lowest, highest = _group_bottoms(group_e, bottom, self._area[ending], n_groups)
+        joined = ~np.isnan(level)
+
+        start_top = level[group_s]
+        if given is not None:
+            scale = np.nanmax(np.abs(np.r_[given, bottom, 1.0]))
+            spread = np.where(joined, highest - lowest, 0.0)[group_s]
+            mismatch = (np.abs(given - np.where(np.isnan(start_top), given, start_top)) > 1e-9 * scale) | (
+                spread > 1e-9 * scale)
+            if mismatch.any():
+                raise ValueError(
+                    f"Layer {layer}: the tops given for cells below the change of grid do not meet the "
+                    "bottoms of the cells above them. Leave that layer's top as None to make the contact "
+                    "gap-free automatically."
+                )
+            start_top = np.asarray(given, dtype=float).copy()
+        lone = np.isnan(start_top)
+        if lone.any():
+            start_top[lone] = self._sample_above(layer, starting[lone], bot_above)
+        end_bot = level[group_e]
+        groups = np.unique(group_s[~lone])
+        self._contact["contact_groups"] += int(len(groups))
+        if len(ending):
+            self._contact["max_contact_shift"] = max(self._contact["max_contact_shift"],
+                                                     float(np.abs(end_bot - bottom).max()))
+        return start_top, end_bot
+
+    def _sample_above(self, layer, cols, bot_above):
+        """Bottom of the layer-above cell that contains each column's centre."""
+        return bot_above[self._col_of[self._layer_grid[layer - 1]][self._cell_above(layer, cols)]]
+
+    def _cell_above(self, layer, cols):
+        """Index, in the layer above's grid, of the cell that contains each column's centre."""
+        above_cols = self._col_of[self._layer_grid[layer - 1]]
+        geoms = self._columns.geometry.to_numpy()
+        tree = shapely.STRtree(geoms[above_cols])
+        centres = shapely.points(self._columns[["x", "y"]].to_numpy(dtype=float)[cols])
+        point, hit = tree.query(centres, predicate="intersects")
+        found = np.full(len(cols), -1)
+        found[point[::-1]] = hit[::-1]           # First hit wins on shared edges.
+        if (found < 0).any():
+            raise ValueError(
+                f"Layer {layer}: a cell centre lies outside the layer above; give its top explicitly."
+            )
+        return found
+
+    def _cross_faces(self, tolerance):
+        """Faces between cells of different grids that touch along an edge without overlapping.
+
+        Inside a refined area, a coarse cell above a change of grid and a fine
+        cell below it can be plan neighbours; with offset layers their walls
+        overlap vertically and need a staggered connection. As in
+        ``_planar_faces``, the part of one boundary within the tolerance of the
+        other is the face when roundoff hides part of it.
+        """
+        from ._mfusg import RECOVERED_FACE_FRACTION, _line_parts, _straight_face
+
+        geoms = self._columns.geometry.to_numpy()
+        centres = self._columns[["x", "y"]].to_numpy(dtype=float)
+        records = []
+        for g1 in range(len(self._grids)):
+            for g2 in range(g1 + 1, len(self._grids)):
+                a_cols, b_cols = self._col_of[g1], self._col_of[g2]
+                a_only = a_cols[~np.isin(a_cols, b_cols)]
+                b_only = b_cols[~np.isin(b_cols, a_cols)]
+                if not len(a_only) or not len(b_only):
+                    continue
+                ia, ib = shapely.STRtree(geoms[b_only]).query(geoms[a_only], predicate="dwithin",
+                                                               distance=tolerance)
+                i, j = a_only[ia], b_only[ib]
+                # Overlapping cells meet vertically, not side by side.
+                inside = shapely.relate_pattern(geoms[i], geoms[j], "T********")
+                area = np.zeros(len(i))
+                area[inside] = shapely.area(shapely.intersection(geoms[i[inside]], geoms[j[inside]]))
+                i, j = i[area <= self._touch_area[i]], j[area <= self._touch_area[i]]
+                for a, b in zip(i.tolist(), j.tolist()):
+                    shared = shapely.intersection(geoms[a].boundary, geoms[b].boundary, grid_size=tolerance)
+                    near = shapely.intersection(geoms[a].boundary, shapely.buffer(geoms[b].boundary, tolerance))
+                    lost = sum(p.length for p in _line_parts(near)) - sum(p.length for p in _line_parts(shared))
+                    if lost > RECOVERED_FACE_FRACTION * np.sqrt(min(self._area[a], self._area[b])):
+                        shared = near
+                    try:
+                        record = _straight_face(shared, centres[[a, b]], (a, b), 2 * tolerance)
+                    except ValueError:
+                        record = _bent_face(shared, centres[[a, b]], (a, b), tolerance)
+                    if record is not None:
+                        records.append(record)
+        columns = ["cell_id_1", "cell_id_2", "shared_length", "distance_1", "distance_2", "ortho_error",
+                   "normal_x", "normal_y"]
+        faces = pd.DataFrame(records, columns=columns)
+        return faces[faces.shared_length > tolerance].reset_index(drop=True)
+
+    def _overlaps(self):
+        """Plan overlaps between the columns of grids used in consecutive layers."""
+        pairs = {tuple(sorted(p)) for p in zip(self._layer_grid[:-1], self._layer_grid[1:]) if p[0] != p[1]}
+        geoms = self._columns.geometry.to_numpy()
+        frames = []
+        for g1, g2 in sorted(pairs):
+            a_cols, b_cols = self._col_of[g1], self._col_of[g2]
+            a_only = a_cols[~np.isin(a_cols, b_cols)]
+            b_only = b_cols[~np.isin(b_cols, a_cols)]
+            if not len(a_only) or not len(b_only):
+                continue
+            ia, ib = shapely.STRtree(geoms[b_only]).query(geoms[a_only], predicate="intersects")
+            area = shapely.area(shapely.intersection(geoms[a_only][ia], geoms[b_only][ib]))
+            frames.append(pd.DataFrame({"col_a": a_only[ia], "col_b": b_only[ib], "area": area}))
+        if not frames:
+            return pd.DataFrame({"col_a": [], "col_b": [], "area": []})
+        overlaps = pd.concat(frames, ignore_index=True)
+        # Separate grid objects can reuse the same global plan columns.
+        # overlay_links reuses a column pair at each layer transition, so
+        # collecting that pair twice would create duplicate DISU links.
+        pairs = np.sort(overlaps[["col_a", "col_b"]].to_numpy(dtype=np.int64), axis=1)
+        overlaps = overlaps.loc[~pd.DataFrame(pairs).duplicated().to_numpy()]
+        overlaps = overlaps[overlaps.area > self._touch_area[overlaps.col_a.to_numpy(dtype=int)]]
+        overlaps, merged = _merge_plan_slivers(overlaps, self._area, self.options.sliver_abs_tol)
+        self.diagnostics["plan_slivers_merged"] = merged
+        return overlaps
+
+    def _chained_links(self, status, nodemap, top_l, bot_l):
+        """IHC=0 links through pass-through runs that cross more than one change of grid.
+
+        ``overlay_links`` joins the nearest active cells on either side of one
+        change of grid. A pass-through run that ends at a further change of
+        grid (grids A, B, A with a pass-through B cell) is followed across each
+        one, and the active cells at its two ends are joined over the plan
+        area they share through it. As in a single column with
+        ``collapse=None``, the run's thickness is skipped.
+        """
+        nlay = status.shape[0]
+        present = status != ABSENT
+        up, down = _columns.nearest_active(status)
+        geoms = self._columns.geometry.to_numpy()
+        starting = [np.flatnonzero(~present[s] & present[s + 1]) for s in range(nlay - 1)]
+        # Boundary below which a pass-through run starting at a change of grid leaves its column (-1: none).
+        exit_at = np.full(status.shape, -1, dtype=np.int64)
+        for s, cols in enumerate(starting):
+            run = status[s + 1, cols] == PASSTHROUGH
+            for t in range(s + 1, nlay - 1):
+                exit_at[s + 1, cols[run & (status[t + 1, cols] == ABSENT)]] = t
+                run &= status[t + 1, cols] == PASSTHROUGH
+        trees = [shapely.STRtree(geoms[cols]) for cols in starting]
+        found = {}
+        for s in range(nlay - 1):
+            bridges = starting[s][exit_at[s + 1, starting[s]] >= 0]
+            ending = np.flatnonzero(present[s] & ~present[s + 1] & (up[s] >= 0))
+            if not len(bridges) or not len(ending):
+                continue
+            ia, ib = shapely.STRtree(geoms[bridges]).query(geoms[ending], predicate="intersects")
+            stack = [(nodemap[up[s, a], a], shapely.intersection(geoms[a], geoms[b]), exit_at[s + 1, b])
+                     for a, b in zip(ending[ia], bridges[ib])]
+            while stack:
+                node, piece, t = stack.pop()
+                if piece.area <= self._touch_area.min():
+                    continue
+                cols = starting[t][trees[t].query(piece, predicate="intersects")]
+                for c, part in zip(cols, shapely.intersection(piece, geoms[cols])):
+                    if down[t + 1, c] >= 0:
+                        key = (node, nodemap[down[t + 1, c], c])
+                        found[key] = found.get(key, 0.0) + part.area
+                    elif exit_at[t + 1, c] >= 0:
+                        stack.append((node, part, exit_at[t + 1, c]))
+        if not found:
+            return concat_links()
+        n, m = (np.array(v, dtype=np.int64) for v in zip(*found))
+        area = np.array(list(found.values()))
+        keep = area > self._touch_area[self._node_cell[n]]
+        n, m, area = n[keep], m[keep], area[keep]
+        self.diagnostics["chained_links"] = len(n)
+        self.diagnostics["largest_skipped_run"] = float(np.max(self._node_bot[n] - self._node_top[m], initial=0.0))
+        return {
+            "n": n, "m": m, "ihc": np.zeros(len(n), dtype=np.int64),
+            "cl_n": (self._node_top[n] - self._node_bot[n]) / 2,
+            "cl_m": (self._node_top[m] - self._node_bot[m]) / 2,
+            "hwva": area, "height": np.zeros(len(n)), "angle": np.zeros(len(n)), "fahl": area,
+        }
+
     def _per_layer(self, values, name):
-        """Split values shaped like ``botm`` into one ``(ncpl,)`` array per layer."""
+        """Split values shaped like ``botm`` into one array per layer."""
         if isinstance(values, (list, tuple)):
             if len(values) != self.nlay:
                 raise ValueError(f"{name} needs one entry per layer ({self.nlay}).")
             parts = values
         else:
             values = np.asarray(values)
-            if values.ndim != 2 or values.shape[0] != self.nlay:
+            if not self.single_grid or values.ndim != 2 or values.shape[0] != self.nlay:
                 raise ValueError(f"{name} must be shaped like botm.")
             parts = list(values)
-        return [np.broadcast_to(np.asarray(part), (len(self._grid),)) for part in parts]
+        out = []
+        for layer, part in enumerate(parts):
+            size = len(self._col_of[self._layer_grid[layer]])
+            part = np.broadcast_to(np.asarray(part), (size,))
+            out.append(part)
+        return out
 
-    def _cells_at(self, x, y):
-        """The plan cell containing each point (-1 outside); the first cell wins on shared edges."""
-        if not hasattr(self, "_tree"):
-            self._tree = shapely.STRtree(self._grid.geometry.to_numpy())
-        found = np.full(len(x), -1, dtype=np.int64)
-        point, hit = self._tree.query(shapely.points(np.column_stack([x, y])), predicate="intersects")
-        found[point[::-1]] = hit[::-1]
-        return found
+    def _public(self, lattice):
+        if self.single_grid:
+            return lattice[:, self._col_of[0]]
+        return [lattice[layer, self._col_of[g]] for layer, g in enumerate(self._layer_grid)]
 
     def _cellmap(self, top_l, bot_l):
-        grid = self._grid
-        ncpl = len(grid)
-        cellmap = pd.DataFrame({
-            "node": self.nodemap.ravel(), "layer": np.repeat(np.arange(self.nlay), ncpl),
-            "icpl": np.tile(np.arange(ncpl), self.nlay),
-            "node_id": np.tile(grid["node_id"].to_numpy() if "node_id" in grid else np.arange(ncpl), self.nlay),
-            "status": self.status.ravel(),
-            "x": np.tile(grid["x"].to_numpy(dtype=float), self.nlay),
-            "y": np.tile(grid["y"].to_numpy(dtype=float), self.nlay),
-            "top": top_l.ravel(), "bot": bot_l.ravel(),
-        })
-        if "zone_id" in grid:
-            cellmap["zone_id"] = np.tile(grid["zone_id"].to_numpy(), self.nlay)
+        frames = []
+        for layer, g in enumerate(self._layer_grid):
+            cols = self._col_of[g]
+            grid = self._grids[g]
+            frame = pd.DataFrame({
+                "node": self._nodemap[layer, cols], "layer": layer, "icpl": np.arange(len(cols)),
+                "grid": g, "column": cols,
+                "node_id": grid["node_id"].to_numpy() if "node_id" in grid else np.arange(len(cols)),
+                "status": self.status[layer, cols],
+                "x": grid["x"].to_numpy(dtype=float), "y": grid["y"].to_numpy(dtype=float),
+                "top": top_l[layer, cols], "bot": bot_l[layer, cols],
+            })
+            if "zone_id" in grid:
+                frame["zone_id"] = grid["zone_id"].to_numpy()
+            frames.append(frame)
+        cellmap = pd.concat(frames, ignore_index=True)
         cellmap["status"] = pd.Categorical.from_codes(
             cellmap["status"].to_numpy(), [STATUS_NAMES[code] for code in range(len(STATUS_NAMES))],
         )
@@ -550,6 +899,45 @@ class DisuGrid:
     def _require_build(self):
         if self.nodemap is None:
             raise RuntimeError("Call build() first.")
+
+
+def _contact_groups(geoms, starting, ending, touch_area):
+    """Join the columns that overlap in plan across a change of grid into groups.
+
+    ``starting`` columns begin below the change and ``ending`` columns stop
+    above it. Returns ``(group of each starting column, group of each ending
+    column, number of groups, overlaps)``, with ``overlaps`` as
+    ``(starting index, ending index, area)``.
+    """
+    n_s, n_e = len(starting), len(ending)
+    s_idx = e_idx = np.zeros(0, dtype=np.int64)
+    overlap = np.zeros(0)
+    if n_e:
+        s_idx, e_idx = shapely.STRtree(geoms[ending]).query(geoms[starting], predicate="intersects")
+        overlap = shapely.area(shapely.intersection(geoms[starting][s_idx], geoms[ending][e_idx]))
+        keep = overlap > touch_area[starting[s_idx]]
+        s_idx, e_idx, overlap = s_idx[keep], e_idx[keep], overlap[keep]
+    graph = coo_matrix((np.ones(len(s_idx)), (s_idx, n_s + e_idx)), shape=(n_s + n_e, n_s + n_e))
+    n_groups, label = connected_components(graph, directed=False)
+    return label[:n_s], label[n_s:], n_groups, (s_idx, e_idx, overlap)
+
+
+def _group_bottoms(group, bottom, weight, n_groups):
+    """Per group: area-weighted mean, lowest and highest bottom (NaN, inf and -inf for groups without one).
+
+    The mean is exactly the bottoms when they agree.
+    """
+    total = np.bincount(group, weights=weight, minlength=n_groups)
+    level = np.full(n_groups, np.nan)
+    joined = total > 0
+    level[joined] = np.bincount(group, weights=weight * bottom, minlength=n_groups)[joined] / total[joined]
+    lowest = np.full(n_groups, np.inf)
+    highest = np.full(n_groups, -np.inf)
+    np.minimum.at(lowest, group, bottom)
+    np.maximum.at(highest, group, bottom)
+    agree = joined & (lowest == highest)
+    level[agree] = lowest[agree]
+    return level, lowest, highest
 
 
 def splice(base, fine, polygon):
@@ -602,6 +990,127 @@ def splice(base, fine, polygon):
     return gpd.GeoDataFrame(pd.concat([outside, inside], ignore_index=True), crs=base.crs)
 
 
+def _layer_inputs(grids, top, botm, idomain):
+    """Normalize grids and layer arrays into ``(unique grids, grid per layer, per-layer arrays)``."""
+    if isinstance(grids, (list, tuple)):
+        if not grids:
+            raise ValueError("grids must not be empty.")
+        unique, layer_grid = [], []
+        for grid in grids:
+            index = next((i for i, g in enumerate(unique) if g is grid), None)
+            if index is None:
+                unique.append(grid)
+                index = len(unique) - 1
+            layer_grid.append(index)
+    else:
+        unique, layer_grid = [grids], None
+    for grid in unique:
+        missing = {"geometry", "x", "y"}.difference(getattr(grid, "columns", ()))
+        if missing:
+            raise ValueError(f"grid missing required columns: {sorted(missing)}.")
+        if len(grid) == 0:
+            raise ValueError("grid must not be empty.")
+
+    if len(unique) == 1:
+        top_l, bot_l, ido = _columns.layer_arrays(top, botm, idomain, ncpl=len(unique[0]))
+        nlay = bot_l.shape[0]
+        if layer_grid is not None and len(layer_grid) != nlay:
+            raise ValueError(f"grids lists {len(layer_grid)} layers but botm has {nlay}.")
+        layers = [(top_l[0] if k == 0 else None, bot_l[k], ido[k]) for k in range(nlay)]
+        return unique, [0] * nlay, layers
+
+    if not isinstance(botm, (list, tuple)):
+        raise ValueError("With different grids per layer, botm must be a list with one entry per layer.")
+    nlay = len(botm)
+    if layer_grid is None:
+        layer_grid = [0] * nlay
+    if len(layer_grid) != nlay:
+        raise ValueError(f"grids lists {len(layer_grid)} layers but botm has {nlay}.")
+    tops = top if isinstance(top, (list, tuple)) else [top] + [None] * (nlay - 1)
+    idos = idomain if isinstance(idomain, (list, tuple)) else [idomain] * nlay
+    if len(tops) != nlay or len(idos) != nlay:
+        raise ValueError(f"Per-layer top and idomain lists need {nlay} entries.")
+    if tops[0] is None:
+        raise ValueError("The top of the first layer is required.")
+    layers = []
+    for k in range(nlay):
+        size = len(unique[layer_grid[k]])
+        bot = np.broadcast_to(np.asarray(botm[k], dtype=float), (size,)).copy()
+        layer_top = None if tops[k] is None else np.broadcast_to(np.asarray(tops[k], dtype=float), (size,)).copy()
+        ido = np.ones(size, dtype=np.int64) if idos[k] is None else np.broadcast_to(
+            np.asarray(idos[k]), (size,)).astype(np.int64)
+        if not np.isfinite(bot).all() or (layer_top is not None and not np.isfinite(layer_top).all()):
+            raise ValueError(f"Layer {k} elevations must be finite.")
+        layers.append((layer_top, bot, ido))
+    return unique, layer_grid, layers
+
+
+def _plan_columns(grids):
+    """Global plan columns: cells with the same generator and footprint in several grids are one column."""
+    rows, col_of, index = [], [], {}
+    for g, grid in enumerate(grids):
+        geoms = grid.geometry.to_numpy()
+        xy = grid[["x", "y"]].to_numpy(dtype=float)
+        ids = np.empty(len(grid), dtype=np.int64)
+        for i, (geom, (x, y)) in enumerate(zip(geoms, xy)):
+            match = next((c for c in index.get((x, y), ()) if rows[c][0].equals(geom)), None)
+            if match is None:
+                match = len(rows)
+                rows.append((geom, x, y, g, i))
+                index.setdefault((x, y), []).append(match)
+            ids[i] = match
+        col_of.append(ids)
+    geom, x, y, g, i = zip(*rows)
+    columns = gpd.GeoDataFrame({"x": x, "y": y, "grid": g, "icpl": i, "node_id": np.arange(len(rows))},
+                               geometry=list(geom))
+    return col_of, columns
+
+
+def _global_faces(face_tables, col_of):
+    """Plan faces of every grid, renumbered to global columns, each column pair once."""
+    frames = []
+    for faces, cols in zip(face_tables, col_of):
+        faces = faces.copy()
+        faces["cell_id_1"] = cols[faces["cell_id_1"].to_numpy(dtype=np.int64)]
+        faces["cell_id_2"] = cols[faces["cell_id_2"].to_numpy(dtype=np.int64)]
+        frames.append(faces)
+    faces = pd.concat(frames, ignore_index=True)
+    key = np.sort(faces[["cell_id_1", "cell_id_2"]].to_numpy(), axis=1)
+    keep = ~pd.DataFrame(key).duplicated().to_numpy()
+    return faces[keep].reset_index(drop=True)
+
+
+def _bent_face(shared, centres, pair, tolerance):
+    """One face for a contact that is not a single straight segment: total length, mean normal.
+
+    None when the contact is no longer than ``tolerance`` (``_cross_faces`` drops those
+    anyway) or its piece normals cancel, as they can for pieces a few 1e-11 m long.
+    """
+    from ._mfusg import _line_parts
+
+    parts = _line_parts(shared)
+    if not parts:
+        return None
+    lengths = np.array([part.length for part in parts])
+    if lengths.sum() <= tolerance:
+        return None
+    vectors = np.array([np.subtract(part.coords[-1], part.coords[0])[:2] for part in parts])
+    normals = np.column_stack([-vectors[:, 1], vectors[:, 0]]) / lengths[:, None]
+    towards = centres[1] - centres[0]
+    normals *= np.sign(normals @ towards)[:, None]
+    normal = (normals * lengths[:, None]).sum(axis=0)
+    if not np.linalg.norm(normal) > 0:
+        return None
+    normal /= np.linalg.norm(normal)
+    midpoints = np.array([part.interpolate(0.5, normalized=True).coords[0][:2] for part in parts])
+    face_point = (midpoints * lengths[:, None]).sum(axis=0) / lengths.sum()
+    d1, d2 = (face_point - centres[0]) @ normal, (centres[1] - face_point) @ normal
+    angle = np.degrees(np.arccos(np.clip(abs(towards @ normal) / np.linalg.norm(towards), 0, 1)))
+    return {"cell_id_1": pair[0], "cell_id_2": pair[1], "shared_length": float(lengths.sum()),
+            "distance_1": float(abs(d1)), "distance_2": float(abs(d2)), "ortho_error": float(angle),
+            "normal_x": float(normal[0]), "normal_y": float(normal[1])}
+
+
 def _node_values(values, nodes, name):
     """Positive finite values, one per active node (a scalar applies to all)."""
     try:
@@ -611,6 +1120,42 @@ def _node_values(values, nodes, name):
     if not (np.isfinite(values).all() and (values > 0).all()):
         raise ValueError(f"{name} must hold positive finite values.")
     return values
+
+
+def _merge_plan_slivers(overlaps, area, sliver_abs_tol=0.0):
+    """Add overlaps smaller than ``sliver_abs_tol**2`` to the smaller cell's largest overlap."""
+    if overlaps.empty or sliver_abs_tol == 0:
+        return overlaps.reset_index(drop=True), 0
+    overlaps = overlaps.reset_index(drop=True)
+    a = overlaps.col_a.to_numpy(dtype=np.int64)
+    b = overlaps.col_b.to_numpy(dtype=np.int64)
+    small_cell = np.where(area[a] <= area[b], a, b)
+    tiny = overlaps.area.to_numpy() < sliver_abs_tol ** 2
+    if not tiny.any():
+        return overlaps, 0
+    merged_area = overlaps.area.to_numpy(dtype=float).copy()
+    kept = ~tiny
+    for row in np.flatnonzero(tiny):
+        cell = small_cell[row]
+        candidates = np.flatnonzero(kept & ((a == cell) | (b == cell)))
+        if not len(candidates):
+            kept[row] = True                    # The only overlap of that cell: keep it.
+            continue
+        target = candidates[np.argmax(merged_area[candidates])]
+        merged_area[target] += merged_area[row]
+    overlaps = overlaps.assign(area=merged_area)[kept].reset_index(drop=True)
+    return overlaps, int((~kept).sum())
+
+
+def _vertical_offset(links, top, bot):
+    """Largest elevation overlap between the upper and lower cells of a vertical connection."""
+    vertical = links["ihc"] == 0
+    if not vertical.any():
+        return 0.0
+    n, m = links["n"][vertical], links["m"][vertical]
+    upper = np.where(top[n] >= top[m], n, m)
+    lower = np.where(upper == n, m, n)
+    return float(max(0.0, (top[lower] - bot[upper]).max()))
 
 
 def _offset_ratio(status, top_l, bot_l, faces):
@@ -624,7 +1169,8 @@ def _offset_ratio(status, top_l, bot_l, faces):
     both = (status[:, i] == ACTIVE) & (status[:, j] == ACTIVE)
     if not both.any():
         return {"max_offset_ratio": 0.0, "disconnected_faces": 0}
-    offset = np.maximum(np.abs(top_l[:, i] - top_l[:, j]), np.abs(bot_l[:, i] - bot_l[:, j]))
-    thinner = np.minimum(top_l[:, i] - bot_l[:, i], top_l[:, j] - bot_l[:, j])
+    with np.errstate(invalid="ignore"):
+        offset = np.maximum(np.abs(top_l[:, i] - top_l[:, j]), np.abs(bot_l[:, i] - bot_l[:, j]))
+        thinner = np.minimum(top_l[:, i] - bot_l[:, i], top_l[:, j] - bot_l[:, j])
     ratio = np.where(both, offset / np.where(both, thinner, 1.0), 0.0)
     return {"max_offset_ratio": float(ratio.max()), "disconnected_faces": int((ratio >= 1).sum())}

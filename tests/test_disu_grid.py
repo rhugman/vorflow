@@ -55,7 +55,11 @@ def assert_cells_close(d):
     scale = max(1.0, float(np.abs(np.r_[top, bot]).max()))
     vertical = ihc == 0
     if d.options.collapse is not None:
-        np.testing.assert_allclose(top[m[vertical]], bot[n[vertical]], rtol=0, atol=1e-9 * scale)
+        # Only links through pass-through cells between two changes of grid skip a run.
+        gap = bot[n[vertical]] - top[m[vertical]] > 1e-9 * scale
+        assert gap.sum() <= d.diagnostics["chained_links"]
+        assert (d._node_layer[m[vertical][gap]] - d._node_layer[n[vertical][gap]] >= 2).all()
+        np.testing.assert_allclose(top[m[vertical]][~gap], bot[n[vertical]][~gap], rtol=0, atol=1e-9 * scale)
     area = d._area[col]
     for side in (n, m):
         covered = np.bincount(side[vertical], weights=hwva[vertical], minlength=d.nodes)
