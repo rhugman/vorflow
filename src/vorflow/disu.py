@@ -36,7 +36,7 @@ import shapely
 from . import _columns
 from ._columns import ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES
 from ._connect3d import concat_links, layered_links, staggered_links, vertical_links
-from ._disu_export import mf6_gridprops
+from ._disu_export import mf6_gridprops, mfusg_gridprops, write_gsf
 
 __all__ = ["DisuGrid", "DisuOptions"]
 
@@ -216,6 +216,29 @@ class DisuGrid:
             self.nodes, self._node_top, self._node_bot, self._area[self._node_cell],
             self._node_layer, self.links, self._planar, self._node_cell,
         )
+
+    def get_gridprops_mfusg_disu(self):
+        """Keyword arguments for ``flopy.mfusg.MfUsgDisU`` (MODFLOW-USG; gridgen key names).
+
+        Uses ``ivsd=1`` with an explicit ``ivc`` so staggered connections stay
+        horizontal. ``fahl`` is the interface area: for a horizontal connection
+        the face width times its (merged) overlap height. MODFLOW-USG has no
+        XT3D; offset layers rely on the two-point formulation.
+
+        MODFLOW-USG needs at least one node in every layer, so a layer with no
+        active cell (for example one pinched out everywhere) raises ValueError.
+        """
+        self._require_build()
+        return mfusg_gridprops(
+            self.nodes, self.nlay, self._node_top, self._node_bot, self._area[self._node_cell],
+            self._node_layer, self.links,
+        )
+
+    def write_gsf(self, filepath):
+        """Write the grid specification file (GSF) used by MODFLOW-USG post-processors."""
+        self._require_build()
+        return write_gsf(filepath, self._planar, self._node_cell, self._node_top, self._node_bot,
+                         self._node_layer, self.nlay)
 
     def to_nodes(self, values):
         """Pick the values of the active cells, in DISU node order.

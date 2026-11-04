@@ -1,11 +1,17 @@
 """DISU array serialization from a link table (see ``_connect3d``).
 
 ``mf6_gridprops`` returns the keyword arguments of ``flopy.mf6.ModflowGwfdisu``
-(behind ``DisuGrid.get_gridprops_mf6_disu``), with the keys of
-``flopy.utils.gridgen.Gridgen.get_gridprops_disu6``.
+and ``mfusg_gridprops`` those of ``flopy.mfusg.MfUsgDisU`` (behind
+``DisuGrid.get_gridprops_mf6_disu`` and ``get_gridprops_mfusg_disu``), with the
+keys of ``flopy.utils.gridgen.Gridgen.get_gridprops_disu6`` and ``..._disu5``.
 """
 
+import logging
+from pathlib import Path
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def _csr(nodes, links, diagonal):
@@ -24,6 +30,7 @@ def _csr(nodes, links, diagonal):
         "cl12": np.concatenate([np.zeros(nodes), links["cl_n"], links["cl_m"]]),
         "hwva": np.concatenate([np.zeros(nodes), links["hwva"], links["hwva"]]),
         "angldegx": np.concatenate([np.zeros(nodes), links["angle"], reverse]),
+        "fahl": np.concatenate([np.zeros(nodes), links["fahl"], links["fahl"]]),
     }
     is_offdiagonal = entries["row"] != entries["col"]
     order = np.lexsort((entries["col"], is_offdiagonal, entries["row"]))
@@ -68,3 +75,67 @@ def mf6_gridprops(nodes, top, bot, area, layer, links, planar, icpl):
         "vertices": [list(vertex) for vertex in planar["vertices"]],
         "cell2d": cell2d,
     }
+
+
+def mfusg_gridprops(nodes, nlay, top, bot, area, layer, links):
+    """MODFLOW-USG DISU arrays, for ``flopy.mfusg.MfUsgDisU``.
+
+    ``ivsd=1`` with an explicit ``ivc``: with ``ivsd`` 0 or -1, MODFLOW-USG
+    treats every connection to a node in a lower layer as vertical, so a
+    staggered horizontal connection would take its conductance from the
+    vertical conductivity (this matters when HK differs from VKA or layers
+    are convertible). ``cl12``
+    holds each node's own distance to the face (full, non-symmetric storage,
+    ``idsymrd=0``) and ``fahl`` the interface area.
+    """
+    layer = np.asarray(layer, dtype=np.int64)
+    if len(layer) and np.any(np.diff(layer) < 0):
+        raise ValueError("MODFLOW-USG needs nodes numbered layer by layer.")
+    nodelay = np.bincount(layer, minlength=nlay).astype(np.int64)
+    if (nodelay == 0).any():
+        raise ValueError(
+            f"Layer {int(np.flatnonzero(nodelay == 0)[0])} has no active cells; MODFLOW-USG needs "
+            "at least one node in every layer."
+        )
+    entries, iac = _csr(nodes, links, np.zeros(nodes, dtype=np.int64))
+    is_diagonal = entries["row"] == entries["col"]
+    return {
+        "nodes": int(nodes), "nlay": int(nlay), "njag": int(iac.sum()),
+        "ivsd": 1, "idsymrd": 0, "nodelay": nodelay,
+        "top": np.asarray(top, dtype=float).copy(), "bot": np.asarray(bot, dtype=float).copy(),
+        "area": np.asarray(area, dtype=float).copy(),
+        "iac": iac, "ja": entries["col"].astype(np.int64),
+        "ivc": np.where(is_diagonal, 0, entries["ihc"] == 0).astype(np.int64),
+        "cl12": entries["cl12"], "fahl": entries["fahl"],
+    }
+
+
+def write_gsf(filepath, planar, icpl, top, bot, layer, nlay):
+    """Original 3D GSF: one top and one bottom vertex ring per node, all IDs one-based."""
+    xy = np.asarray(planar["vertices"])[:, 1:]
+    vertices, vertex_ids, cells = [], {}, []
+    for node, (cell, z_top, z_bot, k) in enumerate(zip(icpl, top, bot, layer)):
+        ring = planar["cell2d"][cell]
+        ids = []
+        for elevation in (z_top, z_bot):
+            for vertex in ring[4:]:
+                xyz = (*xy[vertex], elevation)
+                if xyz not in vertex_ids:
+                    vertex_ids[xyz] = len(vertices) + 1
+                    vertices.append(xyz)
+                ids.append(vertex_ids[xyz])
+        # Midpoint avoids top+bottom overflow for otherwise finite elevations.
+        z = z_bot + (z_top - z_bot) / 2
+        cells.append((node + 1, ring[1], ring[2], z, int(k) + 1, ids))
+    path = Path(filepath)
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(f"UNSTRUCTURED\n{len(cells)} {nlay} 1 1\n{len(vertices)}\n")
+        for xyz in vertices:
+            stream.write(" ".join(format(float(value), ".17g") for value in xyz) + "\n")
+        for node, x, y, z, k, ids in cells:
+            stream.write(
+                f"{node} {x:.17g} {y:.17g} {z:.17g} {k} {len(ids)} "
+                + " ".join(map(str, ids)) + "\n"
+            )
+    logger.info("Saved original 3D GSF to %s", path)
+    return path
