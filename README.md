@@ -389,6 +389,36 @@ notebook kernel's environment. The example
 requires the separate `mfusg` executable on PATH or an `MFUSG_EXE` path;
 install it outside the notebook with `get-modflow /path/to/bin --subset mfusg`.
 
+### Fully unstructured DISU (full connectivity)
+
+`vorflow.disu` turns a vorflow grid and FloPy-style layer arrays into a fully
+unstructured DISU grid for MODFLOW 6. Layers can follow dipping or undulating
+surfaces: cells whose shared faces overlap vertically are connected even when
+they are in different layers ("full connectivity", Provost et al. 2025).
+
+```python
+import flopy
+from vorflow import disu
+
+d = disu.DisuGrid(grid, top, botm, idomain).build()   # FloPy shapes: (ncpl,), (nlay, ncpl)
+print(d.report())
+flopy.mf6.ModflowGwfdisu(gwf, **d.get_gridprops_mf6_disu())
+k_nodes = k_layers[d.nodemap >= 0]                     # (nlay, ncpl) values in node order
+flopy.mf6.ModflowGwfnpf(gwf, k=k_nodes, xt3doptions=True, angle2=0.0, angle3=0.0)
+```
+
+- **Pinch-outs:** idomain -1 or `min_thickness` marks pass-through cells.
+  They are removed, and their interval goes to the active cells above and
+  below (`collapse="split"`), so no thickness is lost. idomain 0 is no-flow
+  and never passes flow.
+- **XT3D:** use it with offset layers, and give NPF `angle2` and `angle3`
+  (zeros are fine). Without them MODFLOW 6 XT3D ignores the vertical
+  offsets. `connectivity="layered"` gives the DISV connections instead.
+- **Nodes and cells:** `nodemap` maps `(layer, cell)` to the DISU node (-1
+  where removed) and `cellmap` lists every layer cell with its node, status,
+  centre, top and bottom. FloPy reads the layer number from the IHC
+  diagonal, so `PlotMapView(modelgrid=gwf.modelgrid, layer=k)` works directly.
+
 ### Optional file export
 
 GeoPandas writes formats such as Shapefile and GeoPackage through an I/O engine
@@ -628,6 +658,18 @@ If you use `vorflow` in your work, please cite it using the metadata in
 (GitHub's "Cite this repository" button formats it).
 
 ## Acknowledgements
+
+The full-connectivity DISU builder (`vorflow.disu`) follows the algorithm of
+C. D. Langevin's USGS `disv2disu.py`, published with Provost, A.M., Bardot,
+K., Langevin, C.D. and McCallum, J.L. (2025), *Accurate simulation of flow
+through dipping aquifers with MODFLOW 6 using enhanced cell connectivity*,
+Groundwater 63(3), 399-408 (<https://doi.org/10.1111/gwat.13459>), and the
+problem described by Bardot, K., Lesueur, M., Siade, A.J. and McCallum, J.L.
+(2023), *Revisiting MODFLOW's capability to model flow through sedimentary
+structures*, Groundwater 61, 663-673 (<https://doi.org/10.1111/gwat.13273>).
+Its pass-through of pinched cells follows
+[LoopFlopy](https://github.com/kerrybardot/loopflopy) (Bardot et al. 2025,
+Environmental Modelling & Software 192, 106557).
 
 Thanks to David ([@d-strom](https://github.com/d-strom)) for reporting the
 line-junction problem in [#31](https://github.com/rhugman/vorflow/issues/31)
