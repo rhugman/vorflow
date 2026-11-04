@@ -89,3 +89,61 @@ def test_idomain_layers_maps_status_to_mf6_codes():
     np.testing.assert_array_equal(d.idomain_layers, [[1, 1, 1], [-1, 1, 0], [1, 1, 1]])
     thin = disu.DisuGrid(_grid(nx=2, ny=1), 10.0, [[7.0, 7.0], [6.95, 3.0]], min_thickness=0.1).build()
     np.testing.assert_array_equal(thin.idomain_layers, [[1, 1], [-1, 1]])
+
+
+def test_layer_view_picks_a_sublayer_where_a_layer_was_split():
+    # Layer 1 split into three equal sublayers in the middle column only (the other slots are empty).
+    grid = _grid(nx=3, ny=1)
+    top = np.full(3, 10.0)
+    botm = [[6.0] * 3, [0.0, 4.0, 0.0], [0.0, 2.0, 0.0], [0.0] * 3]
+    idomain = [[1, 1, 1], [1, 1, 1], [-1, 1, -1], [-1, 1, -1]]
+    parent = np.array([0, 1, 1, 1])
+    d = disu.DisuGrid(grid, top, botm, idomain).build()
+    values = np.arange(d.nodes, dtype=float)
+    n = d.nodemap
+    # Columns 0 and 2 keep one cell (first sublayer); column 1 has three equal sublayers.
+    expected = {
+        "top": [n[1, 0], n[1, 1], n[1, 2]],
+        "bottom": [n[1, 0], n[3, 1], n[1, 2]],
+        "middle": [n[1, 0], n[2, 1], n[1, 2]],
+        "mean": [n[1, 0], (n[1, 1] + n[2, 1] + n[3, 1]) / 3, n[1, 2]],
+    }
+    for pick, want in expected.items():
+        np.testing.assert_allclose(d.layer_view(values, 1, parent, pick=pick), want, err_msg=pick)
+    np.testing.assert_allclose(d.layer_view(values, 0, parent), n[0])
+    with pytest.raises(ValueError, match="No layer has parent"):
+        d.layer_view(values, 5, parent)
+
+
+@pytest.mark.parametrize("collapse, source", [("down", 2), ("up", 0), (None, None)])
+def test_layer_view_cover_shows_the_cell_that_took_a_pass_through_interval(collapse, source):
+    d = _three_columns([[1, 1, 1], [-1, 1, 0], [1, 1, 1]], collapse=collapse)
+    values = np.arange(d.nodes, dtype=float)
+    plain = d.layer_view(values, 1)
+    covered = d.layer_view(values, 1, fill="cover")
+    assert np.isnan(plain[0]) and np.isnan(plain[2])
+    assert np.isnan(covered[2])                                   # No-flow stays empty.
+    if source is None:
+        assert np.isnan(covered[0])                               # The gap is kept: nothing covers it.
+    else:
+        assert covered[0] == d.nodemap[source, 0]
+    assert covered[1] == plain[1] == d.nodemap[1, 1]
+
+
+def test_vertex_grid_is_the_layer_plan_grid_for_flopy():
+    pytest.importorskip("flopy")
+    d = _three_columns([[1, 1, 1], [-1, 1, 0], [1, 1, 1]])
+    vg = d.vertex_grid(1)
+    assert vg.ncpl == 3 and vg.nlay == 1
+    np.testing.assert_allclose(vg.xcellcenters, d.grid.x)
+    np.testing.assert_array_equal(np.asarray(vg.idomain).ravel(), [1, 1, 0])
+
+
+def test_flopy_reads_the_layers_from_the_disu_grid():
+    """FloPy layers a DISU grid by the IHC diagonal, which vorflow sets to the layer number."""
+    flopy = pytest.importorskip("flopy", minversion="3.10")
+    d = _three_columns([[1, 1, 1], [-1, 1, 0], [1, 1, 1]])
+    sim = flopy.mf6.MFSimulation()
+    gwf = flopy.mf6.ModflowGwf(sim)
+    flopy.mf6.ModflowGwfdisu(gwf, **d.get_gridprops_mf6_disu())
+    np.testing.assert_array_equal(gwf.modelgrid.ncpl, [3, 1, 3])
