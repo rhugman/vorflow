@@ -1,10 +1,12 @@
-"""Tracking for DisuGrid: values between nodes and layers, and point lookup."""
+"""Tracking for DisuGrid: values between nodes and layers, point lookup and the cell map file."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from vorflow import disu
 
+from test_disu_full import _two_columns
 from test_disu_grid import _grid
 
 
@@ -48,6 +50,38 @@ def test_locate_and_column_follow_the_collapsed_cells():
     assert len(d.column(5.0, 0.5)) == 0
     with pytest.raises(RuntimeError, match="build"):
         disu.DisuGrid(grid, 10.0, [0.0]).locate(0, 0, 0)
+
+
+def test_cellmap_csv_round_trip(tmp_path):
+    d = _two_columns(np.array([20.0, 20.0]), [12, 4], [16, 0])
+    path = d.save_cellmap(tmp_path / "cells.csv")
+    back = pd.read_csv(path)
+    assert list(back.columns[:3]) == ["node", "layer", "icpl"]
+    np.testing.assert_array_equal(back.node, d.cellmap.node)
+    assert list(back.status) == list(d.cellmap.status.astype(str))
+
+
+def test_cellmap_csv_gives_each_layer_cell_its_node_unit_and_idomain(tmp_path):
+    # Layer 1 split into two sublayers in the middle column only (the second slot is empty elsewhere).
+    grid = _grid(nx=3, ny=1)
+    top = np.full(3, 10.0)
+    botm = [[6.0, 6.0, 6.0], [0.0, 3.0, 0.0], [0.0, 0.0, 0.0]]
+    idomain = [[1, 1, 1], [1, 1, 0], [-1, 1, 0]]
+    parent = np.array([0, 1, 1])
+    d = disu.DisuGrid(grid, top, botm, idomain).build()
+    back = pd.read_csv(d.save_cellmap(tmp_path / "cells.csv", parent))
+    np.testing.assert_array_equal(back.unit, parent[back.layer])
+    np.testing.assert_array_equal(back.idomain, np.ravel(d.idomain_layers))
+    # Active rows in node order carry the exported node centres and mid-elevations.
+    props = d.get_gridprops_mf6_disu()
+    nodes = back[back.node >= 0].sort_values("node")
+    np.testing.assert_array_equal(nodes.node, np.arange(d.nodes))
+    np.testing.assert_allclose(nodes[["x", "y"]], [row[1:3] for row in props["cell2d"]])
+    np.testing.assert_allclose(nodes.z, (props["top"] + props["bot"]) / 2)
+    assert (nodes.idomain == 1).all()
+    np.testing.assert_array_equal(pd.read_csv(d.save_cellmap(tmp_path / "plain.csv")).unit, back.layer)
+    with pytest.raises(ValueError, match="parent"):
+        d.save_cellmap(tmp_path / "bad.csv", parent[:-1])
 
 
 def test_idomain_layers_maps_status_to_mf6_codes():
