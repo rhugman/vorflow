@@ -625,6 +625,101 @@ class DisuGrid:
             "gap": np.where(side, 0.0, np.maximum(0.0, bot[upper] - top[lower])),
         })
 
+    def plot_quality(self, layer, column="ortho_error_3d", quality=None, ax=None, colorbar=True, **kwargs):
+        """Plan view of one layer's connections, coloured by a column of :meth:`quality`.
+
+        Each connection with an end in ``layer`` is a line between the two
+        cell centres (a vertical connection within one cell column is a dot),
+        drawn over the layer's plan grid in order of value, so the largest end
+        on top. Needs Matplotlib (``pip install vorflow[plot]``).
+
+        Args:
+            layer: The layer to draw.
+            column: The :meth:`quality` column to colour by.
+            quality: The :meth:`quality` table, or some of its rows (for
+                example ``q[q.ihc == 0]`` or ``q[q.cl_ratio > 2]``) to draw only
+                those; computed when None.
+            ax (matplotlib.axes.Axes, optional): Axes to draw on; a new figure
+                is created when None.
+            colorbar (bool): Add a colour bar.
+            **kwargs: ``cmap``, ``norm`` and ``linewidth`` of the connections.
+
+        Returns:
+            matplotlib.axes.Axes: The axes drawn on.
+        """
+        from ._plot import draw_connections, get_ax
+
+        self._require_build()
+        if not 0 <= layer < self.nlay:
+            raise ValueError(f"layer must be in [0, {self.nlay}), got {layer}.")
+        q = self.quality() if quality is None else quality
+        q = q[q[column].notna()]
+        n, m = q["n"].to_numpy(), q["m"].to_numpy()
+        q = q[(self._node_layer[n] == layer) | (self._node_layer[m] == layer)]
+        ax = get_ax(ax)
+        self.grids_per_layer[layer].boundary.plot(ax=ax, color="0.75", linewidth=0.3)
+        xy = self._columns[["x", "y"]].to_numpy(dtype=float)[self._node_cell]
+        draw_connections(ax, xy[q["n"].to_numpy()], xy[q["m"].to_numpy()], q[column].to_numpy(dtype=float),
+                         colorbar=colorbar, label=column, **kwargs)
+        return ax
+
+    def plot_quality_section(self, line, column="ortho_error_3d", quality=None, ax=None, colorbar=True, **kwargs):
+        """Vertical section along a plan line, with connections coloured by a column of :meth:`quality`.
+
+        The active cells the line crosses are outlined, each over the stretch
+        of the line inside it; each connection between two of them is a line
+        between their middles. The horizontal axis is the distance along
+        ``line``; with ``ax.set_aspect("equal")`` the drawn angles are true.
+        Needs Matplotlib (``pip install vorflow[plot]``).
+
+        Args:
+            line: A shapely LineString, or its points, in plan.
+            column, quality, ax, colorbar, **kwargs: As for :meth:`plot_quality`.
+
+        Returns:
+            matplotlib.axes.Axes: The axes drawn on.
+        """
+        from matplotlib.collections import PatchCollection
+        from matplotlib.patches import Rectangle
+
+        from ._plot import draw_connections, require_matplotlib
+
+        self._require_build()
+        plt = require_matplotlib()
+        line = line if isinstance(line, shapely.LineString) else shapely.LineString(line)
+        cells = self._section_cells(line)
+        q = self.quality() if quality is None else quality
+        q = q[q[column].notna() & q["n"].isin(cells.index) & q["m"].isin(cells.index)]
+        if ax is None:
+            _, ax = plt.subplots()
+        top, bot = self._node_top[cells.index], self._node_bot[cells.index]
+        boxes = [Rectangle((s0, b), s1 - s0, t - b) for s0, s1, b, t in zip(cells.s0, cells.s1, bot, top)]
+        ax.add_collection(PatchCollection(boxes, facecolor="none", edgecolor="0.6", linewidth=0.4))
+        middle = np.column_stack([(cells.s0 + cells.s1) / 2, (top + bot) / 2])
+        row = pd.Series(np.arange(len(cells)), index=cells.index)
+        draw_connections(ax, middle[row[q["n"]].to_numpy()], middle[row[q["m"]].to_numpy()],
+                         q[column].to_numpy(dtype=float), colorbar=colorbar, label=column, **kwargs)
+        ax.set_xlabel("distance along the line")
+        ax.set_ylabel("elevation")
+        return ax
+
+    def _section_cells(self, line):
+        """Active nodes whose plan cell ``line`` crosses, with the stretch of the line (s0, s1) inside each."""
+        rows = []
+        for g, grid in enumerate(self._grids):
+            geoms = grid.geometry.to_numpy()
+            hit = shapely.STRtree(geoms).query(line, predicate="intersects")
+            cuts = shapely.intersection(geoms[hit], line)
+            for i, cut in zip(hit, cuts):
+                if cut.length == 0:
+                    continue
+                along = shapely.line_locate_point(line, shapely.points(shapely.get_coordinates(cut)))
+                for layer in np.flatnonzero(np.asarray(self._layer_grid) == g):
+                    node = self._nodemap[layer, self._col_of[g][i]]
+                    if node >= 0:
+                        rows.append((node, along.min(), along.max()))
+        return pd.DataFrame(rows, columns=["node", "s0", "s1"]).drop_duplicates("node").set_index("node")
+
     def report(self):
         """Plain-text summary of the grid and its connections."""
         self._require_build()
