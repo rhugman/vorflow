@@ -73,6 +73,14 @@ def test_a_change_of_grid_tilts_vertical_connections():
     assert (vertical.ortho_error_3d > 0).any()
 
 
+def test_without_collapse_the_gap_is_the_pass_through_thickness():
+    idomain = [np.ones(2, int), -np.ones(2, int), np.ones(2, int)]
+    q = disu.DisuGrid(_grid(nx=2, ny=1), 10.0, [6.0, 4.0, 0.0], idomain, collapse=None).build().quality()
+    np.testing.assert_allclose(q[q.ihc == 0].gap, 2.0)
+    q = disu.DisuGrid(_grid(nx=2, ny=1), 10.0, [6.0, 4.0, 0.0], idomain).build().quality()
+    np.testing.assert_allclose(q.gap, 0.0)                  # collapse="split" hands the 2 m to the neighbours
+
+
 def test_a_chained_connection_reports_the_skipped_thickness(grids):  # noqa: F811
     base, pit = grids
     idomain = np.ones(len(pit), dtype=int)

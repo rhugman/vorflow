@@ -460,12 +460,15 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
 #### Checking the grid
 
 vorflow builds the grid it is given; whether it is good enough for the model
-is the modeller's call. `d.quality()` measures every connection: the 3D
-orthogonality error (the line between the two cell centres against the face
-normal; the plan error of each plan grid is in `calculate_mesh_quality`), the grading across the face (`cl_ratio`) and the pass-through
-thickness a chained connection skips (`gap`). `d.plot_quality(layer, column)`
-maps one layer's connections and `d.plot_quality_section(line, column)` draws
-them in a section; pass part of the table to draw only those connections.
+is the modeller's call. `d.quality()` measures every connection:
+`ortho_error_3d` measures the angle between the line joining the two cell
+centres and the face normal (`calculate_mesh_quality` gives the plan error of
+each plan grid); `cl_ratio` measures how unevenly the face sits between the
+centres; `gap` gives the pass-through thickness a vertical connection jumps
+over without resistance (with `collapse=None`, or between two changes of
+grid). `d.plot_quality(layer, column)` maps one layer's connections and
+`d.plot_quality_section(line, column)` draws them in a section; pass part of
+the table to draw only those connections.
 To screen every layer at once, colour each cell by its worst connection:
 
 ```python

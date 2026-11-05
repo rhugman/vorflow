@@ -596,8 +596,11 @@ class DisuGrid:
           the shorter: the grading across the face (plan distances for side
           faces, half thicknesses for vertical connections). 1 when the face
           is midway between the centres.
-        * ``gap``: thickness of the pass-through cells a vertical connection
-          skips between two changes of grid; 0 elsewhere.
+        * ``gap``: the thickness a vertical connection jumps over without
+          counting it in its length, so it adds no resistance (as idomain -1
+          in MODFLOW 6). That happens where pass-through cells are not handed
+          to their neighbours: with ``collapse=None``, and where a
+          pass-through cell sits between two changes of grid. 0 elsewhere.
         """
         self._require_build()
         n, m, ihc = (np.asarray(self.links[key]) for key in ("n", "m", "ihc"))
