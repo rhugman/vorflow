@@ -570,6 +570,61 @@ class DisuGrid:
             out.append(found)
         return out
 
+    def quality(self):
+        """Geometric quality of every connection, one row each.
+
+        These are measurements, not pass/fail checks: vorflow builds the grid
+        it is given, and whether it is good enough for the model is the
+        modeller's judgement. Filter or group the table (for example by
+        ``ihc``, or per node with ``groupby``) and map it with
+        :meth:`plot_quality`, :meth:`plot_quality_section` or
+        :meth:`to_layers`.
+
+        Columns: ``n``, ``m`` and ``ihc`` as in :attr:`links`; ``area``, the
+        connection's area (face width times shared height for side faces,
+        overlap area for vertical connections); and
+
+        * ``ortho_error``: plan orthogonality error of the shared face, in
+          degrees, as in :func:`vorflow.utils.calculate_mesh_quality`; NaN for
+          vertical connections.
+        * ``ortho_error_3d``: angle in degrees between the line joining the
+          two cell centres and the normal of the shared face. It adds the tilt
+          between offset cells and, for vertical connections, the plan shift
+          between cells of different grids. Without XT3D or ghost nodes the
+          flow between two cells is exact only where it is 0.
+        * ``cl_ratio``: the longer of the two centre-to-face distances over
+          the shorter: the grading across the face (plan distances for side
+          faces, half thicknesses for vertical connections). 1 when the face
+          is midway between the centres.
+        * ``gap``: thickness of the pass-through cells a vertical connection
+          skips between two changes of grid; 0 elsewhere.
+        """
+        self._require_build()
+        n, m, ihc = (np.asarray(self.links[key]) for key in ("n", "m", "ihc"))
+        top, bot, col = self._node_top, self._node_bot, self._node_cell
+        centre = np.column_stack([self._columns["x"].to_numpy(dtype=float)[col],
+                                  self._columns["y"].to_numpy(dtype=float)[col], (top + bot) / 2])
+        joint = centre[m] - centre[n]
+        side = ihc != 0
+        face = self._link_faces()
+        normal = np.zeros_like(joint)
+        normal[~side, 2] = 1.0
+        normal[side, 0] = self._faces["normal_x"].to_numpy(dtype=float)[face[side]]
+        normal[side, 1] = self._faces["normal_y"].to_numpy(dtype=float)[face[side]]
+        cosine = np.abs((joint * normal).sum(axis=1)) / np.linalg.norm(joint, axis=1)
+        ortho = np.full(len(n), np.nan)
+        ortho[side] = self._faces["ortho_error"].to_numpy(dtype=float)[face[side]]
+        cl_n, cl_m = np.asarray(self.links["cl_n"], dtype=float), np.asarray(self.links["cl_m"], dtype=float)
+        upper = np.where(top[n] >= top[m], n, m)
+        lower = np.where(upper == n, m, n)
+        return pd.DataFrame({
+            "n": n, "m": m, "ihc": ihc, "area": np.asarray(self.links["fahl"], dtype=float),
+            "ortho_error": ortho,
+            "ortho_error_3d": np.degrees(np.arccos(np.clip(cosine, 0.0, 1.0))),
+            "cl_ratio": np.maximum(cl_n, cl_m) / np.minimum(cl_n, cl_m),
+            "gap": np.where(side, 0.0, np.maximum(0.0, bot[upper] - top[lower])),
+        })
+
     def report(self):
         """Plain-text summary of the grid and its connections."""
         self._require_build()
@@ -592,6 +647,10 @@ class DisuGrid:
         if len(self._faces):
             lines.append(f"  max plan orthogonality error: {self.diagnostics['max_ortho_error']:.3g} deg "
                          "(faces that carry a connection)")
+        if len(self.links["n"]):
+            q = self.quality()
+            lines.append(f"  max 3D orthogonality error: {q['ortho_error_3d'].max():.3g} deg; largest cl ratio: "
+                         f"{q['cl_ratio'].max():.3g} (every connection: quality())")
         diag = self.diagnostics
         if diag["chained_links"]:
             lines.append(
