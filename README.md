@@ -457,6 +457,26 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
 - **Existing DISV models** (FloPy, LoopFlopy) go in through
   `disu.DisuGrid.from_disv(vertices, cell2d, top, botm, idomain)`.
 
+#### Checking the grid
+
+vorflow builds the grid it is given; whether it is good enough for the model
+is the modeller's call. `d.quality()` measures every connection: the plan and
+3D orthogonality errors (the line between the two cell centres against the
+face normal), the grading across the face (`cl_ratio`) and the pass-through
+thickness a chained connection skips (`gap`). `d.plot_quality(layer, column)`
+maps one layer's connections and `d.plot_quality_section(line, column)` draws
+them in a section; pass part of the table to draw only those connections.
+To screen every layer at once, colour each cell by its worst connection:
+
+```python
+q = d.quality()
+side = q[q.ihc != 0]                                   # q.ihc == 0: top and bottom faces
+both = pd.concat([side.assign(node=side.n), side.assign(node=side.m)])
+worst = both.groupby("node").ortho_error_3d.max().reindex(range(d.nodes))
+for k, (grid, v) in enumerate(zip(d.grids_per_layer, d.to_layers(worst.to_numpy()))):
+    grid.assign(v=v).plot("v", ax=axes[k], vmin=0, vmax=60)
+```
+
 ### Optional file export
 
 GeoPandas writes formats such as Shapefile and GeoPackage through an I/O engine
