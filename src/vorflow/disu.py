@@ -251,16 +251,27 @@ class DisuGrid:
         elevation (a coarse cell above a change of grid next to a fine cell
         below it) carry no connection, so they are left out.
         """
-        side = np.asarray(self.links["ihc"]) != 0
-        if not side.any() or not len(self._faces):
-            return 0.0
+        face = self._link_faces()
+        face = face[face >= 0]
+        return float(self._faces["ortho_error"].to_numpy()[face].max()) if len(face) else 0.0
+
+    def _link_faces(self):
+        """Row of the plan face table behind each connection; -1 for vertical connections."""
+        found = np.full(len(self.links["n"]), -1, dtype=np.int64)
+        side = np.flatnonzero(np.asarray(self.links["ihc"]) != 0)
+        if not len(side) or not len(self._faces):
+            return found
         a = self._node_cell[np.asarray(self.links["n"])[side]]
         b = self._node_cell[np.asarray(self.links["m"])[side]]
         f1 = self._faces["cell_id_1"].to_numpy(dtype=np.int64)
         f2 = self._faces["cell_id_2"].to_numpy(dtype=np.int64)
-        ncol = int(max(a.max(), b.max(), f1.max(), f2.max())) + 1
-        used = np.isin(np.minimum(f1, f2) * ncol + np.maximum(f1, f2), np.minimum(a, b) * ncol + np.maximum(a, b))
-        return float(self._faces["ortho_error"].to_numpy()[used].max()) if used.any() else 0.0
+        ncol = len(self._columns)
+        face_key = np.minimum(f1, f2) * ncol + np.maximum(f1, f2)
+        link_key = np.minimum(a, b) * ncol + np.maximum(a, b)
+        order = np.argsort(face_key)
+        pos = order[np.minimum(np.searchsorted(face_key, link_key, sorter=order), len(order) - 1)]
+        found[side] = np.where(face_key[pos] == link_key, pos, -1)
+        return found
 
     def get_gridprops_mf6_disu(self):
         """Keyword arguments for ``flopy.mf6.ModflowGwfdisu`` (gridgen key names).
