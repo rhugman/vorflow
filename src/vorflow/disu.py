@@ -674,7 +674,8 @@ class DisuGrid:
 
         Args:
             line: A shapely LineString, or its points, in plan.
-            column, quality, ax, colorbar, **kwargs: As for :meth:`plot_quality`.
+            column, quality, ax, colorbar: As for :meth:`plot_quality`.
+            **kwargs: As for :meth:`plot_quality`.
 
         Returns:
             matplotlib.axes.Axes: The axes drawn on.
