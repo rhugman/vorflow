@@ -1,9 +1,12 @@
 """DisuGrid.quality(): one row of geometric measurements per connection."""
 
+import geopandas as gpd
 import numpy as np
 import pytest
+from shapely.geometry import Polygon
 
 from vorflow import disu
+from vorflow.utils import build_connectivity
 
 from test_disu_full import _two_columns
 from test_disu_grid import _grid
@@ -18,8 +21,6 @@ def test_aligned_layers_are_ideal():
     np.testing.assert_allclose(q.ortho_error_3d, 0.0, atol=1e-9)
     np.testing.assert_allclose(q.cl_ratio, 1.0)
     np.testing.assert_array_equal(q.gap, 0.0)
-    assert q[q.ihc == 0].ortho_error.isna().all()
-    np.testing.assert_allclose(q[q.ihc != 0].ortho_error, 0.0, atol=1e-9)
 
 
 def test_offset_connections_measure_their_tilt_area_and_grading():
@@ -35,6 +36,17 @@ def test_offset_connections_measure_their_tilt_area_and_grading():
     assert q.loc[(a1, a2)].area == pytest.approx(1.0)           # the 1 m x 1 m plan cell
     assert q.loc[(a1, b2)].cl_ratio == pytest.approx(1.0)       # the face is midway in plan
     assert q.loc[(b1, b2)].cl_ratio == pytest.approx(16 / 4)    # half thicknesses 2 and 8
+
+
+def test_between_centres_at_one_depth_the_3d_error_is_the_plan_error():
+    # Two parallelograms sheared by 0.5: their shared face leans atan(0.5) off the line between centres.
+    cells = [Polygon([(i, 0), (i + 1, 0), (i + 1.5, 1), (i + 0.5, 1)]) for i in range(2)]
+    grid = gpd.GeoDataFrame({"node_id": [100, 101], "zone_id": 1, "x": [c.centroid.x for c in cells],
+                             "y": [c.centroid.y for c in cells]}, geometry=cells)
+    q = disu.DisuGrid(grid, 10.0, [6.0, 2.0]).build().quality()
+    side = q[q.ihc != 0].ortho_error_3d
+    np.testing.assert_allclose(side, np.degrees(np.arctan(0.5)))
+    np.testing.assert_allclose(side, build_connectivity(grid, center="generator").ortho_error.iloc[0])
 
 
 def test_cl_ratio_measures_plan_grading():

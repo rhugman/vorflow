@@ -584,14 +584,14 @@ class DisuGrid:
         connection's area (face width times shared height for side faces,
         overlap area for vertical connections); and
 
-        * ``ortho_error``: plan orthogonality error of the shared face, in
-          degrees, as in :func:`vorflow.utils.calculate_mesh_quality`; NaN for
-          vertical connections.
         * ``ortho_error_3d``: angle in degrees between the line joining the
-          two cell centres and the normal of the shared face. It adds the tilt
-          between offset cells and, for vertical connections, the plan shift
-          between cells of different grids. Without XT3D or ghost nodes the
-          flow between two cells is exact only where it is 0.
+          two cell centres and the normal of the shared face. Between centres
+          at the same depth it is the plan orthogonality error of the face
+          (per plan grid, :func:`vorflow.utils.build_connectivity` and
+          :func:`vorflow.utils.calculate_mesh_quality` give that one); it adds
+          the tilt between offset cells and, for vertical connections, the
+          plan shift between cells of different grids. Without XT3D or ghost
+          nodes the flow between two cells is exact only where it is 0.
         * ``cl_ratio``: the longer of the two centre-to-face distances over
           the shorter: the grading across the face (plan distances for side
           faces, half thicknesses for vertical connections). 1 when the face
@@ -612,14 +612,11 @@ class DisuGrid:
         normal[side, 0] = self._faces["normal_x"].to_numpy(dtype=float)[face[side]]
         normal[side, 1] = self._faces["normal_y"].to_numpy(dtype=float)[face[side]]
         cosine = np.abs((joint * normal).sum(axis=1)) / np.linalg.norm(joint, axis=1)
-        ortho = np.full(len(n), np.nan)
-        ortho[side] = self._faces["ortho_error"].to_numpy(dtype=float)[face[side]]
         cl_n, cl_m = np.asarray(self.links["cl_n"], dtype=float), np.asarray(self.links["cl_m"], dtype=float)
         upper = np.where(top[n] >= top[m], n, m)
         lower = np.where(upper == n, m, n)
         return pd.DataFrame({
             "n": n, "m": m, "ihc": ihc, "area": np.asarray(self.links["fahl"], dtype=float),
-            "ortho_error": ortho,
             "ortho_error_3d": np.degrees(np.arccos(np.clip(cosine, 0.0, 1.0))),
             "cl_ratio": np.maximum(cl_n, cl_m) / np.minimum(cl_n, cl_m),
             "gap": np.where(side, 0.0, np.maximum(0.0, bot[upper] - top[lower])),

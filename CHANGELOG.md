@@ -44,8 +44,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `split_contacts()` keeps dipping bottoms at a change of grid as given,
     by adding a wedge layer under a flat cut, on the grid above or below.
   - `subdivide()` makes sublayers in all or some columns.
-  - `quality()` measures every connection (plan and 3D orthogonality
-    errors, grading across the face, skipped pass-through thickness);
+  - `quality()` measures every connection (3D orthogonality error,
+    grading across the face, skipped pass-through thickness);
     `plot_quality()` and `plot_quality_section()` map it in plan and in
     section.
   - `to_nodes`, `to_layers`, `locate`, `column` and `save_cellmap` track
