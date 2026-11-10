@@ -418,6 +418,17 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
   and `write_gsf()`. USG has no XT3D but still gains from the extra
   connections. Between cells of unequal thickness its default conductance is
   too small; `MfUsgLpf(ikcflag=1, ksat=d.get_mfusg_ksat(k))` makes it exact.
+- **Ghost-node corrections (GNC):** where a connection leans (`ortho_error_3d`
+  in `quality()`), `gnc = d.estimate_gnc()` gives MODFLOW-USG and
+  USG-Transport the correction XT3D gives MODFLOW 6. The weights depend on
+  geometry only (computed once, valid when K changes) and are exact for
+  linear heads. Write them with `flopy.mfusg.MfUsgGnc(model,
+  **gnc.get_gridprops_mfusg_gnc())`, then `gnc.write_mfusg_gnc(fn_path)`
+  after `write_input()`; or `flopy.mf6.ModflowGwfgnc(gwf,
+  **gnc.get_gridprops_mf6_gnc())` with IMS `BICGSTAB` (not with XT3D). Like
+  XT3D, it is not automatically an improvement: it can lose accuracy across
+  sharp K contrasts, next to barriers, near wells and with strong vertical
+  anisotropy. Compare with the standard formulation on your model.
 - **Finer cells at depth:** pass one grid per layer, e.g.
   `DisuGrid([base, base, pit, pit], top, [b0, b1, b2, b3])` with
   `pit = disu.splice(base, fine, polygon)`: base cells outside the polygon,

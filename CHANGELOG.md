@@ -48,6 +48,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     grading across the face, skipped pass-through thickness);
     `plot_quality()` and `plot_quality_section()` map it in plan and in
     section.
+  - `estimate_gnc()` computes ghost-node corrections for every connection
+    whose centre line is not normal to its face, from geometry only, and
+    returns `GncCorrections` with the MF6 GNC and MODFLOW-USG GNC input
+    (`write_mfusg_gnc()` keeps double-precision weights). It is exact for
+    linear heads, and MODFLOW-USG reproduces MODFLOW 6's results with it.
   - `to_nodes`, `to_layers`, `locate`, `column` and `save_cellmap` track
     cells; `idomain_layers`, `layer_view` and `vertex_grid` give per-layer
     status maps and 2D views for FloPy plots; `from_disv()` reads existing
