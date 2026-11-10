@@ -361,6 +361,33 @@ class DisuGrid:
         return write_gsf(filepath, self._planar, self._node_cell, self._node_top, self._node_bot,
                          self._node_layer, self.nlay)
 
+    def barrier_faces(self, trace):
+        """Return the connections a vertical barrier cuts, with HFB package data.
+
+        Mesh every layer with the barrier (``add_line(..., is_barrier=True)``)
+        so that it follows cell faces, and pass the lines the faces follow
+        (``MeshGenerator.barrier_lines``). A horizontal connection is cut where
+        the face between its two cells lies on the trace, including faces that
+        meet at a junction. A trace that runs off the cell faces raises
+        ``ValueError``: this method does not approximate a barrier on a mesh
+        that does not follow it.
+
+        Parameters
+        ----------
+        trace : LineString, LinearRing or MultiLineString, or a sequence of them
+            One geometry for every layer, or one per layer (``None`` where the
+            layer has no barrier).
+
+        Returns
+        -------
+        BarrierFaces
+            Link indices, node pairs and ``get_gridprops_mf6_hfb`` /
+            ``get_gridprops_mfusg_hfb``.
+        """
+        from ._hfb import barrier_faces
+
+        return barrier_faces(self, trace)
+
     def to_nodes(self, values):
         """Pick the values of the active cells, in DISU node order.
 

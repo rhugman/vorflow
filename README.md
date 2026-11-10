@@ -454,6 +454,15 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
   writes it for tools that work layer by layer in 2D, such as pilot points
   per layer: every layer cell with its node, plan cell, centre, top, bottom
   and mid-elevation, its `idomain` code, and its `unit`, the original layer.
+- **Barriers and faults:** mesh the fault into every layer
+  (`add_line(fault, is_barrier=True)`), then `faces = d.barrier_faces(fault)`
+  returns the connections it cuts, and
+  `flopy.mf6.ModflowGwfhfb(gwf, **faces.get_gridprops_mf6_hfb(hydchr))`
+  (or `get_gridprops_mfusg_hfb` for `flopy.modflow.ModflowHfb` in USG) makes
+  the HFB package. `hydchr` is the barrier conductivity divided by its
+  width. Give one trace per layer, with `None`, to limit the barrier to some
+  layers. Pass the lines the faces follow, `MeshGenerator.barrier_lines`:
+  a trace that runs off the cell faces raises an error.
 - **Existing DISV models** (FloPy, LoopFlopy) go in through
   `disu.DisuGrid.from_disv(vertices, cell2d, top, botm, idomain)`.
 

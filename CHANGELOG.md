@@ -9,6 +9,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `DisuGrid.barrier_faces(trace)` finds the connections a barrier cuts on a
+  DISU grid meshed with the barrier (`add_line(..., is_barrier=True)`) and
+  returns MODFLOW 6 and MODFLOW-USG HFB package arguments. Give one trace for
+  every layer, or one per layer with `None` where a layer has none. A trace
+  that runs off the cell faces raises `ValueError`; every face on the trace is
+  cut, including those meeting at a junction.
 - `DisuGrid.get_mfusg_ksat(k, k33=None)` returns one hydraulic conductivity
   per connection for `flopy.mfusg.MfUsgLpf(ikcflag=1, ksat=...)`. MODFLOW-USG
   then gives staggered connections between cells of unequal thickness the
