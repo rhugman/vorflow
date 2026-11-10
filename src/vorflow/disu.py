@@ -40,8 +40,9 @@ from . import _columns
 from ._columns import ABSENT, ACTIVE, NOFLOW, PASSTHROUGH, STATUS_NAMES, subdivide
 from ._connect3d import concat_links, layered_links, overlay_links, staggered_links, vertical_links
 from ._disu_export import mf6_gridprops, mfusg_gridprops, mfusg_ksat, write_gsf
+from ._gnc_export import GncCorrections
 
-__all__ = ["DisuGrid", "DisuOptions", "refill", "splice", "split_contacts", "subdivide"]
+__all__ = ["DisuGrid", "DisuOptions", "GncCorrections", "refill", "splice", "split_contacts", "subdivide"]
 
 CONNECTIVITY = ("full", "layered")
 CL12_MODES = ("plan", "connector")
@@ -354,6 +355,50 @@ class DisuGrid:
         k = _node_values(k, self.nodes, "k")
         k33 = k if k33 is None else _node_values(k33, self.nodes, "k33")
         return mfusg_ksat(self.nodes, self.links, k, k33)
+
+    def estimate_gnc(self):
+        """Ghost-node corrections (GNC) for the connections whose centre line is not normal to their face.
+
+        MODFLOW computes the flow between two cells from their two heads, which is exact only when the line
+        joining the cell centres is normal to the shared face (``ortho_error_3d`` = 0 in :meth:`quality`). For
+        every other connection this places a ghost point on the normal and interpolates its head from
+        neighbouring cells. The non-negative weights reproduce any linear head field exactly, use at most five
+        contributors (the MODFLOW-USG limit), and depend on geometry only, so they stay valid when K changes.
+
+        This gives MODFLOW-USG and USG-Transport, which have no XT3D, a correction comparable to MODFLOW 6's
+        XT3D. In MODFLOW 6 use one or the other, not both. Like XT3D, it is exact for linear heads, also with
+        Kv different from Kh, but it is not automatically an improvement: the interpolation assumes heads vary
+        roughly linearly between neighbouring cells. Across sharp K contrasts (for example between layers),
+        next to barriers (HFB), near wells and where strong vertical anisotropy makes vertical gradients steep,
+        it can lose accuracy. Compare with the standard formulation on your model. Rotated anisotropy
+        (``angle1``-``angle3``) is not represented, as in any two-point correction.
+
+        Each corrected connection needs a small linear program (1-2 ms): expect minutes for 100,000 of them.
+        Connections that cannot be corrected keep the standard conductance; a warning reports them. A
+        partial correction can be locally less accurate than none, so check ``unsupported``.
+
+        Returns
+        -------
+        GncCorrections
+            The ghost records, the connections left uncorrected, and the input for
+            ``flopy.mf6.ModflowGwfgnc`` (:meth:`~GncCorrections.get_gridprops_mf6_gnc`) and
+            ``flopy.mfusg.MfUsgGnc`` (:meth:`~GncCorrections.get_gridprops_mfusg_gnc`,
+            :meth:`~GncCorrections.write_mfusg_gnc`).
+
+        Examples
+        --------
+        ::
+
+            gnc = d.estimate_gnc()
+            flopy.mf6.ModflowGwfgnc(gwf, **gnc.get_gridprops_mf6_gnc())   # IMS: linear_acceleration="BICGSTAB"
+
+            usg = flopy.mfusg.MfUsgGnc(model, **gnc.get_gridprops_mfusg_gnc())
+            model.write_input()
+            gnc.write_mfusg_gnc(usg.fn_path)                               # double-precision weights
+        """
+        from ._gnc import estimate_gnc
+
+        return estimate_gnc(self)
 
     def write_gsf(self, filepath):
         """Write the grid specification file (GSF) used by MODFLOW-USG post-processors."""
