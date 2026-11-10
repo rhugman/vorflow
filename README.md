@@ -463,6 +463,15 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
   width. Give one trace per layer, with `None`, to limit the barrier to some
   layers. Pass the lines the faces follow, `MeshGenerator.barrier_lines`:
   a trace that runs off the cell faces raises an error.
+  For a dipping fault give one trace per layer, at that layer's mid-depth,
+  and mesh one grid with all the traces for every layer: the fault becomes a
+  staircase of walls and treads (`faces.vertical`), and `faces.factor`
+  (|n<sub>fault</sub> · n<sub>face</sub>|, multiplied into `hydchr` by the
+  exporters) gives flow normal to the fault the plane's resistance. Flow
+  along a dipping fault still meets the staircase. Vertical HFB connections
+  need MODFLOW 6.7 or later; for MODFLOW-USG the exporter divides their
+  `hydchr` by the mean cell thickness, which USG multiplies it by (exact for
+  confined layers).
 - **Existing DISV models** (FloPy, LoopFlopy) go in through
   `disu.DisuGrid.from_disv(vertices, cell2d, top, botm, idomain)`.
 

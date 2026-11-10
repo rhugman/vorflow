@@ -362,27 +362,47 @@ class DisuGrid:
                          self._node_layer, self.nlay)
 
     def barrier_faces(self, trace):
-        """Return the connections a vertical barrier cuts, with HFB package data.
+        """Return the connections a barrier cuts, with HFB package data.
 
-        Mesh every layer with the barrier (``add_line(..., is_barrier=True)``)
-        so that it follows cell faces, and pass the lines the faces follow
+        Give one trace for a vertical barrier, or one per layer for a dipping
+        one, each at its layer's mid-depth. Mesh every layer with its trace
+        (``add_line(..., is_barrier=True)``) so that the barrier follows cell
+        faces, and pass the lines the faces follow
         (``MeshGenerator.barrier_lines``). A horizontal connection is cut where
         the face between its two cells lies on the trace, including faces that
         meet at a junction. A trace that runs off the cell faces raises
         ``ValueError``: this method does not approximate a barrier on a mesh
         that does not follow it.
 
+        A dipping fault becomes a staircase: walls on each layer's trace and
+        treads between the traces of consecutive layers. A connection between
+        layers with different traces is cut where the two centres lie on
+        opposite sides of their own layers' traces and the segment between them
+        reaches the zone joining the traces, closed at the fault tips. The
+        traces are given one common direction, each following the one above,
+        and consecutive traces must overlap along the strike. Treads are exact
+        where consecutive layers share the cells beside the traces: mesh every
+        layer with all the traces, or each with its own and its neighbours'.
+
         Parameters
         ----------
         trace : LineString, LinearRing or MultiLineString, or a sequence of them
             One geometry for every layer, or one per layer (``None`` where the
-            layer has no barrier).
+            layer has no barrier). Traces that differ between layers must each
+            be one LineString.
 
         Returns
         -------
         BarrierFaces
-            Link indices, node pairs and ``get_gridprops_mf6_hfb`` /
-            ``get_gridprops_mfusg_hfb``.
+            Node pairs, ``vertical`` flags, ``factor`` and
+            ``get_gridprops_mf6_hfb`` / ``get_gridprops_mfusg_hfb``. ``factor``
+            does not depend on K: it is ``|n_fault · n_face|`` for the plane
+            through consecutive traces (1 on a vertical barrier), and the
+            exporters multiply ``hydchr`` by it, so that flow normal to the
+            fault meets the plane's resistance. Flow along a dipping fault still
+            meets the staircase. Vertical barrier connections need MODFLOW 6 6.7
+            or later; MODFLOW-USG and USG-Transport accept them too (see
+            ``get_gridprops_mfusg_hfb``).
         """
         from ._hfb import barrier_faces
 

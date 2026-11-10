@@ -14,7 +14,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   returns MODFLOW 6 and MODFLOW-USG HFB package arguments. Give one trace for
   every layer, or one per layer with `None` where a layer has none. A trace
   that runs off the cell faces raises `ValueError`; every face on the trace is
-  cut, including those meeting at a junction.
+  cut, including those meeting at a junction. With one trace per
+  layer a dipping fault becomes walls and treads (vertical connections
+  between consecutive traces), each with a K-independent factor on the
+  hydraulic characteristic so that flow normal to the fault meets the
+  plane's resistance. The MODFLOW-USG export divides the hydraulic
+  characteristic of vertical connections by the mean cell thickness that
+  USG multiplies it by.
 - `DisuGrid.get_mfusg_ksat(k, k33=None)` returns one hydraulic conductivity
   per connection for `flopy.mfusg.MfUsgLpf(ikcflag=1, ksat=...)`. MODFLOW-USG
   then gives staggered connections between cells of unequal thickness the
