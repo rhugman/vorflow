@@ -51,6 +51,23 @@ Logging
 
    set_verbosity
 
+Fully unstructured DISU
+-----------------------
+
+``vorflow.disu`` builds MF6 and MODFLOW-USG DISU grids with full connectivity from
+vorflow grids and FloPy-style layer arrays; import it as
+``from vorflow import disu``.
+
+.. currentmodule:: vorflow.disu
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   DisuGrid
+   refill
+   splice
+
 Grid quality and utilities
 --------------------------
 

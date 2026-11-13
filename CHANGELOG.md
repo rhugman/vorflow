@@ -9,6 +9,46 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `DisuGrid.get_mfusg_ksat(k, k33=None)` returns one hydraulic conductivity
+  per connection for `flopy.mfusg.MfUsgLpf(ikcflag=1, ksat=...)`. MODFLOW-USG
+  then gives staggered connections between cells of unequal thickness the
+  conductance of their shared face, as MODFLOW 6 does; by default (as with
+  Gridgen) it divides the face area by the cells' mean thickness. For
+  confined layers (`laytyp=0`) or convertible layers with upstream weighting
+  (`laytyp=4`), exact while the cells are saturated; `laytyp=1` is not
+  allowed.
+- `vorflow.disu`: fully unstructured MODFLOW grids with full connectivity
+  (Provost et al. 2025, after Langevin's USGS `disv2disu.py`).
+  - `DisuGrid(grid, top, botm, idomain).build()` takes a vorflow grid and
+    FloPy-style layer arrays. `get_gridprops_mf6_disu()` and
+    `get_gridprops_mfusg_disu()` return arguments for
+    `flopy.mf6.ModflowGwfdisu` and `flopy.mfusg.MfUsgDisU`, with gridgen's
+    key names; `write_gsf()` writes the MODFLOW-USG grid specification file.
+  - Cells in different layers whose faces overlap vertically are connected
+    (IHC=2). Every piece is kept by default, so each cell's face areas
+    match its geometry; merging small pieces (`sliver_abs_tol`) is optional
+    and inexact. `connectivity="layered"` gives the DISV connections.
+  - Pass-through cells (idomain -1, or no thicker than `min_thickness`) are
+    removed without leaving gaps (`collapse`); idomain 0 stays no-flow.
+  - Layers can use different plan grids, joined by their plan overlaps
+    (`splice(base, fine, polygon)` joins grids made separately). Contacts
+    where the grid changes are gap-free: cells that overlap across them
+    share one elevation (the area-weighted mean of the bottoms above).
+  - `refill(base, polygon, resolution)` re-meshes the inside of a barrier
+    outline with finer Voronoi cells that share the outline's vertices, so
+    every face stays orthogonal; the inside is graded by `growth_factor` or
+    `fields`, as in `add_polygon`. `outline_split` makes the cells along the
+    outline finer, and `priority="growth"` enlarges the core cells when the
+    grading cannot reach the outline size (the default keeps `resolution`
+    and warns).
+  - `to_nodes`, `to_layers`, `locate`, `column` and `save_cellmap` track
+    cells; `idomain_layers`, `layer_view` and `vertex_grid` give per-layer
+    status maps and 2D views for FloPy plots; `from_disv()` reads existing
+    DISV models.
+  - `nodemap` and `cellmap` map nodes to layers and plan cells; `report()`
+    gives the offset ratio from the paper, how far a contact at a change of
+    grid moved the bottoms above it, and the reminder that MF6 XT3D needs
+    NPF `angle2`/`angle3` to account for vertical offsets.
 - `ConceptualMesh.check(background_lc=None)` reports input defects that tend
   to produce bad Voronoi cells, before meshing and without Gmsh: short
   segments, close vertices (including a line crossing a polygon edge beside a
