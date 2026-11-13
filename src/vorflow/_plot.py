@@ -6,6 +6,7 @@ Matplotlib is not a dependency of vorflow: it is imported only when a
 from __future__ import annotations
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 
 from ._features import is_embedded, row_bool
@@ -180,3 +181,28 @@ def plot_features(ax, polygons, lines, points, column="zone_id", **kwargs):
     if not field_only.empty:
         plot_by_label(field_only, ax, facecolor="none", edgecolor="black", markersize=12)
     return ax
+
+
+def draw_connections(ax, start, end, values, cmap=None, norm=None, linewidth=1.2, colorbar=True, label=None):
+    """Connections from ``start`` to ``end`` (``(n, 2)`` points) coloured by ``values``; returns the LineCollection.
+
+    Drawn in order of value, so the largest end on top. Connections of zero
+    length (a vertical connection within one cell column) are dots.
+    """
+    plt = require_matplotlib()
+    from matplotlib.collections import LineCollection
+
+    order = np.argsort(values, kind="stable")
+    start, end, values = start[order], end[order], values[order]
+    if norm is None:
+        norm = plt.Normalize(*(np.nanmin(values), np.nanmax(values)) if len(values) else (0, 1))
+    dot = (start == end).all(axis=1)
+    lines = LineCollection(np.stack([start[~dot], end[~dot]], axis=1), cmap=cmap, norm=norm, linewidths=linewidth)
+    lines.set_array(values[~dot])
+    ax.add_collection(lines)
+    if dot.any():
+        ax.scatter(*start[dot].T, c=values[dot], cmap=lines.cmap, norm=norm, s=4 * linewidth, zorder=3)
+    ax.autoscale_view()
+    if colorbar:
+        ax.figure.colorbar(lines, ax=ax, label=label)
+    return lines

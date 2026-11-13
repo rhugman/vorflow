@@ -389,6 +389,116 @@ notebook kernel's environment. The example
 requires the separate `mfusg` executable on PATH or an `MFUSG_EXE` path;
 install it outside the notebook with `get-modflow /path/to/bin --subset mfusg`.
 
+### Fully unstructured DISU (full connectivity)
+
+`vorflow.disu` turns a vorflow grid and FloPy-style layer arrays into a fully
+unstructured DISU grid for MODFLOW 6 or MODFLOW-USG. Layers can follow dipping or undulating
+surfaces: cells whose shared faces overlap vertically are connected even when
+they are in different layers ("full connectivity", Provost et al. 2025).
+
+```python
+import flopy
+from vorflow import disu
+
+d = disu.DisuGrid(grid, top, botm, idomain).build()   # FloPy shapes: (ncpl,), (nlay, ncpl)
+print(d.report())
+flopy.mf6.ModflowGwfdisu(gwf, **d.get_gridprops_mf6_disu())
+flopy.mf6.ModflowGwfnpf(gwf, k=d.to_nodes(k_layers), xt3doptions=True, angle2=0.0, angle3=0.0)
+heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl), NaN where removed
+```
+
+- **Pinch-outs:** idomain -1 or `min_thickness` marks pass-through cells.
+  They are removed, and their interval goes to the active cells above and
+  below (`collapse="split"`), so no thickness is lost. idomain 0 is no-flow
+  and never passes flow.
+- **XT3D:** use it with offset layers, and give NPF `angle2` and `angle3`
+  (zeros are fine). Without them MODFLOW 6 XT3D ignores the vertical
+  offsets. `connectivity="layered"` gives the DISV connections instead.
+- **MODFLOW-USG:** `get_gridprops_mfusg_disu()` for `flopy.mfusg.MfUsgDisU`
+  and `write_gsf()`. USG has no XT3D but still gains from the extra
+  connections. Between cells of unequal thickness its default conductance is
+  too small; `MfUsgLpf(ikcflag=1, ksat=d.get_mfusg_ksat(k))` makes it exact.
+- **Finer cells at depth:** pass one grid per layer, e.g.
+  `DisuGrid([base, base, pit, pit], top, [b0, b1, b2, b3])` with
+  `pit = disu.splice(base, fine, polygon)`: base cells outside the polygon,
+  fine cells inside. The outline must be cell faces in both grids
+  (`add_line(outline, is_barrier=True)`); its vertices need not match. The
+  contact where the grid changes is made gap-free. A change of grid at depth
+  suits near-vertical features; for subhorizontal ones use the same grid in
+  every layer. The cells on either side of a spliced outline are not mirror
+  images of each other, so faces there can be far from orthogonal
+  (`report()` gives the largest error).
+  `disu.refill(base, polygon, resolution)` avoids that: it keeps the base
+  cells outside the polygon and fills the inside with finer Voronoi cells
+  that share the outline's vertices, graded by `growth_factor` or `fields`
+  as in `add_polygon`. `outline_split=2` makes the cells along the outline
+  finer.
+- **Dipping contacts at a change of grid:** where fine cells straddle coarse
+  ones, the gap-free contact under a refinement is one flat level, which
+  moves the bottoms above it; `report()` says by how much.
+  `grids, top, botm, idomain, parent = disu.split_contacts(grids, top, botm,
+  idomain)` keeps them as given by adding a wedge layer.
+- **Sublayers:** `disu.subdivide(top, botm, idomain, nsub=..., where=mask)`
+  splits layers everywhere or only in some columns. Its `parent` (and that of
+  `split_contacts`) maps the layers back to the original units for
+  `layer_view` and `save_cellmap`; a wedge lies on another plan grid than its
+  unit, so `layer_view` shows it by its own layer number, without `parent`.
+- **Tracking:** `nodemap`, `cellmap`, `to_nodes`, `to_layers`,
+  `locate(x, y, z)` and `column(x, y)`. FloPy reads the layer number from the
+  IHC diagonal, so `PlotMapView(modelgrid=gwf.modelgrid, layer=k)` works
+  directly. `idomain_layers` (1 active, -1 pass-through, 0 no-flow),
+  `layer_view` (one 2D map for a layer, also when split into sublayers) and
+  `vertex_grid` (a FloPy grid for those maps) cover the rest; MF6 DISU
+  accepts IDOMAIN 0/1 only.
+- **Layer structure for other tools:** MF6 copies each node's plan polygon
+  to the binary grid file, but not its layer. `save_cellmap(path, parent)`
+  writes it for tools that work layer by layer in 2D, such as pilot points
+  per layer: every layer cell with its node, plan cell, centre, top, bottom
+  and mid-elevation, its `idomain` code, and its `unit`, the original layer.
+- **Barriers and faults:** mesh the fault into every layer
+  (`add_line(fault, is_barrier=True)`), then `faces = d.barrier_faces(fault)`
+  returns the connections it cuts, and
+  `flopy.mf6.ModflowGwfhfb(gwf, **faces.get_gridprops_mf6_hfb(hydchr))`
+  (or `get_gridprops_mfusg_hfb` for `flopy.modflow.ModflowHfb` in USG) makes
+  the HFB package. `hydchr` is the barrier conductivity divided by its
+  width. Give one trace per layer, with `None`, to limit the barrier to some
+  layers. Pass the lines the faces follow, `MeshGenerator.barrier_lines`:
+  a trace that runs off the cell faces raises an error.
+  For a dipping fault give one trace per layer, at that layer's mid-depth,
+  and mesh one grid with all the traces for every layer: the fault becomes a
+  staircase of walls and treads (`faces.vertical`), and `faces.factor`
+  (|n<sub>fault</sub> · n<sub>face</sub>|, multiplied into `hydchr` by the
+  exporters) gives flow normal to the fault the plane's resistance. Flow
+  along a dipping fault still meets the staircase. Vertical HFB connections
+  need MODFLOW 6.7 or later; for MODFLOW-USG the exporter divides their
+  `hydchr` by the mean cell thickness, which USG multiplies it by (exact for
+  confined layers).
+- **Existing DISV models** (FloPy, LoopFlopy) go in through
+  `disu.DisuGrid.from_disv(vertices, cell2d, top, botm, idomain)`.
+
+#### Checking the grid
+
+vorflow builds the grid it is given; whether it is good enough for the model
+is the modeller's call. `d.quality()` measures every connection:
+`ortho_error_3d` measures the angle between the line joining the two cell
+centres and the face normal (`calculate_mesh_quality` gives the plan error of
+each plan grid); `cl_ratio` measures how unevenly the face sits between the
+centres; `gap` gives the pass-through thickness a vertical connection jumps
+over without resistance (with `collapse=None`, or between two changes of
+grid). `d.plot_quality(layer, column)` maps one layer's connections and
+`d.plot_quality_section(line, column)` draws them in a section; pass part of
+the table to draw only those connections.
+To screen every layer at once, colour each cell by its worst connection:
+
+```python
+q = d.quality()
+side = q[q.ihc != 0]                                   # q.ihc == 0: top and bottom faces
+both = pd.concat([side.assign(node=side.n), side.assign(node=side.m)])
+worst = both.groupby("node").ortho_error_3d.max().reindex(range(d.nodes))
+for k, (grid, v) in enumerate(zip(d.grids_per_layer, d.to_layers(worst.to_numpy()))):
+    grid.assign(v=v).plot("v", ax=axes[k], vmin=0, vmax=60)
+```
+
 ### Optional file export
 
 GeoPandas writes formats such as Shapefile and GeoPackage through an I/O engine
@@ -628,6 +738,18 @@ If you use `vorflow` in your work, please cite it using the metadata in
 (GitHub's "Cite this repository" button formats it).
 
 ## Acknowledgements
+
+The full-connectivity DISU builder (`vorflow.disu`) follows the algorithm of
+C. D. Langevin's USGS `disv2disu.py`, published with Provost, A.M., Bardot,
+K., Langevin, C.D. and McCallum, J.L. (2025), *Accurate simulation of flow
+through dipping aquifers with MODFLOW 6 using enhanced cell connectivity*,
+Groundwater 63(3), 399-408 (<https://doi.org/10.1111/gwat.13459>), and the
+problem described by Bardot, K., Lesueur, M., Siade, A.J. and McCallum, J.L.
+(2023), *Revisiting MODFLOW's capability to model flow through sedimentary
+structures*, Groundwater 61, 663-673 (<https://doi.org/10.1111/gwat.13273>).
+Its pass-through of pinched cells follows
+[LoopFlopy](https://github.com/kerrybardot/loopflopy) (Bardot et al. 2025,
+Environmental Modelling & Software 192, 106557).
 
 Thanks to David ([@d-strom](https://github.com/d-strom)) for reporting the
 line-junction problem in [#31](https://github.com/rhugman/vorflow/issues/31)

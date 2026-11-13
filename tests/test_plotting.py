@@ -1,5 +1,6 @@
 import sys
 
+import numpy as np
 import pytest
 from shapely.geometry import LineString, Point, Polygon
 
@@ -172,3 +173,43 @@ def test_mesh_generator_plot_draws_elements():
     ax = mesher.plot(column="zone_id")
 
     assert ax.collections
+
+
+def _offset_disu():
+    """Two columns of offset layers (see test_disu_full): A 20 | 12 | 4 and B 20 | 16 | 0."""
+    from test_disu_full import _two_columns
+
+    return _two_columns(np.array([20.0, 20.0]), [12, 4], [16, 0])
+
+
+def test_disu_plot_quality_draws_the_connections_of_a_layer():
+    from matplotlib.collections import LineCollection, PathCollection
+
+    d = _offset_disu()
+    q = d.quality()
+    ax = d.plot_quality(0, "ortho_error_3d", quality=q)
+    lines = [c for c in ax.collections if isinstance(c, LineCollection) and c.get_array() is not None]
+    dots = [c for c in ax.collections if isinstance(c, PathCollection)]
+    layer = d.cellmap[d.cellmap.node >= 0].sort_values("node").layer.to_numpy()
+    touching = q[(layer[q.n] == 0) | (layer[q.m] == 0)]
+    assert len(lines[0].get_segments()) == (touching.ihc != 0).sum()
+    assert len(dots[0].get_offsets()) == (touching.ihc == 0).sum()
+    assert sorted(lines[0].get_array()) == sorted(touching[touching.ihc != 0].ortho_error_3d)
+    assert len(ax.figure.axes) == 2                                      # the colour bar
+    ax = d.plot_quality(0, quality=q[q.ihc == 0], colorbar=False)
+    assert not [c for c in ax.collections if isinstance(c, LineCollection) and len(c.get_segments())
+                and c.get_array() is not None]
+    with pytest.raises(ValueError, match="layer"):
+        d.plot_quality(5)
+
+
+def test_disu_plot_quality_section_draws_cells_and_connections():
+    from matplotlib.collections import LineCollection, PatchCollection
+
+    d = _offset_disu()
+    ax = d.plot_quality_section([(0.0, 0.5), (2.0, 0.5)], "ortho_error_3d")
+    boxes = [c for c in ax.collections if isinstance(c, PatchCollection)][0]
+    lines = [c for c in ax.collections if isinstance(c, LineCollection)][0]
+    assert len(boxes.get_paths()) == d.nodes                            # the line crosses every cell
+    assert len(lines.get_segments()) == (d.quality().ihc != 0).sum() + (d.quality().ihc == 0).sum()
+    assert max(lines.get_array()) == pytest.approx(np.degrees(np.arctan(8.0)))
