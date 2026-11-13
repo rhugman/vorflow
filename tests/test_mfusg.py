@@ -46,6 +46,14 @@ def test_usg_arrays_for_two_cells_with_asymmetric_distances():
     assert disu["connectivity"]["ortho_error"].max() == 0
 
 
+def test_face_normals_point_from_the_first_cell_to_the_second():
+    # Cell 0 is east of cell 1 and south of cell 2, so the normals point west and north.
+    grid = _grid([box(1, 0, 2, 1), box(0, 0, 1, 1), box(1, 1, 2, 2)])
+    faces = grid_to_mfusg_disu(grid, top=10, botm=0)["connectivity"].set_index(["cell_id_1", "cell_id_2"])
+    np.testing.assert_allclose(faces.loc[(0, 1), ["normal_x", "normal_y"]], [-1, 0], atol=1e-12)
+    np.testing.assert_allclose(faces.loc[(0, 2), ["normal_x", "normal_y"]], [0, 1], atol=1e-12)
+
+
 def test_multilayer_connections_use_mean_thickness_and_own_half_lengths():
     disu = grid_to_mfusg_disu(_grid(), top=[10, 12], botm=[[4, 5], [-1, -4]], nlay=2)
     np.testing.assert_array_equal(disu["nodelay"], [2, 2])
