@@ -139,6 +139,47 @@ def _straight_face(shared, centres, pair, tolerance):
     }
 
 
+def _near_length_bound(geoms, first, second, distance):
+    """Per pair, an upper bound of the length of ``first``'s boundary within ``distance`` of ``second``'s.
+
+    The points within ``distance`` of a segment t lie in a rectangle: along t,
+    from ``distance`` before its start to ``distance`` past its end; across
+    it, within ``distance`` of it. The bound adds up the length of each
+    segment of the first boundary inside the rectangle of each segment of the
+    second.
+    """
+    xy, owner = shapely.get_coordinates(geoms, return_index=True)
+    start, end = xy[:-1], xy[1:]
+    keep = (owner[:-1] == owner[1:]) & np.any(start != end, axis=1)
+    start, end, owner = start[keep], end[keep], owner[:-1][keep]
+    count = np.bincount(owner, minlength=len(geoms))
+    offset = np.cumsum(count) - count
+    length = np.hypot(*(end - start).T)
+    (x, y), (ux, uy) = start.T, ((end - start) / length[:, None]).T
+    per_pair = count[first] * count[second]
+    bound = np.zeros(len(first))
+    # Blocks of about a million segment pairs keep memory bounded on large grids.
+    for block in np.array_split(np.arange(len(first)), 1 + int(per_pair.sum()) // 2**20):
+        pair = np.repeat(block, per_pair[block])
+        k = np.arange(len(pair)) - np.repeat(np.cumsum(per_pair[block]) - per_pair[block], per_pair[block])
+        s = offset[first[pair]] + k // count[second[pair]]
+        t = offset[second[pair]] + k % count[second[pair]]
+        dx, dy, vx, vy = x[s] - x[t], y[s] - y[t], ux[t], uy[t]
+        low, high = np.zeros(len(pair)), length[s]
+        # The positions along s whose coordinate along t, then across it, is within [lower, upper].
+        along = (dx * vx + dy * vy, ux[s] * vx + uy[s] * vy, -distance, length[t] + distance)
+        across = (dy * vx - dx * vy, uy[s] * vx - ux[s] * vy, -distance, distance)
+        for at, rate, lower, upper in (along, across):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                a, b = (lower - at) / rate, (upper - at) / rate
+            parallel = rate == 0
+            a = np.where(parallel, np.where((lower <= at) & (at <= upper), -np.inf, np.inf), a)
+            b = np.where(parallel, np.inf, b)
+            low, high = np.maximum(low, np.minimum(a, b)), np.minimum(high, np.maximum(a, b))
+        bound += np.bincount(pair, np.maximum(high - low, 0), minlength=len(first))
+    return bound
+
+
 def _prepare_grid(gdf, top, botm, nlay):
     # Local import avoids a cycle with the thin public wrappers in utils.
     from .utils import grid_to_disv
@@ -174,10 +215,14 @@ def _prepare_grid(gdf, top, botm, nlay):
     # between neighbours, e.g. along hanging vertices.
     left, right = tree.query(geoms, predicate="dwithin", distance=tolerance)
     boundaries = shapely.boundary(geoms)
-    bands = shapely.buffer(boundaries, tolerance)
     areas = shapely.area(geoms)
+    pairs = sorted(zip(left[left < right], right[left < right]))
+    # Upper bounds of the part of one boundary within the tolerance of the other
+    # (below), from the segments alone; twice the tolerance covers the band's
+    # own roundoff.
+    bounds = _near_length_bound(geoms, *np.array(pairs, dtype=int).reshape(-1, 2).T, 2 * tolerance)
     records = []
-    for i, j in sorted(zip(left[left < right], right[left < right])):
+    for (i, j), bound in zip(pairs, bounds):
         overlap = geoms[i].intersection(geoms[j])
         # Faces recovered from roundoff are checked with twice the tolerance:
         # pieces of one straight face can lie up to it on both sides of it.
@@ -202,10 +247,15 @@ def _prepare_grid(gdf, top, botm, nlay):
         # face (as on a splice outline) they meet over part of it, only at points,
         # or not at all. The part of one boundary within the tolerance of the other
         # is the whole face; at a corner contact it is only about the tolerance long.
-        near = shapely.intersection(boundaries[i], bands[j])
-        lost = sum(p.length for p in _line_parts(near)) - sum(p.length for p in _line_parts(shared))
-        if lost > RECOVERED_FACE_FRACTION * np.sqrt(min(areas[i], areas[j])):
-            shared, recovered = near, True
+        # Its band is costly and most pairs' intersection is already the whole
+        # face: look for it only where its bound exceeds the face found by more
+        # than half the margin (the other half absorbs roundoff in the lengths).
+        found = sum(p.length for p in _line_parts(shared))
+        margin = RECOVERED_FACE_FRACTION * np.sqrt(min(areas[i], areas[j]))
+        if bound - found > margin / 2:
+            near = shapely.intersection(boundaries[i], shapely.buffer(boundaries[j], tolerance))
+            if sum(p.length for p in _line_parts(near)) - found > margin:
+                shared, recovered = near, True
         record = _straight_face(shared, centres[[i, j]], (int(i), int(j)),
                                 2 * tolerance if recovered else tolerance)
         if record is not None:
