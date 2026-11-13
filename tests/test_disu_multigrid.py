@@ -43,6 +43,15 @@ def test_splice_keeps_base_outside_and_fine_inside(grids):
     assert inside.geometry.area.sum() == pytest.approx(PIT.area)
 
 
+def test_splice_numbers_fine_cells_after_base_cells_without_node_id():
+    base, fine = _boxes(4, 1.0).drop(columns="node_id"), _boxes(8, 0.5).drop(columns="node_id")
+    pit = disu.splice(base, fine, PIT)
+    assert pit.node_id.is_unique
+    outside, inside = pit[pit.splice_source == "base"], pit[pit.splice_source == "fine"]
+    assert list(outside.node_id) == list(outside.source_node_id)
+    assert inside.node_id.min() == outside.node_id.max() + 1
+
+
 def test_splice_rejects_cells_crossing_the_outline():
     base, fine = _boxes(4, 1.0), _boxes(8, 0.5)
     with pytest.raises(ValueError, match="cross the splice outline"):

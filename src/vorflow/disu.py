@@ -983,10 +983,10 @@ def splice(base, fine, polygon):
             f"Fine cells cover {inside_area:.6g} of the {polygon_area:.6g} splice area; the fine grid "
             "must cover the whole area inside the outline."
         )
-    start = int(outside["node_id"].max()) + 1 if "node_id" in outside and len(outside) else 0
-    inside["node_id"] = np.arange(start, start + len(inside))
     if "node_id" not in outside:
         outside["node_id"] = outside["source_node_id"]
+    start = int(outside["node_id"].max()) + 1 if len(outside) else 0
+    inside["node_id"] = np.arange(start, start + len(inside))
     return gpd.GeoDataFrame(pd.concat([outside, inside], ignore_index=True), crs=base.crs)
 
 
