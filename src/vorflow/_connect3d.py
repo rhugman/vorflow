@@ -109,7 +109,7 @@ def _containing(point_face, z, cell_face, cell_top, cell_bot):
     candidate = last_top[is_point]
     cell = order[np.maximum(candidate, 0)]
     valid = (candidate >= 0) & (face[np.maximum(candidate, 0)] == face[is_point])
-    valid &= cell_bot[np.where(valid, cell, 0)] < z[point]
+    valid[valid] = cell_bot[cell[valid]] < z[point[valid]]
     found = np.full(len(point_face), -1, dtype=np.int64)
     found[point[valid]] = cell[valid]
     return found
