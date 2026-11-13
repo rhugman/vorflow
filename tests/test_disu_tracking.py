@@ -68,6 +68,15 @@ def test_locate_and_column_follow_the_collapsed_cells():
         disu.DisuGrid(grid, 10.0, [0.0]).locate(0, 0, 0)
 
 
+def test_locate_returns_an_array_for_array_input_of_one_point():
+    d = disu.DisuGrid(_grid(nx=2, ny=1), 10.0, [[5, 5], [0, 0]]).build()
+    one = d.locate(np.array([0.5]), np.array([0.5]), np.array([7.0]))
+    assert isinstance(one, np.ndarray) and one.shape == (1,)
+    assert one[0] == d.nodemap[0, 0]
+    assert isinstance(d.locate([1.5], [0.5], [2.0]), np.ndarray)
+    assert np.ndim(d.locate(0.5, 0.5, 7.0)) == 0
+
+
 def test_cellmap_csv_round_trip(tmp_path):
     d = _two_columns(np.array([20.0, 20.0]), [12, 4], [16, 0])
     path = d.save_cellmap(tmp_path / "cells.csv")

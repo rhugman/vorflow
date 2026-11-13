@@ -43,6 +43,15 @@ def test_splice_keeps_base_outside_and_fine_inside(grids):
     assert inside.geometry.area.sum() == pytest.approx(PIT.area)
 
 
+def test_splice_numbers_fine_cells_after_base_cells_without_node_id():
+    base, fine = _boxes(4, 1.0).drop(columns="node_id"), _boxes(8, 0.5).drop(columns="node_id")
+    pit = disu.splice(base, fine, PIT)
+    assert pit.node_id.is_unique
+    outside, inside = pit[pit.splice_source == "base"], pit[pit.splice_source == "fine"]
+    assert list(outside.node_id) == list(outside.source_node_id)
+    assert inside.node_id.min() == outside.node_id.max() + 1
+
+
 def test_splice_rejects_cells_crossing_the_outline():
     base, fine = _boxes(4, 1.0), _boxes(8, 0.5)
     with pytest.raises(ValueError, match="cross the splice outline"):
@@ -156,6 +165,18 @@ def test_given_tops_must_meet_the_bottoms_above():
     flat = [np.full(len(base), 6.0), np.full(len(base), 4.0), np.full(len(pit), 1.0), np.full(len(pit), 0.0)]
     d = disu.DisuGrid([base, base, pit, pit], [10.0, None, np.full(len(pit), 4.0), None], flat).build()
     _contact_is_gap_free(d, 1, 2)
+
+
+def test_given_tops_of_continuing_columns_must_meet_the_bottoms_above(grids):
+    base, pit = grids
+    botm = [np.full(16, 6.0), np.full(16, 4.0), np.full(28, 2.0), np.full(28, 0.0)]
+    with pytest.raises(ValueError, match="do not meet the bottoms"):
+        disu.DisuGrid([base, base, pit, pit], [10.0, np.full(16, 99.0), None, None], botm).build()
+    exterior_wrong = np.r_[np.full(12, 5.0), np.full(16, 4.0)]   # The 12 base cells come first in pit.
+    with pytest.raises(ValueError, match="do not meet the bottoms"):
+        disu.DisuGrid([base, base, pit, pit], [10.0, None, exterior_wrong, None], botm).build()
+    d = disu.DisuGrid([base, base, pit, pit], [10.0, np.full(16, 6.0), np.full(28, 4.0), None], botm).build()
+    np.testing.assert_array_equal(d.cellmap[d.cellmap.layer == 1].top, 6.0)
 
 
 def test_lists_shaped_like_botm_round_trip(grids):
