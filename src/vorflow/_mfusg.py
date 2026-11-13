@@ -6,7 +6,6 @@ FloPy is deliberately absent: only the tessellator's package wrapper needs it.
 
 from dataclasses import dataclass
 import logging
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -21,6 +20,11 @@ logger = logging.getLogger(__name__)
 # outside (absolute 1e-14..1e-7 m), well past coordinate roundoff. A centre
 # that is really outside its cell is off by a sizeable fraction of it.
 CENTRE_OUTSIDE_FRACTION = 1e-6
+# A face recovered from roundoff (boundaries within the tolerance of each other
+# but meeting only at points) counts when longer than this fraction of
+# sqrt(cell area); at a corner contact the recovered piece is about the
+# tolerance long.
+RECOVERED_FACE_FRACTION = 1e-6
 METADATA_KEYS = {"node_id", "cell_map", "connectivity"}
 PACKAGE_KEYS = {
     "nodes", "nlay", "njag", "ivsd", "idsymrd", "nodelay",
@@ -126,15 +130,81 @@ def _straight_face(shared, centres, pair, tolerance):
         raise ValueError(f"Centres must lie on opposite sides of the shared face for cells {pair}.")
     delta = centres[1] - centres[0]
     angle = np.degrees(np.arccos(np.clip(abs(delta @ normal) / np.linalg.norm(delta), 0, 1)))
+    outward = normal if signed[1] > 0 else -normal  # From cell_1 towards cell_2.
     return {
         "cell_id_1": pair[0], "cell_id_2": pair[1],
         "shared_length": sum(part.length for part in parts),
         "distance_1": abs(signed[0]), "distance_2": abs(signed[1]),
         "ortho_error": float(angle),
+        "normal_x": float(outward[0]), "normal_y": float(outward[1]),
     }
 
 
+def _near_length_bound(geoms, first, second, distance):
+    """Per pair, an upper bound of the length of ``first``'s boundary within ``distance`` of ``second``'s.
+
+    The points within ``distance`` of a segment t lie in a rectangle: along t,
+    from ``distance`` before its start to ``distance`` past its end; across
+    it, within ``distance`` of it. The bound adds up the length of each
+    segment of the first boundary inside the rectangle of each segment of the
+    second.
+    """
+    xy, owner = shapely.get_coordinates(geoms, return_index=True)
+    start, end = xy[:-1], xy[1:]
+    keep = (owner[:-1] == owner[1:]) & np.any(start != end, axis=1)
+    start, end, owner = start[keep], end[keep], owner[:-1][keep]
+    count = np.bincount(owner, minlength=len(geoms))
+    offset = np.cumsum(count) - count
+    length = np.hypot(*(end - start).T)
+    (x, y), (ux, uy) = start.T, ((end - start) / length[:, None]).T
+    per_pair = count[first] * count[second]
+    bound = np.zeros(len(first))
+    # Blocks of about a million segment pairs keep memory bounded on large grids.
+    for block in np.array_split(np.arange(len(first)), 1 + int(per_pair.sum()) // 2**20):
+        pair = np.repeat(block, per_pair[block])
+        k = np.arange(len(pair)) - np.repeat(np.cumsum(per_pair[block]) - per_pair[block], per_pair[block])
+        s = offset[first[pair]] + k // count[second[pair]]
+        t = offset[second[pair]] + k % count[second[pair]]
+        dx, dy, vx, vy = x[s] - x[t], y[s] - y[t], ux[t], uy[t]
+        low, high = np.zeros(len(pair)), length[s]
+        # The positions along s whose coordinate along t, then across it, is within [lower, upper].
+        along = (dx * vx + dy * vy, ux[s] * vx + uy[s] * vy, -distance, length[t] + distance)
+        across = (dy * vx - dx * vy, uy[s] * vx - ux[s] * vy, -distance, distance)
+        for at, rate, lower, upper in (along, across):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                a, b = (lower - at) / rate, (upper - at) / rate
+            parallel = rate == 0
+            a = np.where(parallel, np.where((lower <= at) & (at <= upper), -np.inf, np.inf), a)
+            b = np.where(parallel, np.inf, b)
+            low, high = np.maximum(low, np.minimum(a, b)), np.minimum(high, np.maximum(a, b))
+        bound += np.bincount(pair, np.maximum(high - low, 0), minlength=len(first))
+    return bound
+
+
 def _prepare_grid(gdf, top, botm, nlay):
+    planar, area, faces, _ = _planar_faces(gdf)
+    layer_top, bot = _layer_arrays(top, botm, nlay, len(gdf))
+    ncpl = len(gdf)
+    mapping = pd.DataFrame({
+        "model_node": np.arange(nlay * ncpl),
+        "layer": np.repeat(np.arange(nlay), ncpl),
+        "cell_id": np.tile(np.arange(ncpl), nlay),
+        "orig_index": np.tile(gdf.index.to_numpy(), nlay),
+        "node_id": np.tile(planar["node_id"], nlay),
+    })
+    if "zone_id" in gdf:
+        mapping["zone_id"] = np.tile(gdf["zone_id"].to_numpy(), nlay)
+    return _LayeredGrid(planar, layer_top, bot, area, mapping, faces)
+
+
+def _planar_faces(gdf):
+    """Validated plan geometry shared by every layer: DISV rings, cell areas and straight faces.
+
+    Returns ``(planar, area, faces, tolerance)``. ``faces`` has one row per
+    pair of cells sharing a straight face of positive length, with the face
+    length, each centre's perpendicular distance to it, the orthogonality
+    error and the unit normal pointing from ``cell_id_1`` to ``cell_id_2``.
+    """
     # Local import avoids a cycle with the thin public wrappers in utils.
     from .utils import grid_to_disv
 
@@ -159,17 +229,28 @@ def _prepare_grid(gdf, top, botm, nlay):
     outside = ~shapely.dwithin(geoms, shapely.points(centres), centre_tolerance)
     if outside.any():
         raise ValueError(f"Centre of cell {int(np.flatnonzero(outside)[0])} lies outside its polygon.")
-    layer_top, bot = _layer_arrays(top, botm, nlay, len(gdf))
     # Reuse conforming rings, not MF6 solver semantics. Limit insertion to
     # coordinate roundoff: a looser map-scale tolerance can bend very short
     # faces, making GSF footprints disagree with the numerical geometry.
     planar = grid_to_disv(gdf, tolerance=tolerance)
     tree = shapely.STRtree(geoms)
-    left, right = tree.query(geoms, predicate="intersects")
+    # Within the tolerance, not just intersecting: roundoff can leave a hair's gap
+    # between neighbours, e.g. along hanging vertices.
+    left, right = tree.query(geoms, predicate="dwithin", distance=tolerance)
+    boundaries = shapely.boundary(geoms)
+    areas = shapely.area(geoms)
+    pairs = sorted(zip(left[left < right], right[left < right]))
+    # Upper bounds of the part of one boundary within the tolerance of the other
+    # (below), from the segments alone; twice the tolerance covers the band's
+    # own roundoff.
+    bounds = _near_length_bound(geoms, *np.array(pairs, dtype=int).reshape(-1, 2).T, 2 * tolerance)
     records = []
-    for i, j in sorted(zip(left[left < right], right[left < right])):
+    for (i, j), bound in zip(pairs, bounds):
         overlap = geoms[i].intersection(geoms[j])
-        if overlap.area > 0:
+        # Faces recovered from roundoff are checked with twice the tolerance:
+        # pieces of one straight face can lie up to it on both sides of it.
+        recovered = overlap.area > 0
+        if recovered:
             # Only forgive slivers contained within BOTH boundary roundoff
             # bands. An area-only cutoff could accept small but deep overlaps.
             for geom in (geoms[i], geoms[j]):
@@ -184,97 +265,72 @@ def _prepare_grid(gdf, top, botm, nlay):
                 raise ValueError(f"Cannot resolve roundoff overlap between cells {i} and {j}.")
         else:
             shared = geoms[i].boundary.intersection(geoms[j].boundary)
-        record = _straight_face(shared, centres[[i, j]], (int(i), int(j)), tolerance)
+        # Roundoff can keep two boundaries from meeting along all of their face,
+        # even snapped: along hanging vertices a hair off the neighbour's straight
+        # face (as on a splice outline) they meet over part of it, only at points,
+        # or not at all. The part of one boundary within the tolerance of the other
+        # is the whole face; at a corner contact it is only about the tolerance long.
+        # Its band is costly and most pairs' intersection is already the whole
+        # face: look for it only where its bound exceeds the face found by more
+        # than half the margin (the other half absorbs roundoff in the lengths).
+        found = sum(p.length for p in _line_parts(shared))
+        margin = RECOVERED_FACE_FRACTION * np.sqrt(min(areas[i], areas[j]))
+        if bound - found > margin / 2:
+            near = shapely.intersection(boundaries[i], shapely.buffer(boundaries[j], tolerance))
+            if sum(p.length for p in _line_parts(near)) - found > margin:
+                shared, recovered = near, True
+        record = _straight_face(shared, centres[[i, j]], (int(i), int(j)),
+                                2 * tolerance if recovered else tolerance)
         if record is not None:
             records.append(record)
     faces = pd.DataFrame(records, columns=[
         "cell_id_1", "cell_id_2", "shared_length", "distance_1", "distance_2", "ortho_error",
+        "normal_x", "normal_y",
     ])
     if len(faces):
-        logger.info("MFUSG export: %s horizontal faces; maximum orthogonality error %.6g degrees",
+        logger.info("Grid export: %s horizontal faces; maximum orthogonality error %.6g degrees",
                     len(faces), faces["ortho_error"].max())
-    ncpl = len(gdf)
-    mapping = pd.DataFrame({
-        "model_node": np.arange(nlay * ncpl),
-        "layer": np.repeat(np.arange(nlay), ncpl),
-        "cell_id": np.tile(np.arange(ncpl), nlay),
-        "orig_index": np.tile(gdf.index.to_numpy(), nlay),
-        "node_id": np.tile(planar["node_id"], nlay),
-    })
-    if "zone_id" in gdf:
-        mapping["zone_id"] = np.tile(gdf["zone_id"].to_numpy(), nlay)
-    return _LayeredGrid(planar, layer_top, bot, shapely.area(geoms), mapping, faces)
+    return planar, shapely.area(geoms), faces, tolerance
 
 
 def _disu_arrays(grid):
-    """Full-matrix USG CL12 stores each node's own half-connection length."""
+    """Full-matrix USG CL12 stores each node's own half-connection length.
+
+    The connections come from the shared DISU core (``vorflow.disu``) with
+    DISV-style layered connectivity; this keeps the original USG output:
+    ``ivsd=-1`` (layers share one mesh) and one layer of areas.
+    """
+    from ._columns import ACTIVE
+    from ._connect3d import concat_links, layered_links, vertical_links
+    from ._disu_export import mfusg_gridprops
+
     ncpl, nlay = grid.ncpl, grid.nlay
-    nodes = ncpl * nlay
-    rows = [[] for _ in range(nodes)]
-    thickness = grid.top - grid.bot
-    for face in grid.faces.itertuples(index=False):
-        i, j = int(face.cell_id_1), int(face.cell_id_2)
-        for layer in range(nlay):
-            n, m = layer * ncpl + i, layer * ncpl + j
-            area = face.shared_length * 0.5 * (thickness[layer, i] + thickness[layer, j])
-            rows[n].append((m, face.distance_1, area))
-            rows[m].append((n, face.distance_2, area))
-    for layer in range(nlay - 1):
-        for cell in range(ncpl):
-            n, m = layer * ncpl + cell, (layer + 1) * ncpl + cell
-            rows[n].append((m, thickness[layer, cell] / 2, grid.area[cell]))
-            rows[m].append((n, thickness[layer + 1, cell] / 2, grid.area[cell]))
-    iac = np.array([len(row) + 1 for row in rows], dtype=np.int32)
-    ja, cl12, fahl = [], [], []
-    for node, row in enumerate(rows):
-        ja.append(node)
-        cl12.append(0.0)
-        fahl.append(0.0)
-        for neighbour, distance, area in sorted(row):
-            ja.append(neighbour)
-            cl12.append(distance)
-            fahl.append(area)
-    return {
-        "nodes": nodes, "nlay": nlay, "njag": int(iac.sum()),
-        "ivsd": -1, "idsymrd": 0,
-        "nodelay": np.full(nlay, ncpl, dtype=np.int32),
-        "top": grid.top.ravel().copy(), "bot": grid.bot.ravel().copy(),
-        "area": grid.area.copy(), "iac": iac,
-        "ja": np.array(ja, dtype=np.int32),
-        "cl12": np.array(cl12, dtype=float), "fahl": np.array(fahl, dtype=float),
+    status = np.full((nlay, ncpl), ACTIVE, dtype=np.int8)
+    nodemap = np.arange(nlay * ncpl).reshape(nlay, ncpl)
+    links = concat_links(
+        vertical_links(status, nodemap, grid.top, grid.bot, grid.area),
+        layered_links(status, nodemap, grid.faces, grid.top, grid.bot),
+    )
+    props = mfusg_gridprops(
+        nlay * ncpl, nlay, grid.top.ravel(), grid.bot.ravel(), np.tile(grid.area, nlay),
+        np.repeat(np.arange(nlay), ncpl), links,
+    )
+    del props["ivc"]
+    props.update({
+        "ivsd": -1, "area": grid.area.copy(),
+        "nodelay": props["nodelay"].astype(np.int32),
+        "iac": props["iac"].astype(np.int32), "ja": props["ja"].astype(np.int32),
         "node_id": grid.cell_map["node_id"].to_numpy(copy=True),
         "cell_map": grid.cell_map.copy(deep=True),
         "connectivity": grid.faces.copy(deep=True),
-    }
+    })
+    return props
 
 
 def _write_gsf(grid, filepath):
     """Original 3D GSF: top and bottom vertex rings, all IDs one-based."""
-    xy = np.asarray(grid.planar["vertices"])[:, 1:]
-    vertices, vertex_ids, cells = [], {}, []
-    for node in range(grid.ncpl * grid.nlay):
-        layer, cell = divmod(node, grid.ncpl)
-        ring = grid.planar["cell2d"][cell]
-        ids = []
-        for elevation in (grid.top[layer, cell], grid.bot[layer, cell]):
-            for vertex in ring[4:]:
-                xyz = (*xy[vertex], elevation)
-                if xyz not in vertex_ids:
-                    vertex_ids[xyz] = len(vertices) + 1
-                    vertices.append(xyz)
-                ids.append(vertex_ids[xyz])
-        # Midpoint avoids top+bottom overflow for otherwise finite elevations.
-        z = grid.bot[layer, cell] + (grid.top[layer, cell] - grid.bot[layer, cell]) / 2
-        cells.append((node + 1, ring[1], ring[2], z, layer + 1, ids))
-    path = Path(filepath)
-    with path.open("w", encoding="utf-8", newline="\n") as stream:
-        stream.write(f"UNSTRUCTURED\n{len(cells)} {grid.nlay} 1 1\n{len(vertices)}\n")
-        for xyz in vertices:
-            stream.write(" ".join(format(float(value), ".17g") for value in xyz) + "\n")
-        for node, x, y, z, layer, ids in cells:
-            stream.write(
-                f"{node} {x:.17g} {y:.17g} {z:.17g} {layer} {len(ids)} "
-                + " ".join(map(str, ids)) + "\n"
-            )
-    logger.info("Saved original 3D GSF to %s", path)
-    return path
+    from ._disu_export import write_gsf
+
+    nodes = grid.ncpl * grid.nlay
+    layer, cell = np.divmod(np.arange(nodes), grid.ncpl)
+    return write_gsf(filepath, grid.planar, cell, grid.top.ravel(), grid.bot.ravel(), layer, grid.nlay)
