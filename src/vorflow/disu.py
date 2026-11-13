@@ -1001,8 +1001,11 @@ def refill(base, polygon, resolution, *, growth_factor=None, fields=None, outlin
     Cells outside stay exactly as in ``base``, so their columns continue
     through every layer; the new cells inside end at the same outline
     vertices, so every outline face is shared one to one (no hanging
-    vertices). Use the result for the layers that need the finer cells, as
-    with :func:`splice`.
+    vertices). Where a long outline face meets a short one, refill halves
+    the long face on the inside until the faces stay exact; the extra
+    vertices hang on the outside cell's face, as with ``outline_split``. Use
+    the result for the layers that need the finer cells, as with
+    :func:`splice`.
 
     Args:
         base: The vorflow grid to start from.
@@ -1069,7 +1072,15 @@ def refill(base, polygon, resolution, *, growth_factor=None, fields=None, outlin
     tolerance = 1e-7 * ring.length
     touching = geoms[shapely.dwithin(geoms, ring, tolerance)]
     base_nodes = _refill.outline_nodes(touching, ring, tolerance)
-    nodes = _refill.subdivide_outline(base_nodes, int(outline_split))
+    split_nodes = _refill.subdivide_outline(base_nodes, int(outline_split))
+    nodes = _refill.even_outline(split_nodes, polygon)
+    if len(nodes) > len(split_nodes):
+        warnings.warn(
+            f"refill: {len(nodes) - len(split_nodes)} vertices were added to halve long outline faces next to "
+            "short ones. They hang on the outside cells' faces, so the connections across those faces are not "
+            "orthogonal. More even faces along the outline in the base grid avoid it.",
+            UserWarning, stacklevel=2,
+        )
     sites_in, sites_out, centres, radii = _refill.mirrored_sites(nodes, polygon)
     segment = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=1)
     spacing = float(np.median(segment))
@@ -1079,7 +1090,7 @@ def refill(base, polygon, resolution, *, growth_factor=None, fields=None, outlin
                               min(float(resolution), spacing))
     generators = np.vstack([sites_in, fill, sites_out])
     n = len(nodes)
-    own_site = [(i, (i + 1) % n) for i in range(n)]
+    own_site = _refill.segment_circles(n)
     own = own_site + [(-1, -1)] * len(fill) + own_site
     _refill.check_circles(generators, centres, radii, own)
     keep = np.arange(n + len(fill))

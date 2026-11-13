@@ -7,7 +7,8 @@ nodes (the empty-circle rule of the exact barriers, Berge et al. 2019): with
 no other generator inside a circle, the segment is exactly the Voronoi face
 between the pair. The inside generator of each pair is kept as a cell, the
 outside one only shapes that face, and new generators fill the rest of the
-polygon outside the circles.
+polygon outside the circles. Where a long segment's circle would hold a
+neighbouring segment's generator, the long segment is halved.
 """
 
 from __future__ import annotations
@@ -30,18 +31,53 @@ def outline_nodes(geoms, ring, tolerance):
     order = np.argsort(position)
     position, points = position[order], points[order]
     keep = np.r_[True, np.diff(position) > tolerance]
-    if position[-1] > ring.length - tolerance:      # The start point, reached again at the end.
-        keep[-1] = False
+    keep[position > ring.length - tolerance] = False    # The start point, reached again at the end.
     return points[keep]
 
 
 def subdivide_outline(nodes, divisions):
-    """Split every outline segment into ``divisions`` equal parts."""
-    if divisions == 1:
+    """Split every outline segment into ``divisions`` equal parts (one number, or one per segment)."""
+    divisions = np.broadcast_to(divisions, len(nodes))
+    if (divisions == 1).all():
         return nodes
     nxt = np.roll(nodes, -1, axis=0)
-    steps = np.arange(divisions)[None, :, None] / divisions
-    return (nodes[:, None, :] + steps * (nxt - nodes)[:, None, :]).reshape(-1, 2)
+    seg = np.repeat(np.arange(len(nodes)), divisions)
+    steps = (np.arange(len(seg)) - np.repeat(np.cumsum(divisions) - divisions, divisions)) / divisions[seg]
+    return nodes[seg] + steps[:, None] * (nxt - nodes)[seg]
+
+
+def segment_circles(n):
+    """The two circles (end nodes) of each of the ``n`` outline segments."""
+    return [(i, (i + 1) % n) for i in range(n)]
+
+
+def even_outline(nodes, polygon):
+    """Halve the longest face around any breached circle until no circle holds another segment's site.
+
+    A long face next to a short one gives a circle large enough to hold a
+    neighbouring segment's mirrored site. Halving faces keeps every node; the
+    new ones are hanging vertices on the outside cells' faces, as with
+    ``outline_split``. Faces no longer than the shortest one at the start are
+    not halved, so a breach that remains (at a corner sharper than about 68
+    degrees) is left to :func:`check_circles`. An outline without a breach is
+    returned unchanged.
+    """
+    shortest = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=1).min()
+    while True:
+        n = len(nodes)
+        inside, outside, centres, radii = mirrored_sites(nodes, polygon)
+        own = segment_circles(n) * 2
+        bad = breaches(np.vstack([inside, outside]), centres, radii, own)
+        if not bad:
+            return nodes
+        length = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=1)
+        faces = np.unique([f % n for k, h in bad for f in (k - 1, k, own[h][0])])
+        longest = (1 - 1e-9) * length[faces].max()     # ties to roundoff are halved together
+        if longest <= shortest:
+            return nodes
+        halve = np.zeros(n, dtype=bool)
+        halve[faces[length[faces] >= longest]] = True
+        nodes = subdivide_outline(nodes, np.where(halve, 2, 1))
 
 
 def mirrored_sites(nodes, polygon):
@@ -80,21 +116,35 @@ def fill_nodes(candidates, centres, radii, sites, spacing):
     return candidates[clear & (gap > 0.5 * spacing)]
 
 
-def check_circles(generators, centres, radii, own):
-    """Raise if a generator lies strictly inside a circle other than the two of its own segment.
+def breaches(generators, centres, radii, own):
+    """(circle, generator) pairs with the generator strictly inside a circle other than the two it sits on.
 
     ``own`` gives, per generator, the indices of the two circles it sits on
     (-1 for fill nodes).
     """
-    tree = cKDTree(generators)
-    for k, hits in enumerate(tree.query_ball_point(centres, radii * (1 - INSIDE_EPS))):
-        bad = [h for h in hits if k not in own[h]]
-        if bad:
-            x, y = generators[bad[0]]
-            raise ValueError(
-                f"refill: a generator at ({x:.2f}, {y:.2f}) lies inside an outline circle, so the outline "
-                "faces would not be exact. Use a coarser resolution near the outline or a larger growth."
-            )
+    hits = cKDTree(generators).query_ball_point(centres, radii * (1 - INSIDE_EPS))
+    return [(k, h) for k, inside in enumerate(hits) for h in inside if k not in own[h]]
+
+
+def check_circles(generators, centres, radii, own):
+    """Raise if a generator lies strictly inside a circle other than the two of its own segment.
+
+    Fill nodes are kept out of every circle, so the offender is a mirrored
+    outline site that :func:`even_outline` could not clear: the outline faces
+    around that circle meet too sharply (or are too uneven).
+    """
+    bad = breaches(generators, centres, radii, own)
+    if bad:
+        k, h = bad[0]
+        length = np.linalg.norm(np.roll(centres, -1, axis=0) - centres, axis=1)
+        near = length[[k - 1, k, own[h][0]]]
+        x, y = centres[k]
+        raise ValueError(
+            f"refill: the outline faces near ({x:.2f}, {y:.2f}), from {near.min():.3g} to {near.max():.3g} long, "
+            "meet too sharply (or are too uneven) for every outline face to stay exact; faces of similar length "
+            "need a corner of at least about 68 degrees. Blunt that corner of the outline, or give the base grid "
+            "more even faces there."
+        )
 
 
 def voronoi_cells(generators, polygon, keep, nodes, tolerance):
