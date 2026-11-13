@@ -638,6 +638,8 @@ class DisuGrid:
             above = bot_l[layer - 1, cols]
             new = np.isnan(above)
             layer_top = above.copy()
+            if top is not None:
+                _check_given_tops(layer, top[~new], above[~new], above[~new])
             if new.any():
                 in_layer = np.zeros(ncol, dtype=bool)
                 in_layer[cols] = True
@@ -679,16 +681,7 @@ class DisuGrid:
 
         start_top = level[group_s]
         if given is not None:
-            scale = np.nanmax(np.abs(np.r_[given, bottom, 1.0]))
-            spread = np.where(joined, highest - lowest, 0.0)[group_s]
-            mismatch = (np.abs(given - np.where(np.isnan(start_top), given, start_top)) > 1e-9 * scale) | (
-                spread > 1e-9 * scale)
-            if mismatch.any():
-                raise ValueError(
-                    f"Layer {layer}: the tops given for cells below the change of grid do not meet the "
-                    "bottoms of the cells above them. Leave that layer's top as None to make the contact "
-                    "gap-free automatically."
-                )
+            _check_given_tops(layer, given, start_top, bottom, np.where(joined, highest - lowest, 0.0)[group_s])
             start_top = np.asarray(given, dtype=float).copy()
         lone = np.isnan(start_top)
         if lone.any():
@@ -938,6 +931,21 @@ def _group_bottoms(group, bottom, weight, n_groups):
     agree = joined & (lowest == highest)
     level[agree] = lowest[agree]
     return level, lowest, highest
+
+
+def _check_given_tops(layer, given, expected, bottoms, spread=0.0):
+    """Raise unless tops given for ``layer`` meet the ``expected`` bottoms above them (NaN: no cell above).
+
+    The tolerance scales with ``bottoms``; a positive ``spread`` means the
+    bottoms a cell meets disagree, so no single given top can meet them.
+    """
+    tolerance = 1e-9 * np.nanmax(np.abs(np.r_[given, bottoms, 1.0]))
+    mismatch = (np.abs(given - np.where(np.isnan(expected), given, expected)) > tolerance) | (spread > tolerance)
+    if mismatch.any():
+        raise ValueError(
+            f"Layer {layer}: the tops given do not meet the bottoms of the cells above them. Leave that "
+            "layer's top as None to make the contact gap-free automatically."
+        )
 
 
 def splice(base, fine, polygon):

@@ -167,6 +167,18 @@ def test_given_tops_must_meet_the_bottoms_above():
     _contact_is_gap_free(d, 1, 2)
 
 
+def test_given_tops_of_continuing_columns_must_meet_the_bottoms_above(grids):
+    base, pit = grids
+    botm = [np.full(16, 6.0), np.full(16, 4.0), np.full(28, 2.0), np.full(28, 0.0)]
+    with pytest.raises(ValueError, match="do not meet the bottoms"):
+        disu.DisuGrid([base, base, pit, pit], [10.0, np.full(16, 99.0), None, None], botm).build()
+    exterior_wrong = np.r_[np.full(12, 5.0), np.full(16, 4.0)]   # The 12 base cells come first in pit.
+    with pytest.raises(ValueError, match="do not meet the bottoms"):
+        disu.DisuGrid([base, base, pit, pit], [10.0, None, exterior_wrong, None], botm).build()
+    d = disu.DisuGrid([base, base, pit, pit], [10.0, np.full(16, 6.0), np.full(28, 4.0), None], botm).build()
+    np.testing.assert_array_equal(d.cellmap[d.cellmap.layer == 1].top, 6.0)
+
+
 def test_lists_shaped_like_botm_round_trip(grids):
     d = _pit_model(grids)
     k = [np.full(16, 1.0), np.full(16, 2.0), np.full(28, 3.0), np.full(28, 4.0)]
