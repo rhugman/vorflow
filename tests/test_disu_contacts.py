@@ -57,6 +57,21 @@ def test_the_cell_map_file_puts_the_wedge_in_the_unit_it_belongs_to(tmp_path, we
     assert set(cells[cells.layer == 2].grid) != set(cells[cells.layer == other].grid)
 
 
+@pytest.mark.parametrize("wedge, unit, other", [("upper", 2, 3), ("lower", 1, 1)])
+def test_layer_view_shows_a_wedge_by_its_own_layer_number(wedge, unit, other):
+    base, pit, grids, botm, contact = _straddling_model()
+    top = [10.0, None, contact, None] if wedge == "lower" else 10.0
+    grids2, top2, botm2, idomain2, parent = disu.split_contacts(grids, top, botm, wedge=wedge)
+    d = disu.DisuGrid(grids2, top2, botm2, idomain2).build()
+    values = np.arange(d.nodes, dtype=float)
+    # The wedge (layer 2) lies on another plan grid than the rest of its unit.
+    with pytest.raises(ValueError, match="split_contacts wedge.*parent=None"):
+        d.layer_view(values, unit, parent)
+    layers = d.to_layers(values)
+    for k in (2, other):
+        np.testing.assert_array_equal(d.layer_view(values, k), layers[k])
+
+
 def test_lower_wedge_follows_the_contact_given_on_the_fine_grid():
     base, pit, grids, botm, contact = _straddling_model()
     top = [10.0, None, contact, None]

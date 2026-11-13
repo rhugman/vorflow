@@ -1,10 +1,13 @@
 """disu.refill: finer cells inside an outline that share the outline's vertices with the base grid."""
 
+import geopandas as gpd
+import numpy as np
 import pytest
 import shapely
+from scipy.spatial import Voronoi
 from shapely.geometry import Polygon, box
 
-from vorflow import disu
+from vorflow import _refill, disu
 from vorflow._mfusg import _planar_faces
 from vorflow._refill import outline_nodes
 from vorflow.fields import ExponentialField, MeshField
@@ -92,6 +95,62 @@ def test_refill_rejects_bad_input():
         disu.refill(base, PIT, -1.0)
     with pytest.raises(ValueError, match="priority"):
         disu.refill(base, PIT, 0.25, priority="smooth")
+
+
+def _uneven_boxes(x):
+    """4 x 4 boxes whose second column ends at ``x``: outline faces of x - 1 next to 3 - x on box(1, 1, 3, 3)."""
+    xs, ys = [0, 1, x, 3, 4], [0, 1, 2, 3, 4]
+    cells = [box(x0, y0, x1, y1) for y0, y1 in zip(ys, ys[1:]) for x0, x1 in zip(xs, xs[1:])]
+    return gpd.GeoDataFrame({"node_id": range(len(cells)), "x": [c.centroid.x for c in cells],
+                             "y": [c.centroid.y for c in cells]}, geometry=cells)
+
+
+@pytest.mark.parametrize("x", [1.75, 1.5, 1.3, 1.2])
+def test_long_faces_next_to_short_ones_are_halved_until_every_face_is_exact(x):
+    # The long face's circle held a neighbouring segment's mirrored generator.
+    nodes = outline_nodes(_uneven_boxes(x).geometry.to_numpy(), PIT.exterior, 1e-9)
+    even = _refill.even_outline(nodes, PIT)
+    assert len(even) > len(nodes) and {tuple(p) for p in nodes} <= {tuple(p) for p in even}
+    inside, outside, centres, radii = _refill.mirrored_sites(even, PIT)
+    n = len(even)
+    assert not _refill.breaches(np.vstack([inside, outside]), centres, radii, _refill.segment_circles(n) * 2)
+    # Each segment is exactly the Voronoi face between its pair, whatever the other generators.
+    vor = Voronoi(np.vstack([inside, outside]))
+    ridges = {frozenset(p): v for p, v in zip(vor.ridge_points.tolist(), vor.ridge_vertices)}
+    for i in range(n):
+        ends = vor.vertices[ridges[frozenset((i, n + i))]]
+        segment = even[[i, (i + 1) % n]]
+        assert np.allclose(ends, segment, atol=1e-12) or np.allclose(ends, segment[::-1], atol=1e-12)
+
+
+def test_refill_of_uneven_outline_faces_shares_every_base_vertex():
+    base = _uneven_boxes(1.3)
+    with pytest.warns(UserWarning, match="added to halve long outline faces"):
+        grid = disu.refill(base, PIT, 0.25)
+    inner, outer = _outline_vertices(grid, PIT, True), _outline_vertices(base, PIT, False)
+    assert outer < inner          # the halved long faces add hanging vertices, as outline_split does
+    fine = grid[grid.splice_source == "fine"].reset_index(drop=True)
+    assert shapely.union_all(fine.geometry.to_numpy()).area == pytest.approx(PIT.area)
+    assert _planar_faces(fine)[2]["ortho_error"].max() < 1e-4      # degrees; roundoff only
+
+
+def test_even_outline_leaves_a_regular_outline_unchanged_and_a_sharp_one_to_the_error():
+    nodes = outline_nodes(_boxes(4, 1.0).geometry.to_numpy(), PIT.exterior, 1e-9)
+    assert _refill.even_outline(nodes, PIT) is nodes
+    # Equal faces at 60 degree corners: halving cannot help, check_circles explains.
+    triangle = Polygon([(0, 0), (10, 0), (5, 5 * np.sqrt(3))])
+    nodes = _refill.subdivide_outline(np.asarray(triangle.exterior.coords)[:-1], 10)
+    assert _refill.even_outline(nodes, triangle) is nodes
+    inside, outside, centres, radii = _refill.mirrored_sites(nodes, triangle)
+    with pytest.raises(ValueError, match="meet too sharply.*68 degrees"):
+        _refill.check_circles(np.vstack([inside, outside]), centres, radii, _refill.segment_circles(len(nodes)) * 2)
+
+
+def test_outline_nodes_drop_every_copy_of_the_start_point():
+    # Two vertices a roundoff short of the ring's end (its start point) used to leave one, a zero-length face.
+    ring = box(0, 0, 1, 1).exterior                    # starts and ends at (1, 0), reached last from (0, 0)
+    cells = [box(0, -1, 1 - 2e-14, 0), box(1 - 1e-14, -1, 2, 0)]
+    assert len(outline_nodes(np.array(cells), ring, 1e-9)) == 4
 
 
 @pytest.mark.slow

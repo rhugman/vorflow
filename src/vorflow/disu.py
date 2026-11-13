@@ -454,7 +454,11 @@ class DisuGrid:
             values: One value per DISU node (e.g. ``heads.ravel()``).
             layer: The original layer, as numbered by ``parent``.
             parent: The original layer of each layer, as returned by
-                :func:`subdivide`; ``None`` when no layer was split.
+                :func:`subdivide`; ``None`` when no layer was split. The
+                layers of one original layer must share a plan grid, so a
+                wedge from :func:`split_contacts`, which lies on another grid
+                than its unit, is viewed by its own layer number
+                (``parent=None``).
             pick: Which sublayer gives the value in each column: ``"top"``
                 or ``"bottom"`` (the highest or lowest active one),
                 ``"middle"`` (the active cell at the original layer's
@@ -482,7 +486,9 @@ class DisuGrid:
             raise ValueError(f"No layer has parent {layer!r}.")
         grids = {self._layer_grid[k] for k in sub}
         if len(grids) > 1:
-            raise ValueError(f"The sublayers of layer {layer} use different plan grids.")
+            raise ValueError(f"The sublayers of layer {layer} use different plan grids, as with a "
+                             "split_contacts wedge; view them separately, by their own layer numbers "
+                             "with parent=None, or with a parent that numbers the wedge apart.")
         cols = self._col_of[self._layer_grid[sub[0]]]
         node = self._nodemap[np.ix_(sub, cols)]
         active = node >= 0
@@ -557,9 +563,10 @@ class DisuGrid:
 
         Uses the cell elevations after pass-through gaps are closed, so a
         point in a collapsed pass-through cell maps to the active cell that
-        took its interval. Accepts scalars or arrays.
+        took its interval. Scalar inputs give an int, array inputs an array.
         """
         self._require_build()
+        scalar = np.ndim(x) == np.ndim(y) == np.ndim(z) == 0
         x, y, z = (np.atleast_1d(np.asarray(v, dtype=float)) for v in (x, y, z))
         cols = self._columns_at(x, y)
         found = np.full(len(x), -1, dtype=np.int64)
@@ -570,7 +577,7 @@ class DisuGrid:
             node_safe = np.maximum(node, 0)
             hit &= (self._node_bot[node_safe] <= z) & (z <= self._node_top[node_safe])
             found[hit] = node[hit]
-        return found if found.size > 1 else int(found[0])
+        return int(found[0]) if scalar else found
 
     def save_cellmap(self, path, parent=None):
         """Write :attr:`cellmap` to CSV, so results can be mapped back without vorflow.
@@ -856,6 +863,8 @@ class DisuGrid:
             above = bot_l[layer - 1, cols]
             new = np.isnan(above)
             layer_top = above.copy()
+            if top is not None:
+                _check_given_tops(layer, top[~new], above[~new], above[~new])
             if new.any():
                 in_layer = np.zeros(ncol, dtype=bool)
                 in_layer[cols] = True
@@ -897,16 +906,7 @@ class DisuGrid:
 
         start_top = level[group_s]
         if given is not None:
-            scale = np.nanmax(np.abs(np.r_[given, bottom, 1.0]))
-            spread = np.where(joined, highest - lowest, 0.0)[group_s]
-            mismatch = (np.abs(given - np.where(np.isnan(start_top), given, start_top)) > 1e-9 * scale) | (
-                spread > 1e-9 * scale)
-            if mismatch.any():
-                raise ValueError(
-                    f"Layer {layer}: the tops given for cells below the change of grid do not meet the "
-                    "bottoms of the cells above them. Leave that layer's top as None to make the contact "
-                    "gap-free automatically."
-                )
+            _check_given_tops(layer, given, start_top, bottom, np.where(joined, highest - lowest, 0.0)[group_s])
             start_top = np.asarray(given, dtype=float).copy()
         lone = np.isnan(start_top)
         if lone.any():
@@ -1316,6 +1316,21 @@ def _coordinate_tolerance(grids):
     return 32 * np.finfo(float).eps * max(1.0, float(np.abs(coords).max()))
 
 
+def _check_given_tops(layer, given, expected, bottoms, spread=0.0):
+    """Raise unless tops given for ``layer`` meet the ``expected`` bottoms above them (NaN: no cell above).
+
+    The tolerance scales with ``bottoms``; a positive ``spread`` means the
+    bottoms a cell meets disagree, so no single given top can meet them.
+    """
+    tolerance = 1e-9 * np.nanmax(np.abs(np.r_[given, bottoms, 1.0]))
+    mismatch = (np.abs(given - np.where(np.isnan(expected), given, expected)) > tolerance) | (spread > tolerance)
+    if mismatch.any():
+        raise ValueError(
+            f"Layer {layer}: the tops given do not meet the bottoms of the cells above them. Leave that "
+            "layer's top as None to make the contact gap-free automatically."
+        )
+
+
 def splice(base, fine, polygon):
     """A plan grid with ``base`` cells outside ``polygon`` and ``fine`` cells inside it.
 
@@ -1351,18 +1366,21 @@ def splice(base, fine, polygon):
         selected["source_node_id"] = (selected["node_id"].to_numpy() if "node_id" in selected
                                       else np.flatnonzero((inside > tolerance) == keep_inside))
         parts.append(selected)
+        if name == "base":
+            # Base cells do not overlap, so their parts inside the polygon add
+            # up to the area of it that the base grid covers.
+            polygon_area = inside.sum()
     outside, inside = parts
-    inside_area, polygon_area = inside.geometry.area.sum(), polygon.intersection(
-        shapely.union_all(base.geometry.to_numpy())).area
+    inside_area = inside.geometry.area.sum()
     if abs(inside_area - polygon_area) > 1e-9 * max(polygon_area, 1.0):
         raise ValueError(
             f"Fine cells cover {inside_area:.6g} of the {polygon_area:.6g} splice area; the fine grid "
             "must cover the whole area inside the outline."
         )
-    start = int(outside["node_id"].max()) + 1 if "node_id" in outside and len(outside) else 0
-    inside["node_id"] = np.arange(start, start + len(inside))
     if "node_id" not in outside:
         outside["node_id"] = outside["source_node_id"]
+    start = int(outside["node_id"].max()) + 1 if len(outside) else 0
+    inside["node_id"] = np.arange(start, start + len(inside))
     return gpd.GeoDataFrame(pd.concat([outside, inside], ignore_index=True), crs=base.crs)
 
 
@@ -1375,8 +1393,11 @@ def refill(base, polygon, resolution, *, growth_factor=None, fields=None, outlin
     Cells outside stay exactly as in ``base``, so their columns continue
     through every layer; the new cells inside end at the same outline
     vertices, so every outline face is shared one to one (no hanging
-    vertices). Use the result for the layers that need the finer cells, as
-    with :func:`splice`.
+    vertices). Where a long outline face meets a short one, refill halves
+    the long face on the inside until the faces stay exact; the extra
+    vertices hang on the outside cell's face, as with ``outline_split``. Use
+    the result for the layers that need the finer cells, as with
+    :func:`splice`.
 
     Args:
         base: The vorflow grid to start from.
@@ -1443,7 +1464,15 @@ def refill(base, polygon, resolution, *, growth_factor=None, fields=None, outlin
     tolerance = 1e-7 * ring.length
     touching = geoms[shapely.dwithin(geoms, ring, tolerance)]
     base_nodes = _refill.outline_nodes(touching, ring, tolerance)
-    nodes = _refill.subdivide_outline(base_nodes, int(outline_split))
+    split_nodes = _refill.subdivide_outline(base_nodes, int(outline_split))
+    nodes = _refill.even_outline(split_nodes, polygon)
+    if len(nodes) > len(split_nodes):
+        warnings.warn(
+            f"refill: {len(nodes) - len(split_nodes)} vertices were added to halve long outline faces next to "
+            "short ones. They hang on the outside cells' faces, so the connections across those faces are not "
+            "orthogonal. More even faces along the outline in the base grid avoid it.",
+            UserWarning, stacklevel=2,
+        )
     sites_in, sites_out, centres, radii = _refill.mirrored_sites(nodes, polygon)
     segment = np.linalg.norm(np.roll(nodes, -1, axis=0) - nodes, axis=1)
     spacing = float(np.median(segment))
@@ -1453,7 +1482,7 @@ def refill(base, polygon, resolution, *, growth_factor=None, fields=None, outlin
                               min(float(resolution), spacing))
     generators = np.vstack([sites_in, fill, sites_out])
     n = len(nodes)
-    own_site = [(i, (i + 1) % n) for i in range(n)]
+    own_site = _refill.segment_circles(n)
     own = own_site + [(-1, -1)] * len(fill) + own_site
     _refill.check_circles(generators, centres, radii, own)
     keep = np.arange(n + len(fill))
