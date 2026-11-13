@@ -497,9 +497,10 @@ class DisuGrid:
 
         Uses the cell elevations after pass-through gaps are closed, so a
         point in a collapsed pass-through cell maps to the active cell that
-        took its interval. Accepts scalars or arrays.
+        took its interval. Scalar inputs give an int, array inputs an array.
         """
         self._require_build()
+        scalar = np.ndim(x) == np.ndim(y) == np.ndim(z) == 0
         x, y, z = (np.atleast_1d(np.asarray(v, dtype=float)) for v in (x, y, z))
         cols = self._columns_at(x, y)
         found = np.full(len(x), -1, dtype=np.int64)
@@ -510,7 +511,7 @@ class DisuGrid:
             node_safe = np.maximum(node, 0)
             hit &= (self._node_bot[node_safe] <= z) & (z <= self._node_top[node_safe])
             found[hit] = node[hit]
-        return found if found.size > 1 else int(found[0])
+        return int(found[0]) if scalar else found
 
     def save_cellmap(self, path, parent=None):
         """Write :attr:`cellmap` to CSV, so results can be mapped back without vorflow.
@@ -640,6 +641,8 @@ class DisuGrid:
             above = bot_l[layer - 1, cols]
             new = np.isnan(above)
             layer_top = above.copy()
+            if top is not None:
+                _check_given_tops(layer, top[~new], above[~new], above[~new])
             if new.any():
                 in_layer = np.zeros(ncol, dtype=bool)
                 in_layer[cols] = True
@@ -681,16 +684,7 @@ class DisuGrid:
 
         start_top = level[group_s]
         if given is not None:
-            scale = np.nanmax(np.abs(np.r_[given, bottom, 1.0]))
-            spread = np.where(joined, highest - lowest, 0.0)[group_s]
-            mismatch = (np.abs(given - np.where(np.isnan(start_top), given, start_top)) > 1e-9 * scale) | (
-                spread > 1e-9 * scale)
-            if mismatch.any():
-                raise ValueError(
-                    f"Layer {layer}: the tops given for cells below the change of grid do not meet the "
-                    "bottoms of the cells above them. Leave that layer's top as None to make the contact "
-                    "gap-free automatically."
-                )
+            _check_given_tops(layer, given, start_top, bottom, np.where(joined, highest - lowest, 0.0)[group_s])
             start_top = np.asarray(given, dtype=float).copy()
         lone = np.isnan(start_top)
         if lone.any():
@@ -942,6 +936,21 @@ def _group_bottoms(group, bottom, weight, n_groups):
     return level, lowest, highest
 
 
+def _check_given_tops(layer, given, expected, bottoms, spread=0.0):
+    """Raise unless tops given for ``layer`` meet the ``expected`` bottoms above them (NaN: no cell above).
+
+    The tolerance scales with ``bottoms``; a positive ``spread`` means the
+    bottoms a cell meets disagree, so no single given top can meet them.
+    """
+    tolerance = 1e-9 * np.nanmax(np.abs(np.r_[given, bottoms, 1.0]))
+    mismatch = (np.abs(given - np.where(np.isnan(expected), given, expected)) > tolerance) | (spread > tolerance)
+    if mismatch.any():
+        raise ValueError(
+            f"Layer {layer}: the tops given do not meet the bottoms of the cells above them. Leave that "
+            "layer's top as None to make the contact gap-free automatically."
+        )
+
+
 def splice(base, fine, polygon):
     """A plan grid with ``base`` cells outside ``polygon`` and ``fine`` cells inside it.
 
@@ -977,18 +986,21 @@ def splice(base, fine, polygon):
         selected["source_node_id"] = (selected["node_id"].to_numpy() if "node_id" in selected
                                       else np.flatnonzero((inside > tolerance) == keep_inside))
         parts.append(selected)
+        if name == "base":
+            # Base cells do not overlap, so their parts inside the polygon add
+            # up to the area of it that the base grid covers.
+            polygon_area = inside.sum()
     outside, inside = parts
-    inside_area, polygon_area = inside.geometry.area.sum(), polygon.intersection(
-        shapely.union_all(base.geometry.to_numpy())).area
+    inside_area = inside.geometry.area.sum()
     if abs(inside_area - polygon_area) > 1e-9 * max(polygon_area, 1.0):
         raise ValueError(
             f"Fine cells cover {inside_area:.6g} of the {polygon_area:.6g} splice area; the fine grid "
             "must cover the whole area inside the outline."
         )
-    start = int(outside["node_id"].max()) + 1 if "node_id" in outside and len(outside) else 0
-    inside["node_id"] = np.arange(start, start + len(inside))
     if "node_id" not in outside:
         outside["node_id"] = outside["source_node_id"]
+    start = int(outside["node_id"].max()) + 1 if len(outside) else 0
+    inside["node_id"] = np.arange(start, start + len(inside))
     return gpd.GeoDataFrame(pd.concat([outside, inside], ignore_index=True), crs=base.crs)
 
 
