@@ -6,8 +6,10 @@ import geopandas as gpd
 import numpy as np
 import pytest
 import shapely
+from scipy.optimize import linprog
 from shapely.geometry import MultiPoint, Point, Polygon, box
 
+from vorflow._gnc import _weights
 from vorflow.disu import DisuGrid, splice
 
 
@@ -113,6 +115,29 @@ def test_second_ring_of_neighbours_is_used_when_the_first_cannot_interpolate():
         neighbours[int(a)].add(int(b))
         neighbours[int(b)].add(int(a))
     assert any(set(r["contributors"]) - neighbours[r["n"]] for r in gnc.records)
+
+
+def test_weight_solver_agrees_with_a_general_lp_solver():
+    rng = np.random.default_rng(7)
+    cap = 1 - 1e-8
+    solved = 0
+    for trial in range(300):
+        n = int(rng.integers(1, 13))
+        rows = rng.normal(size=(3, n))
+        if trial % 4 == 0:
+            rows[2] = 0.0                                   # one layer: no vertical offsets to reproduce
+        # Half the right-hand sides come from valid weights; the others are mostly out of reach.
+        rhs = rows @ rng.uniform(0, 1.5 / n, n) if trial % 2 else rng.normal(size=3) * (rows.any(axis=1))
+        cost = rng.uniform(0.1, 1.0, n)
+        fit = linprog(cost, A_eq=rows, b_eq=rhs, A_ub=np.ones((1, n)), b_ub=[cap], bounds=(0, None), method="highs")
+        w = _weights(cost, rows, rhs, cap)
+        assert (w is not None) == fit.success
+        if w is not None:
+            solved += 1
+            assert w.min() >= 0 and w.sum() <= cap + 1e-12
+            np.testing.assert_allclose(rows @ w, rhs, atol=1e-9)
+            assert cost @ w == pytest.approx(fit.fun, abs=1e-8)
+    assert 100 < solved < 250, "the trials should mix problems with and without a solution"
 
 
 def test_aligned_grid_needs_no_correction():

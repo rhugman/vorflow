@@ -12,13 +12,15 @@ from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.optimize import linprog
 from shapely.geometry import Point
 
 from ._gnc_export import GncCorrections
 
 _MAX_CONTRIBUTORS = 5
 _HOST_FLOOR = 1e-8   # smallest weight left on the host cell
+_PIVOT = 1e-12       # smallest pivot and reduced cost of the simplex
+_FEASIBLE = 1e-9     # largest sum of artificial variables of a feasible problem (rows are of order one)
+_MAX_PIVOTS = 500
 
 
 @dataclass
@@ -59,6 +61,52 @@ def _geometry(grid):
                      1e-9 * max(float(np.ptp(xyz, axis=0).max()), 1.0)), (n, m, ihc, cl_n, cl_m)
 
 
+def _weights(cost, rows, rhs, cap):
+    """Non-negative ``w`` minimising ``cost @ w`` with ``rows @ w = rhs`` and ``w.sum() <= cap``, or None.
+
+    A two-phase simplex on a dense tableau. The problems are tiny (three rows and the neighbours of one
+    cell), and with a general solver its call overhead took most of the estimation time.
+    """
+    n = len(cost)
+    sign = np.where(rhs < 0, -1.0, 1.0)
+    # Columns: the weights, the slack of the cap, one artificial variable per row, the right-hand side.
+    t = np.zeros((4, n + 5))
+    t[:3, :n], t[:3, -1] = rows * sign[:, None], rhs * sign
+    t[3, :n + 1], t[3, -1] = 1.0, cap
+    t[:3, n + 1:n + 4] = np.eye(3)
+    basis = np.array([n + 1, n + 2, n + 3, n])
+    # First drive the artificial variables to zero (a feasible start), then minimise the cost.
+    for phase, costs in enumerate((np.r_[np.zeros(n + 1), np.ones(3)], np.r_[cost, np.zeros(4)])):
+        for _ in range(_MAX_PIVOTS):
+            entering = np.flatnonzero(costs[:n + 1] - costs[basis] @ t[:, :n + 1] < -_PIVOT)
+            if not len(entering):
+                break
+            j = entering[0]                     # Bland's rule (first candidate in, lowest variable out): no cycling
+            column = t[:, j]
+            ratio = np.full(4, np.inf)
+            up = column > _PIVOT
+            ratio[up] = t[up, -1] / column[up]
+            if phase:                           # an artificial variable still in the basis stays at zero
+                ratio[(basis > n) & (np.abs(column) > _PIVOT)] = 0.0
+            if not np.isfinite(ratio.min()):
+                return None
+            ties = np.flatnonzero(ratio == ratio.min())
+            r = ties[np.argmin(basis[ties])]
+            t[r] /= t[r, j]
+            others = np.arange(4) != r
+            t[others] -= np.outer(t[others, j], t[r])
+            basis[r] = j
+        else:
+            return None
+        if not phase:
+            if t[basis > n, -1].sum() > _FEASIBLE:
+                return None
+            t[basis > n, -1] = 0.0
+    w = np.zeros(n + 4)
+    w[basis] = t[:, -1]
+    return w[:n]
+
+
 def estimate_gnc(grid):
     """Ghost-node corrections for every connection whose centre line is not normal to its face.
 
@@ -91,16 +139,15 @@ def estimate_gnc(grid):
         scale = np.maximum(np.maximum(np.abs(vectors).max(axis=0), np.abs(offset)), g.tolerance)
         distance = np.linalg.norm(vectors, axis=1)
         # Non-negative weights that reproduce the offset (so any linear field), nearest cells preferred.
-        fit = linprog(distance / max(distance.max(), g.tolerance) + 1e-6,
-                      A_eq=vectors.T / scale[:, None], b_eq=offset / scale,
-                      A_ub=np.ones((1, len(js))), b_ub=[1 - _HOST_FLOOR], bounds=(0, None), method="highs")
-        if not fit.success:
+        weights = _weights(distance / max(distance.max(), g.tolerance) + 1e-6, vectors.T / scale[:, None],
+                           offset / scale, 1 - _HOST_FLOOR)
+        if weights is None:
             return None, "no interpolation from neighbouring cells"
-        keep = fit.x > 1e-11
-        weights, js = fit.x[keep], js[keep]
+        keep = weights > 1e-11
+        weights, js = weights[keep], js[keep]
         if not 1 <= len(js) <= _MAX_CONTRIBUTORS:
             return None, "more than five contributing cells"
-        if weights.sum() > 1 - _HOST_FLOOR + 1e-12:   # the solver's feasibility tolerance can reach a sum of 1
+        if weights.sum() > 1 - _HOST_FLOOR + 1e-12:   # roundoff can reach a sum of 1
             return None, "no weight left on the host cell"
         if outside and not any(in_prism(j, target) for j in [n, *js]):
             return None, "ghost outside the cells used to interpolate it"

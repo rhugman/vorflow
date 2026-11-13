@@ -373,7 +373,8 @@ class DisuGrid:
         it can lose accuracy. Compare with the standard formulation on your model. Rotated anisotropy
         (``angle1``-``angle3``) is not represented, as in any two-point correction.
 
-        Each corrected connection needs a small linear program (1-2 ms): expect minutes for 100,000 of them.
+        Each corrected connection needs a small linear program (under 1 ms): expect about a minute for
+        100,000 of them.
         Connections that cannot be corrected keep the standard conductance; a warning reports them. A
         partial correction can be locally less accurate than none, so check ``unsupported``.
 
