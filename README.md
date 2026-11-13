@@ -452,7 +452,8 @@ heads = d.to_layers(gwf.output.head().get_data().ravel())  # back to (nlay, ncpl
 - **Sublayers:** `disu.subdivide(top, botm, idomain, nsub=..., where=mask)`
   splits layers everywhere or only in some columns. Its `parent` (and that of
   `split_contacts`) maps the layers back to the original units for
-  `layer_view` and `save_cellmap`.
+  `layer_view` and `save_cellmap`; a wedge lies on another plan grid than its
+  unit, so `layer_view` shows it by its own layer number, without `parent`.
 - **Tracking:** `nodemap`, `cellmap`, `to_nodes`, `to_layers`,
   `locate(x, y, z)` and `column(x, y)`. FloPy reads the layer number from the
   IHC diagonal, so `PlotMapView(modelgrid=gwf.modelgrid, layer=k)` works

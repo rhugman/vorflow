@@ -149,3 +149,13 @@ def test_one_ulp_offset_does_not_duplicate_a_connection():
     props = d.get_gridprops_mf6_disu()                    # Raises on a duplicate connection.
     assert props["nja"] == len(props["ja"])
     assert sum(h for _, h in _pairs(d).values()) == pytest.approx(20.0)
+
+
+@pytest.mark.parametrize("live", [0, 1])
+def test_column_whose_neighbours_are_all_inactive_has_no_side_links(live):
+    """One side of every plan face has no active cell (it once raised IndexError)."""
+    idomain = np.zeros((2, 2), dtype=int)
+    idomain[:, live] = 1
+    d = _two_columns(np.array([2.0, 2.0]), [1, 0], [1, 0], idomain=idomain)
+    assert d.nodes == 2
+    assert list(d.links["ihc"]) == [0]
