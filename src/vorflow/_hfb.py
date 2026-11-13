@@ -30,6 +30,8 @@ import shapely
 from shapely.geometry import LineString, Polygon
 from shapely.geometry.base import BaseGeometry
 
+from .disu import _coordinate_tolerance
+
 _LINEAR = {shapely.GeometryType.LINESTRING, shapely.GeometryType.LINEARRING,
            shapely.GeometryType.MULTILINESTRING}
 
@@ -138,20 +140,31 @@ def _cells(grid):
     return cells, cells[["x", "y"]].to_numpy(dtype=float), cells.layer.to_numpy(), polygons
 
 
-def _faces_on(trace, links, n, m, xy, polygons, tolerance):
+def _shared_faces(a, b, roundoff):
+    """Faces between polygons ``a`` and ``b``: the part of each ``a`` boundary within ``roundoff`` of ``b``'s.
+
+    As in ``_planar_faces``, which found the grid's faces: where hanging
+    vertices lie a roundoff off the neighbour's face, the exact intersection
+    of the boundaries loses the face, or part of it.
+    """
+    return shapely.intersection(shapely.boundary(a), shapely.buffer(shapely.boundary(b), roundoff))
+
+
+def _faces_on(trace, links, n, m, xy, polygons, tolerance, roundoff):
     """The ``links`` whose shared face lies on ``trace``, and those faces."""
     tree = shapely.STRtree(shapely.linestrings(np.stack((xy[n[links]], xy[m[links]]), axis=1)))
     found = links[tree.query(trace, predicate="dwithin", distance=tolerance)]
-    faces = shapely.intersection(shapely.boundary(polygons[n[found]]), shapely.boundary(polygons[m[found]]))
+    faces = _shared_faces(polygons[n[found]], polygons[m[found]], roundoff)
     on = (shapely.length(faces) > tolerance) & shapely.covers(trace.buffer(tolerance), faces)
     return found[on], faces[on]
 
 
-def _require_faces(trace, k, faces, cells, tolerance):
+def _require_faces(trace, k, faces, cells, tolerance, roundoff):
     """Raise unless ``trace`` runs on ``faces`` wherever it crosses ``cells`` (one layer's cells near it)."""
     if not len(cells):
         return
-    area = shapely.union_all(cells)
+    # Grown by the roundoff, so that a hair's gap between neighbours is not taken for the edge of the cells.
+    area = shapely.union_all(shapely.buffer(cells, roundoff))
     open_ = shapely.difference(shapely.intersection(trace, area), shapely.boundary(area).buffer(tolerance))
     if len(faces):
         open_ = shapely.difference(open_, shapely.union_all(faces).buffer(tolerance))
@@ -174,6 +187,7 @@ def barrier_faces(grid, trace):
     thickness = (cells.top - cells.bot).to_numpy(dtype=float)
     middle = ((cells.top + cells.bot) / 2).to_numpy(dtype=float)
     tolerance = 1e-7 * max(float(np.ptp(xy, axis=0).max()), 1.0)
+    roundoff = _coordinate_tolerance(grid._grids)
     cell_tree = shapely.STRtree(polygons)
 
     def depth(points, lay):
@@ -209,7 +223,7 @@ def barrier_faces(grid, trace):
     for t in {id(t): t for t in traces if t is not None}.values():
         own = [k for k, other in enumerate(traces) if _same(other, t)]
         candidates = horizontal[np.isin(layer[n[horizontal]], own) | np.isin(layer[m[horizontal]], own)]
-        found, faces = _faces_on(t, candidates, n, m, xy, polygons, tolerance)
+        found, faces = _faces_on(t, candidates, n, m, xy, polygons, tolerance, roundoff)
         hit[found], face[found] = True, faces
     walls = np.flatnonzero(hit)
     if len(walls):
@@ -252,13 +266,12 @@ def barrier_faces(grid, trace):
             factor[s] = d / np.hypot(dh, d)
     # Wherever a trace crosses its layer's cells it must run on cut faces (walls or staggered links).
     staggered = np.flatnonzero(hit & ~same & (ihc != 0))
-    face[staggered] = shapely.intersection(shapely.boundary(polygons[n[staggered]]),
-                                           shapely.boundary(polygons[m[staggered]]))
+    face[staggered] = _shared_faces(polygons[n[staggered]], polygons[m[staggered]], roundoff)
     for k, t in enumerate(traces):
         if t is not None:
-            near = cell_tree.query(t, predicate="intersects")
+            near = cell_tree.query(t, predicate="dwithin", distance=roundoff)
             mine = hit & (ihc != 0) & ((layer[n] == k) | (layer[m] == k))
-            _require_faces(t, k, face[mine], polygons[near[layer[near] == k]], tolerance)
+            _require_faces(t, k, face[mine], polygons[near[layer[near] == k]], tolerance, roundoff)
     found = np.flatnonzero(hit)
     cell = grid._node_top - grid._node_bot
     return BarrierFaces(found, n[found], m[found], factor[found], ihc[found] == 0,

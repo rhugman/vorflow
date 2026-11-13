@@ -3,11 +3,12 @@
 import geopandas as gpd
 import numpy as np
 import pytest
+import shapely
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, Point, Polygon, box
 
-from vorflow import disu
+from vorflow import _hfb, disu
 
 FAULT = LineString([(2, -1), (2, 5)])
 
@@ -106,6 +107,34 @@ def test_a_trace_ending_inside_a_face_is_rejected():
     d = disu.DisuGrid(boxes(6), 1.0, [0.0]).build()
     with pytest.raises(ValueError, match=r"runs 0.5 off the cell faces, starting near \(3, 2"):
         d.barrier_faces(LineString([(3, -1), (3, 2.5)]))
+
+
+def hanging(off):
+    """Two fine cells beside a coarse one; their shared vertex lies ``off`` the coarse face, as on a splice outline."""
+    polygons = [Polygon([(990, 0), (1000, 0), (1000 - off, 5), (990, 5)]),
+                Polygon([(990, 5), (1000 - off, 5), (1000, 10), (990, 10)]), box(1000, 0, 1010, 10)]
+    grid = gpd.GeoDataFrame({"node_id": np.arange(3), "x": [995, 995, 1005], "y": [2.5, 7.5, 5]}, geometry=polygons)
+    return disu.DisuGrid(grid, 10.0, [0.0]).build()
+
+
+@pytest.mark.parametrize("off", [0.0, 1e-12, -1e-12])
+def test_faces_a_roundoff_off_their_neighbour_are_cut(off):
+    # A roundoff outside the coarse face, the boundaries meet only at points; inside it, the cells overlap.
+    d = hanging(off)
+    faces = d.barrier_faces(LineString([(1000, 0), (1000, 10)]))
+    np.testing.assert_array_equal(faces.pairs, [[0, 2], [1, 2]])
+    assert faces.get_gridprops_mf6_hfb(0.1)["stress_period_data"][0] == [((0,), (2,), 0.1), ((1,), (2,), 0.1)]
+    polygons = d._grids[0].geometry.to_numpy()
+    np.testing.assert_allclose(shapely.length(_hfb._shared_faces(polygons[:2], polygons[2],
+                                                                 disu._coordinate_tolerance(d._grids))), 5)
+
+
+@pytest.mark.parametrize("off", [0.0, 1e-12, -1e-12])
+@pytest.mark.parametrize("ends, length", [((-1, 2.5), 2.5), ((2.5, 7.5), 5)])
+def test_a_trace_ending_inside_roundoff_faces_is_rejected(off, ends, length):
+    # The hair's gap between the cells (off > 0) must not pass for the edge of the grid.
+    with pytest.raises(ValueError, match=f"runs {length} off the cell faces"):
+        hanging(off).barrier_faces(LineString([(1000, ends[0]), (1000, ends[1])]))
 
 
 @pytest.mark.parametrize("east", [3, -1])
