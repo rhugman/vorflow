@@ -396,7 +396,11 @@ class DisuGrid:
             values: One value per DISU node (e.g. ``heads.ravel()``).
             layer: The original layer, as numbered by ``parent``.
             parent: The original layer of each layer, as returned by
-                :func:`subdivide`; ``None`` when no layer was split.
+                :func:`subdivide`; ``None`` when no layer was split. The
+                layers of one original layer must share a plan grid, so a
+                wedge from :func:`split_contacts`, which lies on another grid
+                than its unit, is viewed by its own layer number
+                (``parent=None``).
             pick: Which sublayer gives the value in each column: ``"top"``
                 or ``"bottom"`` (the highest or lowest active one),
                 ``"middle"`` (the active cell at the original layer's
@@ -424,7 +428,9 @@ class DisuGrid:
             raise ValueError(f"No layer has parent {layer!r}.")
         grids = {self._layer_grid[k] for k in sub}
         if len(grids) > 1:
-            raise ValueError(f"The sublayers of layer {layer} use different plan grids.")
+            raise ValueError(f"The sublayers of layer {layer} use different plan grids, as with a "
+                             "split_contacts wedge; view them separately, by their own layer numbers "
+                             "with parent=None, or with a parent that numbers the wedge apart.")
         cols = self._col_of[self._layer_grid[sub[0]]]
         node = self._nodemap[np.ix_(sub, cols)]
         active = node >= 0
