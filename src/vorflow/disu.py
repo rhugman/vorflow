@@ -354,9 +354,10 @@ class DisuGrid:
 
         Uses the cell elevations after pass-through gaps are closed, so a
         point in a collapsed pass-through cell maps to the active cell that
-        took its interval. Accepts scalars or arrays.
+        took its interval. Scalar inputs give an int, array inputs an array.
         """
         self._require_build()
+        scalar = np.ndim(x) == np.ndim(y) == np.ndim(z) == 0
         x, y, z = (np.atleast_1d(np.asarray(v, dtype=float)) for v in (x, y, z))
         cell = self._cells_at(x, y)
         node = np.where(cell >= 0, self.nodemap[:, np.maximum(cell, 0)], -1)    # (nlay, npoints)
@@ -364,7 +365,7 @@ class DisuGrid:
         hit = (node >= 0) & (self._node_bot[safe] <= z) & (z <= self._node_top[safe])
         # From the top down: on a shared top and bottom the upper cell wins.
         found = np.where(hit.any(axis=0), node[np.argmax(hit, axis=0), np.arange(len(x))], -1)
-        return found if found.size > 1 else int(found[0])
+        return int(found[0]) if scalar else found
 
     def save_cellmap(self, path, parent=None):
         """Write :attr:`cellmap` to CSV, so results can be mapped back without vorflow.
