@@ -984,9 +984,12 @@ def splice(base, fine, polygon):
         selected["source_node_id"] = (selected["node_id"].to_numpy() if "node_id" in selected
                                       else np.flatnonzero((inside > tolerance) == keep_inside))
         parts.append(selected)
+        if name == "base":
+            # Base cells do not overlap, so their parts inside the polygon add
+            # up to the area of it that the base grid covers.
+            polygon_area = inside.sum()
     outside, inside = parts
-    inside_area, polygon_area = inside.geometry.area.sum(), polygon.intersection(
-        shapely.union_all(base.geometry.to_numpy())).area
+    inside_area = inside.geometry.area.sum()
     if abs(inside_area - polygon_area) > 1e-9 * max(polygon_area, 1.0):
         raise ValueError(
             f"Fine cells cover {inside_area:.6g} of the {polygon_area:.6g} splice area; the fine grid "
